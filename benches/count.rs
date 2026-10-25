@@ -71,7 +71,10 @@ fn bench_count(c: &mut Criterion) {
                 ("canonical", StrandMode::Canonical),
             ] {
                 let check = count_records(&records, k, strand);
-                assert_eq!(check.counts().values().sum::<u64>(), expected);
+                assert_eq!(
+                    check.counts().map(|(_, count)| count).sum::<u64>(),
+                    expected
+                );
                 drop(check);
 
                 group.bench_with_input(BenchmarkId::new(mode, k), &k, |b, &k| {
@@ -79,7 +82,9 @@ fn bench_count(c: &mut Criterion) {
                         // Fresh map each iteration; construction, allocation, counting,
                         // and destruction are all included in the measurement.
                         let counter = count_records(black_box(&records), k, strand);
-                        black_box(counter.counts());
+                        // Observe storage without decoding keys: output conversion
+                        // was not part of the byte-key baseline either.
+                        black_box(&counter);
                     });
                 });
             }

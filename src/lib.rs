@@ -27,12 +27,20 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+// Keep the representation private so wider packed keys can be added without
+// changing the public output format.
+enum Counts {
+    Packed(HashMap<u64, u64>),
+    Bytes(HashMap<Vec<u8>, u64>),
+}
+
 /// An exact, in-memory DNA k-mer counter.
 ///
-/// Keys are uppercase ASCII DNA sequences and counts are cumulative across records.
-/// There is no maximum k other than practical memory limits.
+/// Output keys are uppercase ASCII DNA sequences; counts accumulate across records.
+/// For k <= 32, counting uses rolling 2-bit keys without allocating individual DNA keys.
+/// Larger k uses byte-string storage, with no maximum other than practical memory limits.
 pub struct Counter {
-    counts: HashMap<Vec<u8>, u64>,
+    counts: Counts,
     strand: StrandMode,
     k: usize,
 }
@@ -45,7 +53,11 @@ impl Counter {
         }
 
         Ok(Self {
-            counts: HashMap::new(),
+            counts: if k <= 32 {
+                Counts::Packed(HashMap::new())
+            } else {
+                Counts::Bytes(HashMap::new())
+            },
             strand,
             k,
         })
@@ -62,51 +74,149 @@ impl Counter {
             return Ok(());
         }
 
-        let sequence = sequence.to_ascii_uppercase();
-        let mut reverse_complement = if self.strand == StrandMode::Canonical {
-            vec![0; self.k]
-        } else {
-            Vec::new()
-        };
+        match &mut self.counts {
+            Counts::Packed(counts) => match self.strand {
+                StrandMode::Forward => add_packed_record::<false>(counts, sequence, self.k),
+                StrandMode::Canonical => add_packed_record::<true>(counts, sequence, self.k),
+            },
+            Counts::Bytes(counts) => add_byte_record(counts, sequence, self.k, self.strand),
+        }
+    }
 
-        for kmer in sequence.windows(self.k) {
-            if !kmer
-                .iter()
-                .all(|base| matches!(base, b'A' | b'C' | b'G' | b'T'))
-            {
+    /// Iterate over distinct uppercase DNA keys and their counts, in unspecified order.
+    ///
+    /// Each yielded key is an owned byte vector. Packed keys are decoded lazily;
+    /// collecting or formatting output is separate from counting.
+    ///
+    /// ```
+    /// use kbolt::{Counter, StrandMode};
+    /// use std::collections::HashMap;
+    ///
+    /// let mut counter = Counter::new(3, StrandMode::Canonical).unwrap();
+    /// counter.add_record(b"ACGT").unwrap();
+    /// let counts: HashMap<Vec<u8>, u64> = counter.counts().collect();
+    /// assert_eq!(counts[b"ACG".as_slice()], 2);
+    /// ```
+    pub fn counts(&self) -> impl Iterator<Item = (Vec<u8>, u64)> + '_ {
+        let (packed, bytes) = match &self.counts {
+            Counts::Packed(counts) => (Some(counts.iter()), None),
+            Counts::Bytes(counts) => (None, Some(counts.iter())),
+        };
+        packed
+            .into_iter()
+            .flatten()
+            .map(|(&key, &count)| (decode_packed(key, self.k), count))
+            .chain(
+                bytes
+                    .into_iter()
+                    .flatten()
+                    .map(|(key, &count)| (key.clone(), count)),
+            )
+    }
+}
+
+// Specialize by strand once per record, leaving no reverse-complement work in
+// the forward-only loop. Callers guarantee 1 <= k <= 32.
+fn add_packed_record<const CANONICAL: bool>(
+    counts: &mut HashMap<u64, u64>,
+    sequence: &[u8],
+    k: usize,
+) -> Result<(), Error> {
+    // Right-shifting an all-ones mask also handles k = 32 without a shift by 64.
+    let mask = u64::MAX >> (64 - 2 * k);
+    let high_shift = 2 * (k - 1);
+    let (mut forward, mut reverse) = (0_u64, 0_u64);
+    let mut valid_run = 0;
+
+    for &byte in sequence {
+        let base = match byte {
+            b'A' | b'a' => 0,
+            b'C' | b'c' => 1,
+            b'G' | b'g' => 2,
+            b'T' | b't' => 3,
+            _ => {
+                forward = 0;
+                reverse = 0;
+                valid_run = 0;
                 continue;
             }
-
-            let key = if self.strand == StrandMode::Canonical {
-                for (complement, base) in reverse_complement.iter_mut().zip(kmer.iter().rev()) {
-                    *complement = match base {
-                        b'A' => b'T',
-                        b'C' => b'G',
-                        b'G' => b'C',
-                        b'T' => b'A',
-                        _ => unreachable!("bases were validated above"),
-                    };
-                }
-                kmer.min(reverse_complement.as_slice())
-            } else {
-                kmer
-            };
-
-            // Existing keys can be looked up by a borrowed slice, without allocating.
-            if let Some(count) = self.counts.get_mut(key) {
-                *count = count.checked_add(1).ok_or(Error::CountOverflow)?;
-            } else {
-                self.counts.insert(key.to_vec(), 1);
-            }
+        };
+        forward = ((forward << 2) | base) & mask;
+        if CANONICAL {
+            reverse = (reverse >> 2) | ((base ^ 3) << high_shift);
+        }
+        valid_run = (valid_run + 1).min(k);
+        if valid_run < k {
+            continue;
         }
 
-        Ok(())
+        // A=0, C=1, G=2, T=3 makes numeric and lexicographic order agree.
+        let key = if CANONICAL {
+            forward.min(reverse)
+        } else {
+            forward
+        };
+        let count = counts.entry(key).or_insert(0);
+        *count = count.checked_add(1).ok_or(Error::CountOverflow)?;
     }
+    Ok(())
+}
 
-    /// Return all distinct keys and their counts. Iteration order is unspecified.
-    pub fn counts(&self) -> &HashMap<Vec<u8>, u64> {
-        &self.counts
+fn decode_packed(mut key: u64, k: usize) -> Vec<u8> {
+    let mut dna = vec![0; k];
+    for base in dna.iter_mut().rev() {
+        *base = b"ACGT"[(key & 3) as usize];
+        key >>= 2;
     }
+    dna
+}
+
+// Existing arbitrary-k implementation; a multiword packed backend can replace
+// this independently of the single-word counting loop and public iterator.
+fn add_byte_record(
+    counts: &mut HashMap<Vec<u8>, u64>,
+    sequence: &[u8],
+    k: usize,
+    strand: StrandMode,
+) -> Result<(), Error> {
+    let sequence = sequence.to_ascii_uppercase();
+    let mut reverse_complement = if strand == StrandMode::Canonical {
+        vec![0; k]
+    } else {
+        Vec::new()
+    };
+
+    for kmer in sequence.windows(k) {
+        if !kmer
+            .iter()
+            .all(|base| matches!(base, b'A' | b'C' | b'G' | b'T'))
+        {
+            continue;
+        }
+
+        let key = if strand == StrandMode::Canonical {
+            for (complement, base) in reverse_complement.iter_mut().zip(kmer.iter().rev()) {
+                *complement = match base {
+                    b'A' => b'T',
+                    b'C' => b'G',
+                    b'G' => b'C',
+                    b'T' => b'A',
+                    _ => unreachable!("bases were validated above"),
+                };
+            }
+            kmer.min(reverse_complement.as_slice())
+        } else {
+            kmer
+        };
+
+        // Existing keys can be looked up by a borrowed slice, without allocating.
+        if let Some(count) = counts.get_mut(key) {
+            *count = count.checked_add(1).ok_or(Error::CountOverflow)?;
+        } else {
+            counts.insert(key.to_vec(), 1);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -118,13 +228,13 @@ mod tests {
             .iter()
             .map(|(key, count)| (key.as_bytes().to_vec(), *count))
             .collect();
-        assert_eq!(counter.counts(), &expected);
+        assert_eq!(counter.counts().collect::<HashMap<_, _>>(), expected);
     }
 
     #[test]
     fn matches_naive_counts_on_mixed_records() {
         let mut state = 42_u64;
-        let records: Vec<Vec<u8>> = (0..32)
+        let mut records: Vec<Vec<u8>> = (0..32)
             .map(|len| {
                 (0..len)
                     .map(|_| {
@@ -137,7 +247,25 @@ mod tests {
             })
             .collect();
 
-        for k in 1..=8 {
+        // Exercise both backends, full-width keys, and long valid runs. Dense
+        // ambiguity alone would almost never produce a valid 32-base window.
+        for len in [31, 32, 33, 64, 65, 66, 129, 1024] {
+            let valid: Vec<u8> = (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    b"ACGTacgt"[(state % 8) as usize]
+                })
+                .collect();
+            let mut ambiguous = valid.clone();
+            for base in ambiguous.iter_mut().skip(31).step_by(97) {
+                *base = b'N';
+            }
+            records.extend([valid, ambiguous]);
+        }
+
+        for k in 1..=66 {
             for strand in [StrandMode::Forward, StrandMode::Canonical] {
                 let mut counter = Counter::new(k, strand).unwrap();
                 let mut expected = HashMap::new();
@@ -164,7 +292,12 @@ mod tests {
                         }
                         *expected.entry(key).or_insert(0_u64) += 1;
                     }
-                    assert_eq!(counter.counts(), &expected);
+                    assert_eq!(
+                        counter.counts().collect::<HashMap<_, _>>(),
+                        expected,
+                        "k={k}, strand={strand:?}, record length={}",
+                        record.len()
+                    );
                 }
             }
         }
@@ -181,10 +314,83 @@ mod tests {
     #[test]
     fn reports_overflow_without_changing_the_overflowing_count() {
         let mut counter = Counter::new(3, StrandMode::Forward).unwrap();
-        counter.counts.insert(b"ACG".to_vec(), u64::MAX - 1);
+        counter.add_record(b"ACG").unwrap();
+        let Counts::Packed(counts) = &mut counter.counts else {
+            panic!("expected packed backend");
+        };
+        *counts.values_mut().next().unwrap() = u64::MAX - 1;
         counter.add_record(b"ACG").unwrap();
         assert_eq!(counter.add_record(b"ACG"), Err(Error::CountOverflow));
         assert_counts(&counter, &[("ACG", u64::MAX)]);
+    }
+
+    #[test]
+    fn overflow_keeps_earlier_windows_and_stops_before_later_ones() {
+        for k in [1, 3, 32, 33, 65] {
+            for strand in [StrandMode::Forward, StrandMode::Canonical] {
+                let mut counter = Counter::new(k, strand).unwrap();
+                counter.add_record(&vec![b'A'; k]).unwrap();
+                match &mut counter.counts {
+                    Counts::Packed(counts) => *counts.values_mut().next().unwrap() = u64::MAX,
+                    Counts::Bytes(counts) => *counts.values_mut().next().unwrap() = u64::MAX,
+                }
+                let mut record = vec![b'C'];
+                record.extend(vec![b'A'; k + 1]);
+                record.push(b'G');
+                assert_eq!(counter.add_record(&record), Err(Error::CountOverflow));
+                let first = format!("C{}", "A".repeat(k - 1));
+                assert_counts(&counter, &[(&"A".repeat(k), u64::MAX), (&first, 1)]);
+            }
+        }
+    }
+
+    #[test]
+    fn every_invalid_byte_breaks_a_valid_run() {
+        for strand in [StrandMode::Forward, StrandMode::Canonical] {
+            for byte in 0..=u8::MAX {
+                if b"ACGTacgt".contains(&byte) {
+                    continue;
+                }
+                let mut counter = Counter::new(3, strand).unwrap();
+                counter
+                    .add_record(&[b'a', b'c', byte, b'g', b't', b'a'])
+                    .unwrap();
+                assert_counts(&counter, &[("GTA", 1)]);
+            }
+        }
+    }
+
+    #[test]
+    fn full_width_keys_preserve_high_bits_and_leading_as() {
+        let mut counter = Counter::new(32, StrandMode::Forward).unwrap();
+        counter.add_record(&[b'T'; 33]).unwrap();
+        counter.add_record(&[b'A'; 32]).unwrap();
+        let leading_as = format!("{}C", "A".repeat(31));
+        counter.add_record(leading_as.as_bytes()).unwrap();
+        assert_counts(
+            &counter,
+            &[(&"T".repeat(32), 2), (&"A".repeat(32), 1), (&leading_as, 1)],
+        );
+
+        let mut canonical = Counter::new(32, StrandMode::Canonical).unwrap();
+        canonical.add_record(&[b'T'; 33]).unwrap();
+        canonical.add_record(&[b'A'; 32]).unwrap();
+        assert_counts(&canonical, &[(&"A".repeat(32), 3)]);
+    }
+
+    #[test]
+    fn full_width_windows_do_not_cross_invalid_bytes_or_records() {
+        for strand in [StrandMode::Forward, StrandMode::Canonical] {
+            let mut counter = Counter::new(32, strand).unwrap();
+            let mut record = vec![b'T'; 31];
+            record.push(b'N');
+            record.extend([b'A'; 31]);
+            counter.add_record(&record).unwrap();
+            counter.add_record(b"C").unwrap();
+            assert_counts(&counter, &[]);
+            counter.add_record(&[b'A'; 32]).unwrap();
+            assert_counts(&counter, &[(&"A".repeat(32), 1)]);
+        }
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+type PackedCounts = HashMap<u64, u64, foldhash::fast::RandomState>;
+
 /// Whether reverse-complement pairs share a count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StrandMode {
@@ -30,7 +32,7 @@ impl std::error::Error for Error {}
 // Keep the representation private so wider packed keys can be added without
 // changing the public output format.
 enum Counts {
-    Packed(HashMap<u64, u64>),
+    Packed(PackedCounts),
     Bytes(HashMap<Vec<u8>, u64>),
 }
 
@@ -39,6 +41,8 @@ enum Counts {
 /// Output keys are uppercase ASCII DNA sequences; counts accumulate across records.
 /// For k <= 32, counting uses rolling 2-bit keys without allocating individual DNA keys.
 /// Larger k uses byte-string storage, with no maximum other than practical memory limits.
+/// Packed-key hashing uses noncryptographic FoldHash, not intended to resist adaptive
+/// collision attacks.
 pub struct Counter {
     counts: Counts,
     strand: StrandMode,
@@ -54,7 +58,7 @@ impl Counter {
 
         Ok(Self {
             counts: if k <= 32 {
-                Counts::Packed(HashMap::new())
+                Counts::Packed(PackedCounts::default())
             } else {
                 Counts::Bytes(HashMap::new())
             },
@@ -118,7 +122,7 @@ impl Counter {
 // Specialize by strand once per record, leaving no reverse-complement work in
 // the forward-only loop. Callers guarantee 1 <= k <= 32.
 fn add_packed_record<const CANONICAL: bool>(
-    counts: &mut HashMap<u64, u64>,
+    counts: &mut PackedCounts,
     sequence: &[u8],
     k: usize,
 ) -> Result<(), Error> {

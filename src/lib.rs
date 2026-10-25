@@ -58,8 +58,18 @@ impl Counter {
     /// Return `Error::CountOverflow` instead of wrapping an overflowing count.
     /// On overflow, earlier windows in this call remain counted.
     pub fn add_record(&mut self, sequence: &[u8]) -> Result<(), Error> {
-        for window in sequence.windows(self.k) {
-            let mut kmer = window.to_ascii_uppercase();
+        if sequence.len() < self.k {
+            return Ok(());
+        }
+
+        let sequence = sequence.to_ascii_uppercase();
+        let mut reverse_complement = if self.strand == StrandMode::Canonical {
+            vec![0; self.k]
+        } else {
+            Vec::new()
+        };
+
+        for kmer in sequence.windows(self.k) {
             if !kmer
                 .iter()
                 .all(|base| matches!(base, b'A' | b'C' | b'G' | b'T'))
@@ -67,25 +77,27 @@ impl Counter {
                 continue;
             }
 
-            if self.strand == StrandMode::Canonical {
-                let reverse_complement: Vec<u8> = kmer
-                    .iter()
-                    .rev()
-                    .map(|base| match base {
+            let key = if self.strand == StrandMode::Canonical {
+                for (complement, base) in reverse_complement.iter_mut().zip(kmer.iter().rev()) {
+                    *complement = match base {
                         b'A' => b'T',
                         b'C' => b'G',
                         b'G' => b'C',
                         b'T' => b'A',
                         _ => unreachable!("bases were validated above"),
-                    })
-                    .collect();
-                if reverse_complement < kmer {
-                    kmer = reverse_complement;
+                    };
                 }
-            }
+                kmer.min(reverse_complement.as_slice())
+            } else {
+                kmer
+            };
 
-            let count = self.counts.entry(kmer).or_insert(0);
-            *count = count.checked_add(1).ok_or(Error::CountOverflow)?;
+            // Existing keys can be looked up by a borrowed slice, without allocating.
+            if let Some(count) = self.counts.get_mut(key) {
+                *count = count.checked_add(1).ok_or(Error::CountOverflow)?;
+            } else {
+                self.counts.insert(key.to_vec(), 1);
+            }
         }
 
         Ok(())
@@ -107,6 +119,55 @@ mod tests {
             .map(|(key, count)| (key.as_bytes().to_vec(), *count))
             .collect();
         assert_eq!(counter.counts(), &expected);
+    }
+
+    #[test]
+    fn matches_naive_counts_on_mixed_records() {
+        let mut state = 42_u64;
+        let records: Vec<Vec<u8>> = (0..32)
+            .map(|len| {
+                (0..len)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        b"ACGTacgtN-"[(state % 10) as usize]
+                    })
+                    .collect()
+            })
+            .collect();
+
+        for k in 1..=8 {
+            for strand in [StrandMode::Forward, StrandMode::Canonical] {
+                let mut counter = Counter::new(k, strand).unwrap();
+                let mut expected = HashMap::new();
+                for record in records.iter().chain(&records) {
+                    counter.add_record(record).unwrap();
+                    for window in record.windows(k) {
+                        let mut key = window.to_ascii_uppercase();
+                        if !key.iter().all(|base| b"ACGT".contains(base)) {
+                            continue;
+                        }
+                        if strand == StrandMode::Canonical {
+                            let reverse: Vec<u8> = key
+                                .iter()
+                                .rev()
+                                .map(|base| match base {
+                                    b'A' => b'T',
+                                    b'C' => b'G',
+                                    b'G' => b'C',
+                                    b'T' => b'A',
+                                    _ => unreachable!(),
+                                })
+                                .collect();
+                            key = key.min(reverse);
+                        }
+                        *expected.entry(key).or_insert(0_u64) += 1;
+                    }
+                    assert_eq!(counter.counts(), &expected);
+                }
+            }
+        }
     }
 
     #[test]

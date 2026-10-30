@@ -82,8 +82,7 @@ fn bench_count(c: &mut Criterion) {
                         // Fresh map each iteration; construction, allocation, counting,
                         // and destruction are all included in the measurement.
                         let counter = count_records(black_box(&records), k, strand);
-                        // Observe storage without decoding keys: output conversion
-                        // was not part of the byte-key baseline either.
+                        // Observe storage without decoding keys.
                         black_box(&counter);
                     });
                 });

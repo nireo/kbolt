@@ -87,6 +87,19 @@ impl Counter {
         }
     }
 
+    /// Return the number of distinct k-mers counted so far.
+    pub fn len(&self) -> usize {
+        match &self.counts {
+            Counts::Packed(counts) => counts.len(),
+            Counts::Bytes(counts) => counts.len(),
+        }
+    }
+
+    /// Return whether no valid k-mers have been counted.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Iterate over distinct uppercase DNA keys and their counts, in unspecified order.
     ///
     /// Each yielded key is an owned byte vector. Packed keys are decoded lazily;
@@ -407,6 +420,8 @@ mod tests {
     #[test]
     fn starts_empty() {
         let counter = Counter::new(3, StrandMode::Canonical).unwrap();
+        assert!(counter.is_empty());
+        assert_eq!(counter.len(), 0);
         assert_counts(&counter, &[]);
     }
 
@@ -506,6 +521,8 @@ mod tests {
     fn supports_k_above_packed_integer_limits() {
         let mut counter = Counter::new(65, StrandMode::Forward).unwrap();
         counter.add_record(&[b'A'; 66]).unwrap();
+        assert!(!counter.is_empty());
+        assert_eq!(counter.len(), 1);
         assert_counts(&counter, &[(&"A".repeat(65), 2)]);
     }
 }

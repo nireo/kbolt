@@ -374,6 +374,7 @@ dependencies = [
  "criterion",
  "flate2",
  "foldhash",
+ "memchr",
 ]
 
 [[package]]

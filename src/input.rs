@@ -38,7 +38,7 @@ impl<R: BufRead> Lines<R> {
             if buffer.is_empty() {
                 return Ok(length);
             }
-            let newline = buffer.iter().position(|&byte| byte == b'\n');
+            let newline = memchr::memchr(b'\n', buffer);
             let end = newline.unwrap_or(buffer.len());
             let mut bytes = &buffer[..end];
             if pending_cr && !bytes.is_empty() {
@@ -105,19 +105,21 @@ impl<R: BufRead> Lines<R> {
 
 pub(super) fn count<R: BufRead>(reader: R, counting: &mut Counting<'_>) -> io::Result<()> {
     let mut lines = Lines { reader, number: 0 };
-    match lines.peek()? {
+    let result = match lines.peek()? {
         None => Ok(()),
         Some(b'>') => fasta(&mut lines, counting),
         Some(b'@') => fastq(&mut lines, counting),
         _ => Err(invalid("line 1: expected a FASTA '>' or FASTQ '@' header")),
-    }
+    };
+    result?;
+    counting.flush()
 }
 
 fn fasta<R: BufRead>(lines: &mut Lines<R>, counting: &mut Counting<'_>) -> io::Result<()> {
     while let Some(first) = lines.peek()? {
         if first == b'>' {
             lines.header()?;
-            counting.start_record();
+            counting.start_record()?;
         } else {
             lines.sequence(counting)?;
         }
@@ -134,7 +136,7 @@ fn fastq<R: BufRead>(lines: &mut Lines<R>, counting: &mut Counting<'_>) -> io::R
             )));
         }
         lines.header()?;
-        counting.start_record();
+        counting.start_record()?;
         let mut sequence_length = 0_u64;
         loop {
             match lines.peek()? {
@@ -190,7 +192,7 @@ mod tests {
     }
 
     #[test]
-    fn all_chunk_boundaries_match_whole_records_for_both_backends() {
+    fn all_chunk_boundaries_match_whole_records_for_all_backends() {
         let records: Vec<Vec<u8>> = vec![
             b"AC".to_vec(),
             b"GT".to_vec(),
@@ -224,7 +226,7 @@ mod tests {
         // Exercise EOF without a newline.
         fastq.truncate(fastq.len() - 2);
         fasta.truncate(fasta.len() - 2);
-        for k in [1, 3, 31, 32, 33, 65, 200] {
+        for k in [1, 3, 31, 32, 33, 63, 64, 65, 200] {
             for strand in [StrandMode::Canonical, StrandMode::Forward] {
                 let mut expected = Counter::new(k, strand).unwrap();
                 for record in &records {

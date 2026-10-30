@@ -7,8 +7,8 @@
 //!
 //! Each record contains ceil(k/4) key bytes and a u64 count. The key is a
 //! little-endian base-4 integer: A=0, C=1, G=2, T=3, with the first DNA base
-//! most significant and unused high bits zero. Thus keys with k <= 32 can be
-//! written directly from the counter's packed integers. Counts must be positive;
+//! most significant and unused high bits zero. Keys with k <= 64 are written
+//! directly from the counter's packed integers. Counts must be positive;
 //! keys must be unique and canonical when flagged. No trailing data is allowed.
 //! There is no checksum; structural validation does not detect every bit flip.
 //!
@@ -185,25 +185,30 @@ impl Counter {
         let key_bytes = self.k.div_ceil(4);
         match &self.counts {
             Counts::Packed(counts) => {
-                let mut record = [0; 16];
-                for (&key, &count) in counts {
-                    record[..key_bytes].copy_from_slice(&key.to_le_bytes()[..key_bytes]);
-                    record[key_bytes..key_bytes + 8].copy_from_slice(&count.to_le_bytes());
-                    writer.write_all(&record[..key_bytes + 8])?;
-                }
+                write_packed_binary(
+                    counts
+                        .iter()
+                        .map(|(&key, &count)| (key.to_le_bytes(), count)),
+                    key_bytes,
+                    &mut writer,
+                )?;
+            }
+            Counts::Packed128(counts) => {
+                write_packed_binary(
+                    counts.iter().map(|(&(high, low), &count)| {
+                        let key = ((high as u128) << 64) | low as u128;
+                        (key.to_le_bytes(), count)
+                    }),
+                    key_bytes,
+                    &mut writer,
+                )?;
             }
             Counts::Bytes(counts) => {
                 let mut record = buffer(key_bytes + 8)?;
                 for (key, &count) in counts {
                     record[..key_bytes].fill(0);
                     for (index, base) in key.iter().rev().enumerate() {
-                        let value = match base {
-                            b'A' => 0,
-                            b'C' => 1,
-                            b'G' => 2,
-                            b'T' => 3,
-                            _ => unreachable!("counter keys are uppercase DNA"),
-                        };
+                        let value = crate::DNA_BASES[*base as usize];
                         record[index / 4] |= value << (2 * (index % 4));
                     }
                     record[key_bytes..].copy_from_slice(&count.to_le_bytes());
@@ -229,6 +234,16 @@ impl Counter {
                     counts.try_reserve(1).map_err(io::Error::other)?;
                     counts.insert(u64::from_le_bytes(packed), count).is_some()
                 }
+                Counts::Packed128(counts) => {
+                    let mut packed = [0; 16];
+                    let size = header.k.div_ceil(4);
+                    packed[..size].copy_from_slice(&reader.record[..size]);
+                    let key = u128::from_le_bytes(packed);
+                    counts.try_reserve(1).map_err(io::Error::other)?;
+                    counts
+                        .insert(((key >> 64) as u64, key as u64), count)
+                        .is_some()
+                }
                 Counts::Bytes(counts) => {
                     counts.try_reserve(1).map_err(io::Error::other)?;
                     counts.insert(key.to_vec(), count).is_some()
@@ -240,6 +255,27 @@ impl Counter {
         }
         Ok(counter)
     }
+}
+
+fn write_packed_binary<const WIDTH: usize>(
+    entries: impl Iterator<Item = ([u8; WIDTH], u64)>,
+    key_bytes: usize,
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    let mut batch = [0; 16 * 1024];
+    let mut offset = 0;
+    for (key, count) in entries {
+        if offset + WIDTH + 8 > batch.len() {
+            writer.write_all(&batch[..offset])?;
+            offset = 0;
+        }
+        // Constant-width stores avoid a variable-size memcpy for every key.
+        // Count bytes replace any unused key padding; only the record is emitted.
+        batch[offset..offset + WIDTH].copy_from_slice(&key);
+        batch[offset + key_bytes..offset + key_bytes + 8].copy_from_slice(&count.to_le_bytes());
+        offset += key_bytes + 8;
+    }
+    writer.write_all(&batch[..offset])
 }
 
 #[cfg(test)]
@@ -324,12 +360,55 @@ mod tests {
     }
 
     #[test]
+    fn packed_output_preserves_records_across_multiple_output_batches() {
+        let mut state = 42_u64;
+        let sequence: Vec<u8> = (0..20_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                b"ACGT"[(state & 3) as usize]
+            })
+            .collect();
+        for k in [17, 31, 32, 33, 63, 64] {
+            for strand in [StrandMode::Forward, StrandMode::Canonical] {
+                let mut counter = Counter::new(k, strand).unwrap();
+                counter.add_record(&sequence).unwrap();
+                let mut expected = Vec::new();
+                for (key, count) in counter.counts() {
+                    expected.extend_from_slice(&key);
+                    writeln!(expected, "\t{count}").unwrap();
+                }
+                let mut actual = Vec::new();
+                counter.write_tsv(&mut actual).unwrap();
+                assert_eq!(actual, expected);
+                let mut binary = Vec::new();
+                counter.write_binary(&mut binary).unwrap();
+                assert!(binary.len() > 2 * 16 * 1024);
+                assert_eq!(binary.len(), 32 + counter.len() * (k.div_ceil(4) + 8));
+                let mut dumped = Vec::new();
+                DatabaseReader::new(binary.as_slice())
+                    .unwrap()
+                    .write_tsv(&mut dumped)
+                    .unwrap();
+                assert_eq!(dumped, expected);
+                let loaded = Counter::read_binary(binary.as_slice()).unwrap();
+                assert_eq!(
+                    loaded.counts().collect::<HashMap<_, _>>(),
+                    counter.counts().collect::<HashMap<_, _>>()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn preserves_full_width_keys_and_maximum_counts() {
-        for k in [1, 31, 32, 33, 64, 65] {
+        for k in [1, 31, 32, 33, 63, 64, 65] {
             let mut counter = Counter::new(k, StrandMode::Forward).unwrap();
             counter.add_record(&vec![b'T'; k]).unwrap();
             match &mut counter.counts {
                 Counts::Packed(counts) => *counts.values_mut().next().unwrap() = u64::MAX,
+                Counts::Packed128(counts) => *counts.values_mut().next().unwrap() = u64::MAX,
                 Counts::Bytes(counts) => *counts.values_mut().next().unwrap() = u64::MAX,
             }
             let mut bytes = Vec::new();

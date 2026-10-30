@@ -4,7 +4,23 @@ use std::io::{self, Write};
 
 pub mod database;
 
+// Store the high and low words separately to avoid u128 alignment padding in map entries.
+type PackedCounts128 = HashMap<(u64, u64), u64, foldhash::fast::RandomState>;
+
 type PackedCounts = HashMap<u64, u64, foldhash::fast::RandomState>;
+
+const DNA_BASES: [u8; 256] = {
+    let mut codes = [u8::MAX; 256];
+    codes[b'A' as usize] = 0;
+    codes[b'a' as usize] = 0;
+    codes[b'C' as usize] = 1;
+    codes[b'c' as usize] = 1;
+    codes[b'G' as usize] = 2;
+    codes[b'g' as usize] = 2;
+    codes[b'T' as usize] = 3;
+    codes[b't' as usize] = 3;
+    codes
+};
 
 /// Whether reverse-complement pairs share a count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,13 +54,14 @@ impl std::error::Error for Error {}
 // changing the public output format.
 enum Counts {
     Packed(PackedCounts),
+    Packed128(PackedCounts128),
     Bytes(HashMap<Vec<u8>, u64>),
 }
 
 /// An exact, in-memory DNA k-mer counter.
 ///
 /// Output keys are uppercase ASCII DNA sequences; counts accumulate across records.
-/// For k <= 32, counting uses rolling 2-bit keys without allocating individual DNA keys.
+/// Rolling 2-bit keys use 64 bits for k <= 32 and 128 bits for k <= 64.
 /// Larger k uses byte-string storage, with no maximum other than practical memory limits.
 /// Packed-key hashing uses noncryptographic FoldHash, not intended to resist adaptive
 /// collision attacks.
@@ -77,6 +94,12 @@ impl Counter {
                     .try_reserve(capacity)
                     .map_err(|_| Error::ReserveFailed)?;
                 Counts::Packed(counts)
+            } else if k <= 64 {
+                let mut counts = PackedCounts128::default();
+                counts
+                    .try_reserve(capacity)
+                    .map_err(|_| Error::ReserveFailed)?;
+                Counts::Packed128(counts)
             } else {
                 let mut counts = HashMap::new();
                 counts
@@ -105,6 +128,10 @@ impl Counter {
                 StrandMode::Forward => add_packed_record::<false>(counts, sequence, self.k),
                 StrandMode::Canonical => add_packed_record::<true>(counts, sequence, self.k),
             },
+            Counts::Packed128(counts) => match self.strand {
+                StrandMode::Forward => add_packed128_record::<false>(counts, sequence, self.k),
+                StrandMode::Canonical => add_packed128_record::<true>(counts, sequence, self.k),
+            },
             Counts::Bytes(counts) => add_byte_record(counts, sequence, self.k, self.strand),
         }
     }
@@ -113,6 +140,7 @@ impl Counter {
     pub fn len(&self) -> usize {
         match &self.counts {
             Counts::Packed(counts) => counts.len(),
+            Counts::Packed128(counts) => counts.len(),
             Counts::Bytes(counts) => counts.len(),
         }
     }
@@ -133,14 +161,20 @@ impl Counter {
         let mut suffix = [0; 22];
         match &self.counts {
             Counts::Packed(counts) => {
-                let mut row = [0; 32 + 22];
-                for (&key, &count) in counts {
-                    decode_packed_into(key, &mut row[..self.k]);
-                    let suffix = format_count(count, &mut suffix);
-                    let end = self.k + suffix.len();
-                    row[self.k..end].copy_from_slice(suffix);
-                    writer.write_all(&row[..end])?;
-                }
+                write_packed_tsv::<32, _>(
+                    counts.iter().map(|(&key, &count)| (key, count)),
+                    self.k,
+                    &mut writer,
+                    decode_packed_into,
+                )?;
+            }
+            Counts::Packed128(counts) => {
+                write_packed_tsv::<64, _>(
+                    counts.iter().map(|(&key, &count)| (key, count)),
+                    self.k,
+                    &mut writer,
+                    decode_packed128_into,
+                )?;
             }
             Counts::Bytes(counts) => {
                 for (key, &count) in counts {
@@ -167,14 +201,20 @@ impl Counter {
     /// assert_eq!(counts[b"ACG".as_slice()], 2);
     /// ```
     pub fn counts(&self) -> impl Iterator<Item = (Vec<u8>, u64)> + '_ {
-        let (packed, bytes) = match &self.counts {
-            Counts::Packed(counts) => (Some(counts.iter()), None),
-            Counts::Bytes(counts) => (None, Some(counts.iter())),
+        let (packed, wide, bytes) = match &self.counts {
+            Counts::Packed(counts) => (Some(counts.iter()), None, None),
+            Counts::Packed128(counts) => (None, Some(counts.iter()), None),
+            Counts::Bytes(counts) => (None, None, Some(counts.iter())),
         };
         packed
             .into_iter()
             .flatten()
             .map(|(&key, &count)| (decode_packed(key, self.k), count))
+            .chain(wide.into_iter().flatten().map(|(&key, &count)| {
+                let mut dna = vec![0; self.k];
+                decode_packed128_into(key, &mut dna);
+                (dna, count)
+            }))
             .chain(
                 bytes
                     .into_iter()
@@ -182,6 +222,31 @@ impl Counter {
                     .map(|(key, &count)| (key.clone(), count)),
             )
     }
+}
+
+// Assemble many rows directly in one buffer, avoiding a small memcpy and writer
+// call for every distinct key. MAX is the backend's maximum number of bases.
+fn write_packed_tsv<const MAX: usize, K>(
+    entries: impl Iterator<Item = (K, u64)>,
+    k: usize,
+    writer: &mut impl Write,
+    decode: impl Fn(K, &mut [u8]),
+) -> io::Result<()> {
+    let mut batch = [0; 16 * 1024];
+    let mut suffix = [0; 22];
+    let mut offset = 0;
+    for (key, count) in entries {
+        if offset + MAX + 22 > batch.len() {
+            writer.write_all(&batch[..offset])?;
+            offset = 0;
+        }
+        decode(key, &mut batch[offset..offset + k]);
+        let suffix = format_count(count, &mut suffix);
+        let end = offset + k + suffix.len();
+        batch[offset + k..end].copy_from_slice(suffix);
+        offset = end;
+    }
+    writer.write_all(&batch[..offset])
 }
 
 // Specialize by strand once per record, leaving no reverse-complement work in
@@ -198,18 +263,14 @@ fn add_packed_record<const CANONICAL: bool>(
     let mut valid_run = 0;
 
     for &byte in sequence {
-        let base = match byte {
-            b'A' | b'a' => 0,
-            b'C' | b'c' => 1,
-            b'G' | b'g' => 2,
-            b'T' | b't' => 3,
-            _ => {
-                forward = 0;
-                reverse = 0;
-                valid_run = 0;
-                continue;
-            }
-        };
+        let base = DNA_BASES[byte as usize];
+        if base == u8::MAX {
+            forward = 0;
+            reverse = 0;
+            valid_run = 0;
+            continue;
+        }
+        let base = u64::from(base);
         forward = ((forward << 2) | base) & mask;
         if CANONICAL {
             reverse = (reverse >> 2) | ((base ^ 3) << high_shift);
@@ -231,14 +292,81 @@ fn add_packed_record<const CANONICAL: bool>(
     Ok(())
 }
 
+fn add_packed128_record<const CANONICAL: bool>(
+    counts: &mut PackedCounts128,
+    sequence: &[u8],
+    k: usize,
+) -> Result<(), Error> {
+    // Right-shifting an all-ones mask also handles k = 64 without a shift by 128.
+    let mask = u128::MAX >> (128 - 2 * k);
+    let high_shift = 2 * (k - 1);
+    let (mut forward, mut reverse) = (0_u128, 0_u128);
+    let mut valid_run = 0;
+
+    for &byte in sequence {
+        let base = DNA_BASES[byte as usize];
+        if base == u8::MAX {
+            forward = 0;
+            reverse = 0;
+            valid_run = 0;
+            continue;
+        }
+        let base = u128::from(base);
+        forward = ((forward << 2) | base) & mask;
+        if CANONICAL {
+            reverse = (reverse >> 2) | ((base ^ 3) << high_shift);
+        }
+        valid_run = (valid_run + 1).min(k);
+        if valid_run < k {
+            continue;
+        }
+
+        // A=0, C=1, G=2, T=3 makes numeric and lexicographic order agree.
+        let key = if CANONICAL {
+            forward.min(reverse)
+        } else {
+            forward
+        };
+        let count = counts.entry(((key >> 64) as u64, key as u64)).or_insert(0);
+        *count = count.checked_add(1).ok_or(Error::CountOverflow)?;
+    }
+    Ok(())
+}
+
+fn decode_packed128_into(key: (u64, u64), dna: &mut [u8]) {
+    let split = dna.len() - 32;
+    let (high, low) = dna.split_at_mut(split);
+    decode_packed_into(key.0, high);
+    decode_packed_into(key.1, low);
+}
+
 fn decode_packed(key: u64, k: usize) -> Vec<u8> {
     let mut dna = vec![0; k];
     decode_packed_into(key, &mut dna);
     dna
 }
 
+// Decode four bases per lookup, using a 1 KiB table shared by all packed widths.
+const DECODE_BASES: [[u8; 4]; 256] = {
+    let mut table = [[0; 4]; 256];
+    let mut value = 0;
+    while value < 256 {
+        let mut base = 0;
+        while base < 4 {
+            table[value][base] = b"ACGT"[(value >> (2 * (3 - base))) & 3];
+            base += 1;
+        }
+        value += 1;
+    }
+    table
+};
 fn decode_packed_into(mut key: u64, dna: &mut [u8]) {
-    for base in dna.iter_mut().rev() {
+    let mut chunks = dna.rchunks_exact_mut(4);
+    for chunk in &mut chunks {
+        chunk.copy_from_slice(&DECODE_BASES[(key & 255) as usize]);
+        key >>= 8;
+    }
+    for base in chunks.into_remainder().iter_mut().rev() {
         *base = b"ACGT"[(key & 3) as usize];
         key >>= 2;
     }
@@ -260,8 +388,7 @@ fn format_count(mut count: u64, buffer: &mut [u8; 22]) -> &[u8] {
     &buffer[start..]
 }
 
-// Existing arbitrary-k implementation; a multiword packed backend can replace
-// this independently of the single-word counting loop and public iterator.
+// Byte-string fallback for k > 64.
 fn add_byte_record(
     counts: &mut HashMap<Vec<u8>, u64>,
     sequence: &[u8],
@@ -321,14 +448,70 @@ mod tests {
     }
 
     #[test]
+    fn packed_decoder_matches_simple_loop_for_every_length() {
+        let mut state = 42_u64;
+        for _ in 0..1024 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            for len in 0..=32 {
+                let mut actual = [0; 32];
+                decode_packed_into(state, &mut actual[..len]);
+                let expected: Vec<u8> = (0..len)
+                    .map(|index| b"ACGT"[((state >> (2 * (len - 1 - index))) & 3) as usize])
+                    .collect();
+                assert_eq!(&actual[..len], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn full_width_128_bit_keys_preserve_high_bits_and_leading_as() {
+        let mut counter = Counter::new(64, StrandMode::Forward).unwrap();
+        counter.add_record(&[b'T'; 65]).unwrap();
+        counter.add_record(&[b'A'; 64]).unwrap();
+        let leading_as = format!("{}C", "A".repeat(63));
+        counter.add_record(leading_as.as_bytes()).unwrap();
+        assert_counts(
+            &counter,
+            &[(&"T".repeat(64), 2), (&"A".repeat(64), 1), (&leading_as, 1)],
+        );
+
+        let mut canonical = Counter::new(64, StrandMode::Canonical).unwrap();
+        canonical.add_record(&[b'T'; 65]).unwrap();
+        canonical.add_record(&[b'A'; 64]).unwrap();
+        assert_counts(&canonical, &[(&"A".repeat(64), 3)]);
+    }
+
+    #[test]
+    fn every_invalid_byte_breaks_wide_packed_runs() {
+        for k in [33, 64] {
+            for strand in [StrandMode::Forward, StrandMode::Canonical] {
+                for byte in 0..=u8::MAX {
+                    if b"ACGTacgt".contains(&byte) {
+                        continue;
+                    }
+                    let mut record = vec![b'A'; k - 1];
+                    record.push(byte);
+                    record.extend(vec![b'A'; k]);
+                    let mut counter = Counter::new(k, strand).unwrap();
+                    counter.add_record(&record).unwrap();
+                    assert_counts(&counter, &[(&"A".repeat(k), 1)]);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn capacity_hint_preserves_counts_and_allows_growth() {
-        for k in [1, 3, 31, 32, 33, 65] {
+        for k in [1, 3, 31, 32, 33, 63, 64, 65] {
             for strand in [StrandMode::Canonical, StrandMode::Forward] {
                 let mut expected = Counter::new(k, strand).unwrap();
                 let mut reserved = Counter::with_capacity(k, strand, 1).unwrap();
                 assert!(reserved.is_empty());
                 let capacity = match &reserved.counts {
                     Counts::Packed(counts) => counts.capacity(),
+                    Counts::Packed128(counts) => counts.capacity(),
                     Counts::Bytes(counts) => counts.capacity(),
                 };
                 assert!(capacity >= 1);
@@ -351,7 +534,7 @@ mod tests {
             Counter::with_capacity(0, StrandMode::Canonical, usize::MAX),
             Err(Error::InvalidK)
         ));
-        for k in [31, 33] {
+        for k in [31, 33, 65] {
             assert!(matches!(
                 Counter::with_capacity(k, StrandMode::Canonical, usize::MAX),
                 Err(Error::ReserveFailed)
@@ -389,7 +572,7 @@ mod tests {
 
     #[test]
     fn tsv_formats_decimal_boundaries_and_maximum_counts() {
-        for k in [1, 32, 33, 65] {
+        for k in [1, 32, 33, 63, 64, 65] {
             let mut counter = Counter::new(k, StrandMode::Forward).unwrap();
             counter.add_record(&vec![b'A'; k]).unwrap();
             let mut values = vec![0, u64::MAX];
@@ -400,6 +583,7 @@ mod tests {
             for value in values {
                 match &mut counter.counts {
                     Counts::Packed(counts) => *counts.values_mut().next().unwrap() = value,
+                    Counts::Packed128(counts) => *counts.values_mut().next().unwrap() = value,
                     Counts::Bytes(counts) => *counts.values_mut().next().unwrap() = value,
                 }
                 let mut output = Vec::new();
@@ -544,12 +728,13 @@ mod tests {
 
     #[test]
     fn overflow_keeps_earlier_windows_and_stops_before_later_ones() {
-        for k in [1, 3, 32, 33, 65] {
+        for k in [1, 3, 32, 33, 63, 64, 65] {
             for strand in [StrandMode::Forward, StrandMode::Canonical] {
                 let mut counter = Counter::new(k, strand).unwrap();
                 counter.add_record(&vec![b'A'; k]).unwrap();
                 match &mut counter.counts {
                     Counts::Packed(counts) => *counts.values_mut().next().unwrap() = u64::MAX,
+                    Counts::Packed128(counts) => *counts.values_mut().next().unwrap() = u64::MAX,
                     Counts::Bytes(counts) => *counts.values_mut().next().unwrap() = u64::MAX,
                 }
                 let mut record = vec![b'C'];

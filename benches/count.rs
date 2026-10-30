@@ -58,7 +58,7 @@ fn bench_count(c: &mut Criterion) {
         group.throughput(Throughput::Elements(bases as u64));
         group.sampling_mode(SamplingMode::Flat);
 
-        for k in [21, 31] {
+        for k in [21, 31, 33, 63] {
             // Untimed sanity check: count exactly the valid windows, not merely keys.
             let expected: u64 = records
                 .iter()

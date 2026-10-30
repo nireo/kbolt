@@ -71,9 +71,10 @@ struct CountArgs {
 
 struct Counting<'a> {
     counter: &'a mut Counter,
-    // Retain only k-1 sequence bytes between chunks. Recounting this overlap
-    // produces no duplicate windows, including when a record is shorter than k.
+    // Batch up to 64 KiB of new sequence bytes, keeping k-1 tail bytes after each
+    // flush. Wrapped lines share a batch; record boundaries always flush/reset it.
     overlap: Vec<u8>,
+    pending: usize,
     k: usize,
     records: u64,
     bases: u64,
@@ -88,6 +89,7 @@ impl<'a> Counting<'a> {
         Self {
             counter,
             overlap: Vec::new(),
+            pending: 0,
             k,
             records: 0,
             bases: 0,
@@ -97,13 +99,17 @@ impl<'a> Counting<'a> {
         }
     }
 
-    fn start_record(&mut self) {
+    fn start_record(&mut self) -> io::Result<()> {
+        self.flush()?;
         self.overlap.clear();
         self.records += 1;
+        Ok(())
     }
 
-    fn sequence(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.overlap.extend_from_slice(bytes);
+    fn flush(&mut self) -> io::Result<()> {
+        if self.pending == 0 {
+            return Ok(());
+        }
         self.counter
             .add_record(&self.overlap)
             .map_err(io::Error::other)?;
@@ -111,8 +117,24 @@ impl<'a> Counting<'a> {
         let start = self.overlap.len() - keep;
         self.overlap.copy_within(start.., 0);
         self.overlap.truncate(keep);
+        self.pending = 0;
+        Ok(())
+    }
+
+    fn sequence(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            let take = remaining.len().min(BUFFER_SIZE - self.pending);
+            self.overlap.extend_from_slice(&remaining[..take]);
+            self.pending += take;
+            remaining = &remaining[take..];
+            if self.pending == BUFFER_SIZE {
+                self.flush()?;
+            }
+        }
         self.bases += bytes.len() as u64;
         if self.progress && self.last_report.elapsed() >= Duration::from_secs(1) {
+            self.flush()?;
             self.report()?;
             self.last_report = Instant::now();
         }
@@ -265,6 +287,43 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batched_wrapped_records_preserve_windows_and_reset_at_records() {
+        let mut sequence = b"ACGTTGCAGATTCGAC".repeat(10_000);
+        for index in [BUFFER_SIZE - 1, BUFFER_SIZE, 2 * BUFFER_SIZE + 5] {
+            sequence[index] = b'N';
+        }
+        let mut fasta = b">large\r\n".to_vec();
+        for part in sequence.chunks(77) {
+            fasta.extend_from_slice(part);
+            fasta.extend_from_slice(b"\r\n");
+        }
+        fasta.extend_from_slice(b">short\r\nAC\r\n>short2\r\nGT");
+        for k in [1, 31, 32, 33, 63, 64, 65] {
+            for strand in [StrandMode::Forward, StrandMode::Canonical] {
+                let mut expected = Counter::new(k, strand).unwrap();
+                for record in [sequence.as_slice(), b"AC", b"GT"] {
+                    expected.add_record(record).unwrap();
+                }
+                let mut actual = Counter::new(k, strand).unwrap();
+                let mut counting = Counting::new(&mut actual, k, false);
+                count_reader(fasta.as_slice(), &mut counting).unwrap();
+                assert_eq!(counting.pending, 0);
+                assert!(counting.overlap.len() < k);
+                assert!(counting.overlap.capacity() <= 2 * (BUFFER_SIZE + k - 1));
+                assert_eq!(counting.records, 3);
+                assert_eq!(counting.bases, sequence.len() as u64 + 4);
+                assert_eq!(
+                    actual.counts().collect::<std::collections::HashMap<_, _>>(),
+                    expected
+                        .counts()
+                        .collect::<std::collections::HashMap<_, _>>(),
+                    "k={k}, strand={strand:?}",
+                );
+            }
+        }
+    }
 
     #[test]
     fn counts_generated_large_record_with_bounded_input_storage() {

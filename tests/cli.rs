@@ -93,7 +93,7 @@ fn capacity_hint_preserves_output_and_is_not_a_limit() {
     let mut input = b">reads\n".to_vec();
     input.extend_from_slice(&b"acGTTACGAGTCAGATTCGAC".repeat(8));
     input.extend_from_slice(b"\n>ambiguous\nACGTNNACGT\n");
-    for k in [1, 3, 31, 32, 33, 65] {
+    for k in [1, 3, 31, 32, 33, 63, 64, 65] {
         let k = k.to_string();
         for forward in [false, true] {
             let mut args = vec!["count", "-k", &k];
@@ -152,7 +152,7 @@ fn huge_single_line_and_wrapped_fasta_preserve_chunk_windows() {
     let mut input = b">large\n".to_vec();
     input.extend_from_slice(&sequence);
     input.extend_from_slice(b"\n>short\nAC\n>short2\nGT\n");
-    for k in [1, 3, 32, 33, 65] {
+    for k in [1, 3, 32, 33, 63, 64, 65] {
         let output = run(&["count", "-k", &k.to_string(), "--forward"], &input);
         let actual = table(&output);
         let mut expected = kbolt::Counter::new(k, kbolt::StrandMode::Forward).unwrap();
@@ -273,7 +273,7 @@ fn binary_output_and_streaming_dump_match_tsv_for_all_modes() {
     let mut input = b">mixed\n".to_vec();
     input.extend_from_slice(&b"acGTTACGAGTCAGATTCGAC".repeat(8));
     input.extend_from_slice(b"\n>ambiguous\nACGTNNACGT\n");
-    for k in [1, 3, 31, 32, 33, 65] {
+    for k in [1, 3, 31, 32, 33, 63, 64, 65] {
         let k = k.to_string();
         for forward in [false, true] {
             let mut args = vec!["count", "-k", &k];

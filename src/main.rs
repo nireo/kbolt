@@ -2,12 +2,13 @@ mod input;
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use flate2::bufread::MultiGzDecoder;
+use kbolt::database::DatabaseReader;
 use kbolt::{Counter, StrandMode};
 
 const BUFFER_SIZE: usize = 64 * 1024;
@@ -25,26 +26,47 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Count k-mers; the distinct-k-mer table remains in memory
-    Count {
-        /// K-mer length (greater than zero)
-        #[arg(short = 'k', long, value_parser = clap::value_parser!(usize))]
-        k: usize,
-        /// Count forward strands separately instead of canonicalizing
-        #[arg(long)]
-        forward: bool,
-        /// Reserve space for this many distinct k-mers (a hint, not a limit)
-        #[arg(long, default_value_t = 0)]
-        capacity: usize,
-        /// Write tab-separated k-mer/count pairs here (default: stdout)
+    Count(CountArgs),
+    /// Stream a kbolt binary database as TSV; errors may leave partial output
+    Dump {
+        /// Binary database file; '-' means stdin
+        #[arg(default_value = "-")]
+        input: PathBuf,
+        /// TSV output file; '-' means stdout
         #[arg(short, long, default_value = "-")]
         output: PathBuf,
-        /// Report periodic progress and a final summary on stderr
-        #[arg(long)]
-        progress: bool,
-        /// FASTA/FASTQ files, optionally gzip-compressed; '-' means stdin
-        #[arg(value_name = "INPUT", default_value = "-")]
-        inputs: Vec<PathBuf>,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum OutputFormat {
+    Tsv,
+    Binary,
+}
+
+#[derive(Args)]
+struct CountArgs {
+    /// K-mer length (greater than zero)
+    #[arg(short = 'k', long, value_parser = clap::value_parser!(usize))]
+    k: usize,
+    /// Count forward strands separately instead of canonicalizing
+    #[arg(long)]
+    forward: bool,
+    /// Reserve space for this many distinct k-mers (a hint, not a limit)
+    #[arg(long, default_value_t = 0)]
+    capacity: usize,
+    /// Output encoding (binary files can be exported with 'kbolt dump')
+    #[arg(long = "format", value_enum, default_value = "tsv")]
+    format: OutputFormat,
+    /// Output file; '-' means stdout
+    #[arg(short, long, default_value = "-")]
+    output: PathBuf,
+    /// Report periodic progress and a final summary on stderr
+    #[arg(long)]
+    progress: bool,
+    /// FASTA/FASTQ files, optionally gzip-compressed; '-' means stdin
+    #[arg(value_name = "INPUT", default_value = "-")]
+    inputs: Vec<PathBuf>,
 }
 
 struct Counting<'a> {
@@ -136,14 +158,66 @@ fn count_reader<R: Read>(reader: R, counting: &mut Counting<'_>) -> io::Result<(
 }
 
 fn run(cli: Cli) -> io::Result<()> {
-    let Command::Count {
+    match cli.command {
+        Command::Count(args) => count_inputs(args),
+        Command::Dump { input, output } => dump(input, output),
+    }
+}
+
+fn check_output(inputs: &[PathBuf], output: &Path) -> io::Result<()> {
+    if output.as_os_str() == "-" {
+        return Ok(());
+    }
+    let output_path = match std::fs::canonicalize(output) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for path in inputs {
+        if path.as_os_str() != "-" && std::fs::canonicalize(path)? == output_path {
+            return Err(io::Error::other("output must not be an input file"));
+        }
+    }
+    Ok(())
+}
+
+fn output_writer(output: &Path) -> io::Result<BufWriter<Box<dyn Write>>> {
+    let writer: Box<dyn Write> = if output.as_os_str() == "-" {
+        Box::new(io::stdout().lock())
+    } else {
+        Box::new(File::create(output)?)
+    };
+    Ok(BufWriter::with_capacity(BUFFER_SIZE, writer))
+}
+
+fn dump(input: PathBuf, output: PathBuf) -> io::Result<()> {
+    check_output(std::slice::from_ref(&input), &output)?;
+    let result = (|| {
+        let source: Box<dyn Read> = if input.as_os_str() == "-" {
+            Box::new(io::stdin().lock())
+        } else {
+            Box::new(File::open(&input)?)
+        };
+        let reader = DatabaseReader::new(BufReader::with_capacity(BUFFER_SIZE, source))?;
+        let mut writer = output_writer(&output)?;
+        reader.write_tsv(&mut writer)?;
+        writer.flush()
+    })();
+    result.map_err(|error: io::Error| {
+        io::Error::new(error.kind(), format!("{}: {error}", input.display()))
+    })
+}
+
+fn count_inputs(args: CountArgs) -> io::Result<()> {
+    let CountArgs {
         k,
         forward,
         capacity,
+        format,
         output,
         progress,
         inputs,
-    } = cli.command;
+    } = args;
     let strand = if forward {
         StrandMode::Forward
     } else {
@@ -153,24 +227,8 @@ fn run(cli: Cli) -> io::Result<()> {
     if inputs.iter().filter(|path| path.as_os_str() == "-").count() > 1 {
         return Err(io::Error::other("stdin ('-') may only be specified once"));
     }
-    // Refuse the same path (including symlinks) for input and output. Open
-    // output only after ALL input has been read and validated.
-    let output_path = if output.as_os_str() == "-" {
-        None
-    } else {
-        match std::fs::canonicalize(&output) {
-            Ok(path) => Some(path),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        }
-    };
-    if let Some(output_path) = output_path {
-        for path in &inputs {
-            if path.as_os_str() != "-" && std::fs::canonicalize(path)? == output_path {
-                return Err(io::Error::other("output must not be an input file"));
-            }
-        }
-    }
+    // Open output only after all input has been read and validated.
+    check_output(&inputs, &output)?;
     let mut counting = Counting::new(&mut counter, k, progress);
     for path in inputs {
         let result = if path.as_os_str() == "-" {
@@ -185,13 +243,11 @@ fn run(cli: Cli) -> io::Result<()> {
     if progress {
         counting.report()?;
     }
-    let writer: Box<dyn Write> = if output.as_os_str() == "-" {
-        Box::new(io::stdout().lock())
-    } else {
-        Box::new(File::create(&output)?)
-    };
-    let mut writer = BufWriter::with_capacity(BUFFER_SIZE, writer);
-    counter.write_tsv(&mut writer)?;
+    let mut writer = output_writer(&output)?;
+    match format {
+        OutputFormat::Tsv => counter.write_tsv(&mut writer)?,
+        OutputFormat::Binary => counter.write_binary(&mut writer)?,
+    }
     writer.flush()
 }
 

@@ -267,3 +267,141 @@ fn refuses_overwriting_an_input_path() {
     assert!(!output.status.success());
     assert_eq!(fs::read(input).unwrap(), b">x\nACGT\n");
 }
+
+#[test]
+fn binary_output_and_streaming_dump_match_tsv_for_all_modes() {
+    let mut input = b">mixed\n".to_vec();
+    input.extend_from_slice(&b"acGTTACGAGTCAGATTCGAC".repeat(8));
+    input.extend_from_slice(b"\n>ambiguous\nACGTNNACGT\n");
+    for k in [1, 3, 31, 32, 33, 65] {
+        let k = k.to_string();
+        for forward in [false, true] {
+            let mut args = vec!["count", "-k", &k];
+            if forward {
+                args.push("--forward");
+            }
+            let expected = table(&run(&args, &input));
+            args.extend(["--format", "binary", "--capacity", "1000"]);
+            let binary = run(&args, &input);
+            assert!(
+                binary.status.success(),
+                "{}",
+                String::from_utf8_lossy(&binary.stderr)
+            );
+            assert!(binary.stdout.starts_with(b"KBOLTDB\0"));
+            assert!(binary.stderr.is_empty());
+            let loaded = kbolt::Counter::read_binary(binary.stdout.as_slice()).unwrap();
+            assert_eq!(loaded.len(), expected.len());
+            assert_eq!(table(&run(&["dump"], &binary.stdout)), expected);
+        }
+    }
+    for input in [b"".as_slice(), b">empty\n", b">short\nAC\n", b">n\nNNNN\n"] {
+        let binary = run(&["count", "-k", "31", "--format", "binary"], input);
+        assert!(binary.status.success());
+        assert_eq!(binary.stdout.len(), 32);
+        assert!(table(&run(&["dump", "-"], &binary.stdout)).is_empty());
+    }
+}
+
+#[test]
+fn writes_binary_file_and_exports_tsv_file() {
+    let temp = TempDir::new();
+    let database = temp.0.join("counts.kbolt");
+    let tsv = temp.0.join("counts.tsv");
+    let output = run(
+        &[
+            "count",
+            "-k",
+            "3",
+            "--format",
+            "binary",
+            "--output",
+            database.to_str().unwrap(),
+            "--progress",
+        ],
+        &gzip(b">x\nACGT\n"),
+    );
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("1 records, 4 bases, 1 distinct k-mers")
+    );
+    let output = run(
+        &[
+            "dump",
+            database.to_str().unwrap(),
+            "-o",
+            tsv.to_str().unwrap(),
+        ],
+        b"",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert_eq!(fs::read_to_string(tsv).unwrap(), "ACG\t2\n");
+}
+
+#[test]
+fn dump_rejects_invalid_databases_and_identifies_input() {
+    let binary = run(&["count", "-k", "3", "--format", "binary"], b">x\nACG\n").stdout;
+    let mut trailing = binary.clone();
+    trailing.push(0);
+    let mut version = binary.clone();
+    version[8] = 2;
+    let mut zero_count = binary.clone();
+    zero_count[33..].fill(0);
+    for input in [
+        b"".to_vec(),
+        b"not a database".to_vec(),
+        binary[..binary.len() - 1].to_vec(),
+        trailing,
+        version,
+        zero_count,
+    ] {
+        let output = run(&["dump"], &input);
+        assert!(!output.status.success());
+        assert!(!output.stderr.is_empty());
+    }
+    let temp = TempDir::new();
+    let bad = temp.file("bad.kbolt", b"bad");
+    let keep = temp.file("keep.tsv", b"keep me\n");
+    let output = run(&["dump", &bad, "-o", &keep], b"");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("bad.kbolt"));
+    assert_eq!(fs::read(keep).unwrap(), b"keep me\n");
+    assert!(
+        !run(&["dump", "/nonexistent/kbolt.db"], b"")
+            .status
+            .success()
+    );
+    assert!(
+        !run(&["count", "-k", "3", "--format", "unknown"], b"")
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn binary_count_and_dump_refuse_overwriting_inputs() {
+    let temp = TempDir::new();
+    let input = temp.file("input.fa", b">x\nACGT\n");
+    let output = run(
+        &[
+            "count", "-k", "3", "--format", "binary", "-o", &input, &input,
+        ],
+        b"",
+    );
+    assert!(!output.status.success());
+    assert_eq!(fs::read(&input).unwrap(), b">x\nACGT\n");
+    let binary = run(&["count", "-k", "3", "--format", "binary"], b">x\nACGT\n").stdout;
+    let database = temp.file("counts.kbolt", &binary);
+    assert!(
+        !run(&["dump", &database, "-o", &database], b"")
+            .status
+            .success()
+    );
+    assert_eq!(fs::read(database).unwrap(), binary);
+}

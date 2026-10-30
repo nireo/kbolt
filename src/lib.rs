@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
 
+pub mod database;
+
 type PackedCounts = HashMap<u64, u64, foldhash::fast::RandomState>;
 
 /// Whether reverse-complement pairs share a count.

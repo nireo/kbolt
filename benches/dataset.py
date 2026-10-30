@@ -104,6 +104,8 @@ def main():
     parser.add_argument("--forward", action="store_true")
     parser.add_argument("--capacity", type=nonnegative, default=0,
                         help="initial distinct-k-mer capacity hint (default: 0)")
+    parser.add_argument("--format", choices=["tsv", "binary"], default="tsv",
+                        help="output encoding to benchmark (default: tsv)")
     parser.add_argument("--runs", type=positive, default=10)
     parser.add_argument("--warmup", type=positive, default=2)
     args = parser.parse_args()
@@ -125,6 +127,7 @@ def main():
     if args.forward:
         command.append("--forward")
     command.extend(["--capacity", str(args.capacity)])
+    command.extend(["--format", args.format])
     command.append(str(path))
 
     report = {
@@ -137,7 +140,7 @@ def main():
         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
         "input": metadata,
         "command": command,
-        "stdout": "discarded to /dev/null; formatting and writes included",
+        "stdout": "discarded to /dev/null; output serialization and writes included",
         "cache": "warm; input scanned and warmup runs completed before timing",
         "warmup_runs": args.warmup,
     }

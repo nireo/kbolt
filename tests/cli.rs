@@ -89,6 +89,40 @@ fn stdin_defaults_to_canonical_and_forward_is_explicit() {
 }
 
 #[test]
+fn capacity_hint_preserves_output_and_is_not_a_limit() {
+    let mut input = b">reads\n".to_vec();
+    input.extend_from_slice(&b"acGTTACGAGTCAGATTCGAC".repeat(8));
+    input.extend_from_slice(b"\n>ambiguous\nACGTNNACGT\n");
+    for k in [1, 3, 31, 32, 33, 65] {
+        let k = k.to_string();
+        for forward in [false, true] {
+            let mut args = vec!["count", "-k", &k];
+            if forward {
+                args.push("--forward");
+            }
+            let expected = table(&run(&args, &input));
+            for capacity in ["0", "1", "1000"] {
+                let mut args = args.clone();
+                args.extend(["--capacity", capacity]);
+                assert_eq!(table(&run(&args, &input)), expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn rejects_invalid_and_unrepresentable_capacity() {
+    for capacity in ["-1", "abc", &usize::MAX.to_string()] {
+        let output = run(&["count", "-k", "31", "--capacity", capacity], b">x\nACG\n");
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!error.is_empty());
+        assert!(!error.contains("panicked"), "{error}");
+    }
+}
+
+#[test]
 fn accepts_wrapped_fastq_crlf_and_no_final_newline() {
     let output = run(&["count", "-k", "3"], b"@x\r\nAC\r\nGT\r\n+\r\n@+\r\n!!");
     assert_eq!(table(&output), BTreeMap::from([("ACG".to_owned(), 2)]));

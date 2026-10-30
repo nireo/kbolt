@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::io::{self, Write};
 
 type PackedCounts = HashMap<u64, u64, foldhash::fast::RandomState>;
 
@@ -16,6 +17,7 @@ pub enum StrandMode {
 pub enum Error {
     InvalidK,
     CountOverflow,
+    ReserveFailed,
 }
 
 impl fmt::Display for Error {
@@ -23,6 +25,7 @@ impl fmt::Display for Error {
         match self {
             Self::InvalidK => f.write_str("k must be greater than zero"),
             Self::CountOverflow => f.write_str("k-mer count exceeds u64::MAX"),
+            Self::ReserveFailed => f.write_str("unable to reserve k-mer table capacity"),
         }
     }
 }
@@ -52,15 +55,32 @@ pub struct Counter {
 impl Counter {
     /// Create an empty counter. Reject k = 0 with `Error::InvalidK`.
     pub fn new(k: usize, strand: StrandMode) -> Result<Self, Error> {
+        Self::with_capacity(k, strand, 0)
+    }
+
+    /// Create an empty counter with space for at least `capacity` distinct k-mers.
+    ///
+    /// This is an allocation hint, not a limit; the table grows as needed.
+    /// Reject k = 0 with `Error::InvalidK`. Return `Error::ReserveFailed` if the
+    /// requested capacity overflows or the allocation fails.
+    pub fn with_capacity(k: usize, strand: StrandMode, capacity: usize) -> Result<Self, Error> {
         if k == 0 {
             return Err(Error::InvalidK);
         }
 
         Ok(Self {
             counts: if k <= 32 {
-                Counts::Packed(PackedCounts::default())
+                let mut counts = PackedCounts::default();
+                counts
+                    .try_reserve(capacity)
+                    .map_err(|_| Error::ReserveFailed)?;
+                Counts::Packed(counts)
             } else {
-                Counts::Bytes(HashMap::new())
+                let mut counts = HashMap::new();
+                counts
+                    .try_reserve(capacity)
+                    .map_err(|_| Error::ReserveFailed)?;
+                Counts::Bytes(counts)
             },
             strand,
             k,
@@ -98,6 +118,36 @@ impl Counter {
     /// Return whether no valid k-mers have been counted.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Write headerless `KMER<TAB>COUNT` rows, in unspecified order.
+    ///
+    /// Reuses stack buffers for packed keys and decimal counts; larger keys are
+    /// borrowed from the table. No per-row heap allocation is needed. Wrap files
+    /// or stdout in a [`io::BufWriter`] to batch writes. This method does not flush
+    /// the writer; write failures may leave partial output.
+    pub fn write_tsv(&self, mut writer: impl Write) -> io::Result<()> {
+        // A u64 has at most 20 decimal digits, plus a tab and newline.
+        let mut suffix = [0; 22];
+        match &self.counts {
+            Counts::Packed(counts) => {
+                let mut row = [0; 32 + 22];
+                for (&key, &count) in counts {
+                    decode_packed_into(key, &mut row[..self.k]);
+                    let suffix = format_count(count, &mut suffix);
+                    let end = self.k + suffix.len();
+                    row[self.k..end].copy_from_slice(suffix);
+                    writer.write_all(&row[..end])?;
+                }
+            }
+            Counts::Bytes(counts) => {
+                for (key, &count) in counts {
+                    writer.write_all(key)?;
+                    writer.write_all(format_count(count, &mut suffix))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Iterate over distinct uppercase DNA keys and their counts, in unspecified order.
@@ -179,13 +229,33 @@ fn add_packed_record<const CANONICAL: bool>(
     Ok(())
 }
 
-fn decode_packed(mut key: u64, k: usize) -> Vec<u8> {
+fn decode_packed(key: u64, k: usize) -> Vec<u8> {
     let mut dna = vec![0; k];
+    decode_packed_into(key, &mut dna);
+    dna
+}
+
+fn decode_packed_into(mut key: u64, dna: &mut [u8]) {
     for base in dna.iter_mut().rev() {
         *base = b"ACGT"[(key & 3) as usize];
         key >>= 2;
     }
-    dna
+}
+
+fn format_count(mut count: u64, buffer: &mut [u8; 22]) -> &[u8] {
+    buffer[21] = b'\n';
+    let mut start = 21;
+    loop {
+        start -= 1;
+        buffer[start] = b'0' + (count % 10) as u8;
+        count /= 10;
+        if count == 0 {
+            break;
+        }
+    }
+    start -= 1;
+    buffer[start] = b'\t';
+    &buffer[start..]
 }
 
 // Existing arbitrary-k implementation; a multiword packed backend can replace
@@ -246,6 +316,135 @@ mod tests {
             .map(|(key, count)| (key.as_bytes().to_vec(), *count))
             .collect();
         assert_eq!(counter.counts().collect::<HashMap<_, _>>(), expected);
+    }
+
+    #[test]
+    fn capacity_hint_preserves_counts_and_allows_growth() {
+        for k in [1, 3, 31, 32, 33, 65] {
+            for strand in [StrandMode::Canonical, StrandMode::Forward] {
+                let mut expected = Counter::new(k, strand).unwrap();
+                let mut reserved = Counter::with_capacity(k, strand, 1).unwrap();
+                assert!(reserved.is_empty());
+                let capacity = match &reserved.counts {
+                    Counts::Packed(counts) => counts.capacity(),
+                    Counts::Bytes(counts) => counts.capacity(),
+                };
+                assert!(capacity >= 1);
+                for record in [b"ACGTTACGAGTCAGATTCGAC".repeat(8), vec![b'T'; 80]] {
+                    expected.add_record(&record).unwrap();
+                    reserved.add_record(&record).unwrap();
+                }
+                assert!(reserved.len() > 1);
+                assert_eq!(
+                    reserved.counts().collect::<HashMap<_, _>>(),
+                    expected.counts().collect::<HashMap<_, _>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_k_and_unrepresentable_capacity() {
+        assert!(matches!(
+            Counter::with_capacity(0, StrandMode::Canonical, usize::MAX),
+            Err(Error::InvalidK)
+        ));
+        for k in [31, 33] {
+            assert!(matches!(
+                Counter::with_capacity(k, StrandMode::Canonical, usize::MAX),
+                Err(Error::ReserveFailed)
+            ));
+        }
+    }
+
+    #[test]
+    fn tsv_matches_iterator_for_both_backends_and_strands() {
+        for k in 1..=66 {
+            for strand in [StrandMode::Canonical, StrandMode::Forward] {
+                let mut counter = Counter::new(k, strand).unwrap();
+                let mut empty = Vec::new();
+                counter.write_tsv(&mut empty).unwrap();
+                assert!(empty.is_empty());
+                for record in [
+                    b"acgTTacGAGTCAGATTCGAC".repeat(8),
+                    vec![b'T'; 80],
+                    vec![b'A'; 80],
+                    b"ACGTNACGT.--ACGT".repeat(8),
+                ] {
+                    counter.add_record(&record).unwrap();
+                }
+                let mut expected = Vec::new();
+                for (key, count) in counter.counts() {
+                    expected.extend_from_slice(&key);
+                    writeln!(expected, "\t{count}").unwrap();
+                }
+                let mut actual = Vec::new();
+                counter.write_tsv(&mut actual).unwrap();
+                assert_eq!(actual, expected, "k={k}, strand={strand:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn tsv_formats_decimal_boundaries_and_maximum_counts() {
+        for k in [1, 32, 33, 65] {
+            let mut counter = Counter::new(k, StrandMode::Forward).unwrap();
+            counter.add_record(&vec![b'A'; k]).unwrap();
+            let mut values = vec![0, u64::MAX];
+            for exponent in 0..=19 {
+                let power = 10_u64.pow(exponent);
+                values.extend([power - 1, power, power + 1]);
+            }
+            for value in values {
+                match &mut counter.counts {
+                    Counts::Packed(counts) => *counts.values_mut().next().unwrap() = value,
+                    Counts::Bytes(counts) => *counts.values_mut().next().unwrap() = value,
+                }
+                let mut output = Vec::new();
+                counter.write_tsv(&mut output).unwrap();
+                assert_eq!(output, format!("{}\t{value}\n", "A".repeat(k)).as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn tsv_handles_short_writes_and_propagates_write_failures() {
+        struct Writer {
+            bytes: Vec<u8>,
+            remaining: usize,
+        }
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.remaining == 0 {
+                    return Err(io::Error::other("injected output failure"));
+                }
+                let len = bytes.len().min(self.remaining).min(2);
+                self.bytes.extend_from_slice(&bytes[..len]);
+                self.remaining -= len;
+                Ok(len)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                panic!("write_tsv must leave flushing to the caller")
+            }
+        }
+        for k in [3, 33] {
+            let mut counter = Counter::new(k, StrandMode::Forward).unwrap();
+            counter.add_record(&vec![b'A'; k]).unwrap();
+            let expected = format!("{}\t1\n", "A".repeat(k));
+            for remaining in [0, 2, k, k + 1, expected.len()] {
+                let mut writer = Writer {
+                    bytes: Vec::new(),
+                    remaining,
+                };
+                let result = counter.write_tsv(&mut writer);
+                if remaining == expected.len() {
+                    result.unwrap();
+                } else {
+                    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Other);
+                }
+                assert_eq!(writer.bytes, &expected.as_bytes()[..remaining]);
+            }
+        }
     }
 
     #[test]

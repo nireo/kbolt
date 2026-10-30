@@ -32,6 +32,9 @@ enum Command {
         /// Count forward strands separately instead of canonicalizing
         #[arg(long)]
         forward: bool,
+        /// Reserve space for this many distinct k-mers (a hint, not a limit)
+        #[arg(long, default_value_t = 0)]
+        capacity: usize,
         /// Write tab-separated k-mer/count pairs here (default: stdout)
         #[arg(short, long, default_value = "-")]
         output: PathBuf,
@@ -136,6 +139,7 @@ fn run(cli: Cli) -> io::Result<()> {
     let Command::Count {
         k,
         forward,
+        capacity,
         output,
         progress,
         inputs,
@@ -145,7 +149,7 @@ fn run(cli: Cli) -> io::Result<()> {
     } else {
         StrandMode::Canonical
     };
-    let mut counter = Counter::new(k, strand).map_err(io::Error::other)?;
+    let mut counter = Counter::with_capacity(k, strand, capacity).map_err(io::Error::other)?;
     if inputs.iter().filter(|path| path.as_os_str() == "-").count() > 1 {
         return Err(io::Error::other("stdin ('-') may only be specified once"));
     }
@@ -187,10 +191,7 @@ fn run(cli: Cli) -> io::Result<()> {
         Box::new(File::create(&output)?)
     };
     let mut writer = BufWriter::with_capacity(BUFFER_SIZE, writer);
-    for (key, count) in counter.counts() {
-        writer.write_all(&key)?;
-        writeln!(writer, "\t{count}")?;
-    }
+    counter.write_tsv(&mut writer)?;
     writer.flush()
 }
 

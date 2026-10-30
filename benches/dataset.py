@@ -29,6 +29,13 @@ def positive(value):
     return number
 
 
+def nonnegative(value):
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return number
+
+
 def capture(*command):
     return subprocess.check_output(command, cwd=ROOT, text=True).strip()
 
@@ -95,6 +102,8 @@ def main():
                         help="uncompressed FASTA (default: downloaded E. coli)")
     parser.add_argument("-k", type=positive, default=31)
     parser.add_argument("--forward", action="store_true")
+    parser.add_argument("--capacity", type=nonnegative, default=0,
+                        help="initial distinct-k-mer capacity hint (default: 0)")
     parser.add_argument("--runs", type=positive, default=10)
     parser.add_argument("--warmup", type=positive, default=2)
     args = parser.parse_args()
@@ -115,6 +124,7 @@ def main():
     command = [str(binary), "count", "-k", str(args.k)]
     if args.forward:
         command.append("--forward")
+    command.extend(["--capacity", str(args.capacity)])
     command.append(str(path))
 
     report = {

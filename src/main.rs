@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use flate2::bufread::MultiGzDecoder;
 use kbolt::database::DatabaseReader;
-use kbolt::{Counter, StrandMode};
+use kbolt::{Counter, ParallelCounter, StrandMode};
 
 const BUFFER_SIZE: usize = 64 * 1024;
 
@@ -55,6 +55,12 @@ struct CountArgs {
     /// Reserve space for this many distinct k-mers (a hint, not a limit)
     #[arg(long, default_value_t = 0)]
     capacity: usize,
+    /// Counting workers; the input parser runs on the calling thread
+    #[arg(short = 't', long, default_value_t = 1, value_parser = parse_threads)]
+    threads: usize,
+    /// Print counting, merge, and output wall times on stderr
+    #[arg(long)]
+    timings: bool,
     /// Output encoding (binary files can be exported with 'kbolt dump')
     #[arg(long = "format", value_enum, default_value = "tsv")]
     format: OutputFormat,
@@ -69,8 +75,21 @@ struct CountArgs {
     inputs: Vec<PathBuf>,
 }
 
+fn parse_threads(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|&n| n > 0 && n <= usize::MAX / 2)
+        .ok_or_else(|| "threads must be a positive, representable worker count".to_owned())
+}
+
+enum CountSink<'a> {
+    Serial(&'a mut Counter),
+    Parallel(&'a mut ParallelCounter),
+}
+
 struct Counting<'a> {
-    counter: &'a mut Counter,
+    counter: CountSink<'a>,
     // Batch up to 64 KiB of new sequence bytes, keeping k-1 tail bytes after each
     // flush. Wrapped lines share a batch; record boundaries always flush/reset it.
     overlap: Vec<u8>,
@@ -85,6 +104,10 @@ struct Counting<'a> {
 
 impl<'a> Counting<'a> {
     fn new(counter: &'a mut Counter, k: usize, progress: bool) -> Self {
+        Self::with_sink(CountSink::Serial(counter), k, progress)
+    }
+
+    fn with_sink(counter: CountSink<'a>, k: usize, progress: bool) -> Self {
         let now = Instant::now();
         Self {
             counter,
@@ -110,9 +133,11 @@ impl<'a> Counting<'a> {
         if self.pending == 0 {
             return Ok(());
         }
-        self.counter
-            .add_record(&self.overlap)
-            .map_err(io::Error::other)?;
+        match &mut self.counter {
+            CountSink::Serial(counter) => counter.add_record(&self.overlap),
+            CountSink::Parallel(counter) => counter.add_record(&self.overlap),
+        }
+        .map_err(io::Error::other)?;
         let keep = (self.k - 1).min(self.overlap.len());
         let start = self.overlap.len() - keep;
         self.overlap.copy_within(start.., 0);
@@ -142,14 +167,23 @@ impl<'a> Counting<'a> {
     }
 
     fn report(&self) -> io::Result<()> {
-        writeln!(
-            io::stderr().lock(),
-            "{} records, {} bases, {} distinct k-mers, {:.1}s elapsed",
-            self.records,
-            self.bases,
-            self.counter.len(),
-            self.started.elapsed().as_secs_f64(),
-        )
+        match &self.counter {
+            CountSink::Serial(counter) => writeln!(
+                io::stderr().lock(),
+                "{} records, {} bases, {} distinct k-mers, {:.1}s elapsed",
+                self.records,
+                self.bases,
+                counter.len(),
+                self.started.elapsed().as_secs_f64(),
+            ),
+            CountSink::Parallel(_) => writeln!(
+                io::stderr().lock(),
+                "{} records, {} bases submitted, {:.1}s elapsed",
+                self.records,
+                self.bases,
+                self.started.elapsed().as_secs_f64(),
+            ),
+        }
     }
 }
 
@@ -235,6 +269,8 @@ fn count_inputs(args: CountArgs) -> io::Result<()> {
         k,
         forward,
         capacity,
+        threads,
+        timings,
         format,
         output,
         progress,
@@ -245,13 +281,26 @@ fn count_inputs(args: CountArgs) -> io::Result<()> {
     } else {
         StrandMode::Canonical
     };
-    let mut counter = Counter::with_capacity(k, strand, capacity).map_err(io::Error::other)?;
     if inputs.iter().filter(|path| path.as_os_str() == "-").count() > 1 {
         return Err(io::Error::other("stdin ('-') may only be specified once"));
     }
     // Open output only after all input has been read and validated.
     check_output(&inputs, &output)?;
-    let mut counting = Counting::new(&mut counter, k, progress);
+    let started = Instant::now();
+    let mut counter = Counter::with_capacity(k, strand, if threads == 1 { capacity } else { 0 })
+        .map_err(io::Error::other)?;
+    let mut parallel = if threads > 1 {
+        Some(
+            ParallelCounter::with_capacity(k, strand, threads, capacity)
+                .map_err(io::Error::other)?,
+        )
+    } else {
+        None
+    };
+    let mut counting = match &mut parallel {
+        Some(parallel) => Counting::with_sink(CountSink::Parallel(parallel), k, progress),
+        None => Counting::new(&mut counter, k, progress),
+    };
     for path in inputs {
         let result = if path.as_os_str() == "-" {
             count_reader(io::stdin().lock(), &mut counting)
@@ -262,15 +311,42 @@ fn count_inputs(args: CountArgs) -> io::Result<()> {
             io::Error::new(error.kind(), format!("{}: {error}", path.display()))
         })?;
     }
+    let records = counting.records;
+    let bases = counting.bases;
+    drop(counting);
+    let (counting_time, merge_time) = if let Some(parallel) = parallel {
+        let (result, stats) = parallel.finish_with_stats().map_err(io::Error::other)?;
+        counter = result;
+        (stats.counting, stats.merging)
+    } else {
+        (started.elapsed(), Duration::ZERO)
+    };
     if progress {
-        counting.report()?;
+        writeln!(
+            io::stderr().lock(),
+            "{records} records, {bases} bases, {} distinct k-mers, {:.1}s elapsed",
+            counter.len(),
+            started.elapsed().as_secs_f64()
+        )?;
     }
+    let output_started = Instant::now();
     let mut writer = output_writer(&output)?;
     match format {
         OutputFormat::Tsv => counter.write_tsv(&mut writer)?,
         OutputFormat::Binary => counter.write_binary(&mut writer)?,
     }
-    writer.flush()
+    writer.flush()?;
+    if timings {
+        writeln!(
+            io::stderr().lock(),
+            "timings: counting={:.6}s merging={:.6}s output={:.6}s total={:.6}s",
+            counting_time.as_secs_f64(),
+            merge_time.as_secs_f64(),
+            output_started.elapsed().as_secs_f64(),
+            started.elapsed().as_secs_f64()
+        )?;
+    }
+    Ok(())
 }
 
 fn main() -> ExitCode {

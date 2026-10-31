@@ -405,3 +405,63 @@ fn binary_count_and_dump_refuse_overwriting_inputs() {
     );
     assert_eq!(fs::read(database).unwrap(), binary);
 }
+
+#[test]
+fn parallel_cli_matches_serial_for_formats_compression_and_record_boundaries() {
+    let mut sequence = b"acGTTGCAGATTCGAC".repeat(40_000);
+    for index in [65_535, 65_536, 262_143, 262_144] {
+        sequence[index] = b'N';
+    }
+    let mut fasta = b">long\r\n".to_vec();
+    for part in sequence.chunks(77) {
+        fasta.extend_from_slice(part);
+        fasta.extend_from_slice(b"\r\n");
+    }
+    fasta.extend_from_slice(b">short\nAC\n>short2\nGT\n");
+    for k in [1, 31, 32, 33, 63, 64, 65] {
+        let k = k.to_string();
+        for forward in [false, true] {
+            let mut args = vec!["count", "-k", &k];
+            if forward {
+                args.push("--forward");
+            }
+            let expected = table(&run(&args, &fasta));
+            args.extend(["--threads", "3", "--progress", "--timings"]);
+            let parallel = run(&args, &gzip(&fasta));
+            assert_eq!(table(&parallel), expected);
+            let stderr = String::from_utf8_lossy(&parallel.stderr);
+            assert!(stderr.contains("timings: counting="), "{stderr}");
+            assert!(stderr.contains("distinct k-mers"), "{stderr}");
+            args.extend(["--format", "binary"]);
+            let binary = run(&args, &fasta);
+            assert!(binary.status.success());
+            assert_eq!(table(&run(&["dump"], &binary.stdout)), expected);
+        }
+    }
+    // FASTQ qualities, mixed files, stdin, and invalid input retain their semantics.
+    let temp = TempDir::new();
+    let path = temp.file("reads.fastq", b"@a\nACG\n+\n!!!\n@b\nCGT\n+\n@@@\n");
+    assert_eq!(
+        table(&run(
+            &["count", "-k", "3", "-t", "2", &path, "-"],
+            b">c\nACG\n"
+        )),
+        BTreeMap::from([("ACG".to_owned(), 3)])
+    );
+    let output = temp.file("keep.tsv", b"keep me\n");
+    let bad = run(
+        &["count", "-k", "3", "-t", "2", "-o", &output],
+        b"@x\nACGT\n+\n!!!\n",
+    );
+    assert!(!bad.status.success());
+    assert!(bad.stdout.is_empty());
+    assert_eq!(fs::read(output).unwrap(), b"keep me\n");
+    assert!(table(&run(&["count", "-k", "31", "-t", "2",], b"")).is_empty());
+    for threads in ["0", "-1", "18446744073709551615"] {
+        assert!(
+            !run(&["count", "-k", "3", "--threads", threads], b"")
+                .status
+                .success()
+        );
+    }
+}

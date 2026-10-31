@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+crossbeam-channel = "0.5"
 flate2 = "1.1"
 foldhash = "0.2.0"
 memchr = "2.8"
@@ -15,3 +16,7 @@ harness = false
 
 [dev-dependencies]
 criterion = "0.8.2"
+
+[[bench]]
+name = "parallel"
+harness = false

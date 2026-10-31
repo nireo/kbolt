@@ -3,6 +3,9 @@ use std::fmt;
 use std::io::{self, Write};
 
 pub mod database;
+mod parallel;
+
+pub use parallel::{ParallelCounter, ParallelStats};
 
 // Store the high and low words separately to avoid u128 alignment padding in map entries.
 type PackedCounts128 = HashMap<(u64, u64), u64, foldhash::fast::RandomState>;
@@ -36,6 +39,9 @@ pub enum Error {
     InvalidK,
     CountOverflow,
     ReserveFailed,
+    IncompatibleCounters,
+    InvalidThreads,
+    WorkerFailed,
 }
 
 impl fmt::Display for Error {
@@ -44,6 +50,13 @@ impl fmt::Display for Error {
             Self::InvalidK => f.write_str("k must be greater than zero"),
             Self::CountOverflow => f.write_str("k-mer count exceeds u64::MAX"),
             Self::ReserveFailed => f.write_str("unable to reserve k-mer table capacity"),
+            Self::IncompatibleCounters => {
+                f.write_str("counters must have the same k and strand mode")
+            }
+            Self::InvalidThreads => {
+                f.write_str("worker count must be greater than zero and representable")
+            }
+            Self::WorkerFailed => f.write_str("unable to start or complete a counting worker"),
         }
     }
 }
@@ -136,6 +149,21 @@ impl Counter {
         }
     }
 
+    /// Consume another counter with the same k and strand mode, adding its counts.
+    /// Keys remain packed; no DNA decoding or per-key allocation is needed for k <= 64.
+    /// On overflow, earlier entries may have been merged; the overflowing count is unchanged.
+    pub fn merge(&mut self, other: Self) -> Result<(), Error> {
+        if self.k != other.k || self.strand != other.strand {
+            return Err(Error::IncompatibleCounters);
+        }
+        match (&mut self.counts, other.counts) {
+            (Counts::Packed(target), Counts::Packed(source)) => merge_counts(target, source),
+            (Counts::Packed128(target), Counts::Packed128(source)) => merge_counts(target, source),
+            (Counts::Bytes(target), Counts::Bytes(source)) => merge_counts(target, source),
+            _ => unreachable!("matching k selects matching representations"),
+        }
+    }
+
     /// Return the number of distinct k-mers counted so far.
     pub fn len(&self) -> usize {
         match &self.counts {
@@ -222,6 +250,20 @@ impl Counter {
                     .map(|(key, &count)| (key.clone(), count)),
             )
     }
+}
+
+fn merge_counts<K: Eq + std::hash::Hash, S: std::hash::BuildHasher>(
+    target: &mut HashMap<K, u64, S>,
+    source: HashMap<K, u64, S>,
+) -> Result<(), Error> {
+    target
+        .try_reserve(source.len())
+        .map_err(|_| Error::ReserveFailed)?;
+    for (key, delta) in source {
+        let count = target.entry(key).or_insert(0);
+        *count = count.checked_add(delta).ok_or(Error::CountOverflow)?;
+    }
+    Ok(())
 }
 
 // Assemble many rows directly in one buffer, avoiding a small memcpy and writer

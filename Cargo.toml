@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 crossbeam-channel = "0.5"
-flate2 = "1.1"
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs", "runtime_detection"] }
 foldhash = "0.2.0"
 memchr = "2.8"
 

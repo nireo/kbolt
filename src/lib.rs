@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::hash::{BuildHasher, Hash};
 use std::io::{self, Write};
 
 pub mod database;
 mod parallel;
 
-pub use parallel::{ParallelCounter, ParallelStats};
+pub use parallel::{ParallelCounter, ParallelInput, ParallelStats};
 
 // Store the high and low words separately to avoid u128 alignment padding in map entries.
 type PackedCounts128 = HashMap<(u64, u64), u64, foldhash::fast::RandomState>;
@@ -80,6 +81,9 @@ enum Counts {
 /// collision attacks.
 pub struct Counter {
     counts: Counts,
+    // Partition zero is `counts`; remaining partitions retain their own maps.
+    partitions: Vec<Counts>,
+    partition_hash: Option<foldhash::fast::RandomState>,
     strand: StrandMode,
     k: usize,
 }
@@ -120,6 +124,8 @@ impl Counter {
                     .map_err(|_| Error::ReserveFailed)?;
                 Counts::Bytes(counts)
             },
+            partitions: Vec::new(),
+            partition_hash: None,
             strand,
             k,
         })
@@ -136,6 +142,29 @@ impl Counter {
             return Ok(());
         }
 
+        if !self.partitions.is_empty() {
+            let (k, strand) = (self.k, self.strand);
+            return match &self.counts {
+                Counts::Packed(_) => visit_packed(sequence, k, strand, |key| {
+                    let Counts::Packed(map) = self.partition_mut(&key) else {
+                        unreachable!()
+                    };
+                    add_delta(map, key, 1)
+                }),
+                Counts::Packed128(_) => visit_packed128(sequence, k, strand, |key| {
+                    let Counts::Packed128(map) = self.partition_mut(&key) else {
+                        unreachable!()
+                    };
+                    add_delta(map, key, 1)
+                }),
+                Counts::Bytes(_) => visit_bytes(sequence, k, strand, |key| {
+                    let Counts::Bytes(map) = self.partition_mut(key) else {
+                        unreachable!()
+                    };
+                    add_byte_delta(map, key, 1)
+                }),
+            };
+        }
         match &mut self.counts {
             Counts::Packed(counts) => match self.strand {
                 StrandMode::Forward => add_packed_record::<false>(counts, sequence, self.k),
@@ -156,21 +185,90 @@ impl Counter {
         if self.k != other.k || self.strand != other.strand {
             return Err(Error::IncompatibleCounters);
         }
-        match (&mut self.counts, other.counts) {
-            (Counts::Packed(target), Counts::Packed(source)) => merge_counts(target, source),
-            (Counts::Packed128(target), Counts::Packed128(source)) => merge_counts(target, source),
-            (Counts::Bytes(target), Counts::Bytes(source)) => merge_counts(target, source),
-            _ => unreachable!("matching k selects matching representations"),
+        for source in std::iter::once(other.counts).chain(other.partitions) {
+            if self.partitions.is_empty() {
+                match (&mut self.counts, source) {
+                    (Counts::Packed(target), Counts::Packed(source)) => {
+                        merge_counts(target, source)?
+                    }
+                    (Counts::Packed128(target), Counts::Packed128(source)) => {
+                        merge_counts(target, source)?
+                    }
+                    (Counts::Bytes(target), Counts::Bytes(source)) => merge_counts(target, source)?,
+                    _ => unreachable!("matching k selects matching representations"),
+                }
+            } else {
+                match source {
+                    Counts::Packed(source) => {
+                        for (key, delta) in source {
+                            let Counts::Packed(target) = self.partition_mut(&key) else {
+                                unreachable!()
+                            };
+                            add_delta(target, key, delta)?;
+                        }
+                    }
+                    Counts::Packed128(source) => {
+                        for (key, delta) in source {
+                            let Counts::Packed128(target) = self.partition_mut(&key) else {
+                                unreachable!()
+                            };
+                            add_delta(target, key, delta)?;
+                        }
+                    }
+                    Counts::Bytes(source) => {
+                        for (key, delta) in source {
+                            let Counts::Bytes(target) = self.partition_mut(&key) else {
+                                unreachable!()
+                            };
+                            add_delta(target, key, delta)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn from_partitions(
+        k: usize,
+        strand: StrandMode,
+        partitions: Vec<Counts>,
+        hash: foldhash::fast::RandomState,
+    ) -> Self {
+        debug_assert!(partitions.len().is_power_of_two());
+        let mut partitions = partitions.into_iter();
+        Self {
+            counts: partitions.next().unwrap(),
+            partitions: partitions.collect(),
+            partition_hash: Some(hash),
+            k,
+            strand,
+        }
+    }
+
+    fn tables(&self) -> impl Iterator<Item = &Counts> {
+        std::iter::once(&self.counts).chain(&self.partitions)
+    }
+
+    fn partition_mut<K: Hash + ?Sized>(&mut self, key: &K) -> &mut Counts {
+        let index =
+            self.partition_hash.as_ref().unwrap().hash_one(key) as usize & self.partitions.len();
+        if index == 0 {
+            &mut self.counts
+        } else {
+            &mut self.partitions[index - 1]
         }
     }
 
     /// Return the number of distinct k-mers counted so far.
     pub fn len(&self) -> usize {
-        match &self.counts {
-            Counts::Packed(counts) => counts.len(),
-            Counts::Packed128(counts) => counts.len(),
-            Counts::Bytes(counts) => counts.len(),
-        }
+        self.tables()
+            .map(|table| match table {
+                Counts::Packed(map) => map.len(),
+                Counts::Packed128(map) => map.len(),
+                Counts::Bytes(map) => map.len(),
+            })
+            .sum()
     }
 
     /// Return whether no valid k-mers have been counted.
@@ -187,27 +285,29 @@ impl Counter {
     pub fn write_tsv(&self, mut writer: impl Write) -> io::Result<()> {
         // A u64 has at most 20 decimal digits, plus a tab and newline.
         let mut suffix = [0; 22];
-        match &self.counts {
-            Counts::Packed(counts) => {
-                write_packed_tsv::<32, _>(
-                    counts.iter().map(|(&key, &count)| (key, count)),
-                    self.k,
-                    &mut writer,
-                    decode_packed_into,
-                )?;
-            }
-            Counts::Packed128(counts) => {
-                write_packed_tsv::<64, _>(
-                    counts.iter().map(|(&key, &count)| (key, count)),
-                    self.k,
-                    &mut writer,
-                    decode_packed128_into,
-                )?;
-            }
-            Counts::Bytes(counts) => {
-                for (key, &count) in counts {
-                    writer.write_all(key)?;
-                    writer.write_all(format_count(count, &mut suffix))?;
+        for table in self.tables() {
+            match table {
+                Counts::Packed(counts) => {
+                    write_packed_tsv::<32, _>(
+                        counts.iter().map(|(&key, &count)| (key, count)),
+                        self.k,
+                        &mut writer,
+                        decode_packed_into,
+                    )?;
+                }
+                Counts::Packed128(counts) => {
+                    write_packed_tsv::<64, _>(
+                        counts.iter().map(|(&key, &count)| (key, count)),
+                        self.k,
+                        &mut writer,
+                        decode_packed128_into,
+                    )?;
+                }
+                Counts::Bytes(counts) => {
+                    for (key, &count) in counts {
+                        writer.write_all(key)?;
+                        writer.write_all(format_count(count, &mut suffix))?;
+                    }
                 }
             }
         }
@@ -229,26 +329,28 @@ impl Counter {
     /// assert_eq!(counts[b"ACG".as_slice()], 2);
     /// ```
     pub fn counts(&self) -> impl Iterator<Item = (Vec<u8>, u64)> + '_ {
-        let (packed, wide, bytes) = match &self.counts {
-            Counts::Packed(counts) => (Some(counts.iter()), None, None),
-            Counts::Packed128(counts) => (None, Some(counts.iter()), None),
-            Counts::Bytes(counts) => (None, None, Some(counts.iter())),
-        };
-        packed
-            .into_iter()
-            .flatten()
-            .map(|(&key, &count)| (decode_packed(key, self.k), count))
-            .chain(wide.into_iter().flatten().map(|(&key, &count)| {
-                let mut dna = vec![0; self.k];
-                decode_packed128_into(key, &mut dna);
-                (dna, count)
-            }))
-            .chain(
-                bytes
-                    .into_iter()
-                    .flatten()
-                    .map(|(key, &count)| (key.clone(), count)),
-            )
+        self.tables().flat_map(move |table| {
+            let (packed, wide, bytes) = match table {
+                Counts::Packed(counts) => (Some(counts.iter()), None, None),
+                Counts::Packed128(counts) => (None, Some(counts.iter()), None),
+                Counts::Bytes(counts) => (None, None, Some(counts.iter())),
+            };
+            packed
+                .into_iter()
+                .flatten()
+                .map(|(&key, &count)| (decode_packed(key, self.k), count))
+                .chain(wide.into_iter().flatten().map(|(&key, &count)| {
+                    let mut dna = vec![0; self.k];
+                    decode_packed128_into(key, &mut dna);
+                    (dna, count)
+                }))
+                .chain(
+                    bytes
+                        .into_iter()
+                        .flatten()
+                        .map(|(key, &count)| (key.clone(), count)),
+                )
+        })
     }
 }
 
@@ -298,6 +400,30 @@ fn add_packed_record<const CANONICAL: bool>(
     sequence: &[u8],
     k: usize,
 ) -> Result<(), Error> {
+    visit_packed_record::<CANONICAL>(sequence, k, |key| {
+        let count = counts.entry(key).or_insert(0);
+        *count = count.checked_add(1).ok_or(Error::CountOverflow)?;
+        Ok(())
+    })
+}
+
+fn visit_packed(
+    sequence: &[u8],
+    k: usize,
+    strand: StrandMode,
+    emit: impl FnMut(u64) -> Result<(), Error>,
+) -> Result<(), Error> {
+    match strand {
+        StrandMode::Forward => visit_packed_record::<false>(sequence, k, emit),
+        StrandMode::Canonical => visit_packed_record::<true>(sequence, k, emit),
+    }
+}
+
+fn visit_packed_record<const CANONICAL: bool>(
+    sequence: &[u8],
+    k: usize,
+    mut emit: impl FnMut(u64) -> Result<(), Error>,
+) -> Result<(), Error> {
     // Right-shifting an all-ones mask also handles k = 32 without a shift by 64.
     let mask = u64::MAX >> (64 - 2 * k);
     let high_shift = 2 * (k - 1);
@@ -328,8 +454,7 @@ fn add_packed_record<const CANONICAL: bool>(
         } else {
             forward
         };
-        let count = counts.entry(key).or_insert(0);
-        *count = count.checked_add(1).ok_or(Error::CountOverflow)?;
+        emit(key)?;
     }
     Ok(())
 }
@@ -338,6 +463,30 @@ fn add_packed128_record<const CANONICAL: bool>(
     counts: &mut PackedCounts128,
     sequence: &[u8],
     k: usize,
+) -> Result<(), Error> {
+    visit_packed128_record::<CANONICAL>(sequence, k, |key| {
+        let count = counts.entry(key).or_insert(0);
+        *count = count.checked_add(1).ok_or(Error::CountOverflow)?;
+        Ok(())
+    })
+}
+
+fn visit_packed128(
+    sequence: &[u8],
+    k: usize,
+    strand: StrandMode,
+    emit: impl FnMut((u64, u64)) -> Result<(), Error>,
+) -> Result<(), Error> {
+    match strand {
+        StrandMode::Forward => visit_packed128_record::<false>(sequence, k, emit),
+        StrandMode::Canonical => visit_packed128_record::<true>(sequence, k, emit),
+    }
+}
+
+fn visit_packed128_record<const CANONICAL: bool>(
+    sequence: &[u8],
+    k: usize,
+    mut emit: impl FnMut((u64, u64)) -> Result<(), Error>,
 ) -> Result<(), Error> {
     // Right-shifting an all-ones mask also handles k = 64 without a shift by 128.
     let mask = u128::MAX >> (128 - 2 * k);
@@ -369,8 +518,7 @@ fn add_packed128_record<const CANONICAL: bool>(
         } else {
             forward
         };
-        let count = counts.entry(((key >> 64) as u64, key as u64)).or_insert(0);
-        *count = count.checked_add(1).ok_or(Error::CountOverflow)?;
+        emit(((key >> 64) as u64, key as u64))?;
     }
     Ok(())
 }
@@ -437,6 +585,15 @@ fn add_byte_record(
     k: usize,
     strand: StrandMode,
 ) -> Result<(), Error> {
+    visit_bytes(sequence, k, strand, |key| add_byte_delta(counts, key, 1))
+}
+
+fn visit_bytes(
+    sequence: &[u8],
+    k: usize,
+    strand: StrandMode,
+    mut emit: impl FnMut(&[u8]) -> Result<(), Error>,
+) -> Result<(), Error> {
     let sequence = sequence.to_ascii_uppercase();
     let mut reverse_complement = if strand == StrandMode::Canonical {
         vec![0; k]
@@ -467,14 +624,33 @@ fn add_byte_record(
             kmer
         };
 
-        // Existing keys can be looked up by a borrowed slice, without allocating.
-        if let Some(count) = counts.get_mut(key) {
-            *count = count.checked_add(1).ok_or(Error::CountOverflow)?;
-        } else {
-            counts.insert(key.to_vec(), 1);
-        }
+        emit(key)?;
     }
     Ok(())
+}
+
+fn add_delta<K: Eq + Hash, S: BuildHasher>(
+    map: &mut HashMap<K, u64, S>,
+    key: K,
+    delta: u64,
+) -> Result<(), Error> {
+    if map.len() == map.capacity() {
+        map.try_reserve(1).map_err(|_| Error::ReserveFailed)?;
+    }
+    let count = map.entry(key).or_insert(0);
+    *count = count.checked_add(delta).ok_or(Error::CountOverflow)?;
+    Ok(())
+}
+
+fn add_byte_delta(map: &mut HashMap<Vec<u8>, u64>, key: &[u8], delta: u64) -> Result<(), Error> {
+    if let Some(count) = map.get_mut(key) {
+        *count = count.checked_add(delta).ok_or(Error::CountOverflow)?;
+        Ok(())
+    } else {
+        map.try_reserve(1).map_err(|_| Error::ReserveFailed)?;
+        map.insert(key.to_vec(), delta);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

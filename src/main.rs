@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use flate2::bufread::MultiGzDecoder;
 use kbolt::database::DatabaseReader;
-use kbolt::{Counter, ParallelCounter, StrandMode};
+use kbolt::{Counter, ParallelCounter, ParallelInput, StrandMode};
 
 const BUFFER_SIZE: usize = 64 * 1024;
 
@@ -55,9 +55,12 @@ struct CountArgs {
     /// Reserve space for this many distinct k-mers (a hint, not a limit)
     #[arg(long, default_value_t = 0)]
     capacity: usize,
-    /// Counting workers; the input parser runs on the calling thread
+    /// Counting workers; input readers run separately
     #[arg(short = 't', long, default_value_t = 1, value_parser = parse_threads)]
     threads: usize,
+    /// Concurrent input-file readers when threads > 1 (bounded by input count)
+    #[arg(long, default_value_t = 2, value_parser = parse_threads)]
+    readers: usize,
     /// Print counting, merge, and output wall times on stderr
     #[arg(long)]
     timings: bool,
@@ -85,7 +88,7 @@ fn parse_threads(value: &str) -> Result<usize, String> {
 
 enum CountSink<'a> {
     Serial(&'a mut Counter),
-    Parallel(&'a mut ParallelCounter),
+    Parallel(ParallelInput<'a>),
 }
 
 struct Counting<'a> {
@@ -100,6 +103,7 @@ struct Counting<'a> {
     progress: bool,
     started: Instant,
     last_report: Instant,
+    source: Option<PathBuf>,
 }
 
 impl<'a> Counting<'a> {
@@ -119,12 +123,16 @@ impl<'a> Counting<'a> {
             progress,
             started: now,
             last_report: now,
+            source: None,
         }
     }
 
     fn start_record(&mut self) -> io::Result<()> {
         self.flush()?;
         self.overlap.clear();
+        if let CountSink::Parallel(counter) = &mut self.counter {
+            counter.start_record();
+        }
         self.records += 1;
         Ok(())
     }
@@ -147,14 +155,18 @@ impl<'a> Counting<'a> {
     }
 
     fn sequence(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let mut remaining = bytes;
-        while !remaining.is_empty() {
-            let take = remaining.len().min(BUFFER_SIZE - self.pending);
-            self.overlap.extend_from_slice(&remaining[..take]);
-            self.pending += take;
-            remaining = &remaining[take..];
-            if self.pending == BUFFER_SIZE {
-                self.flush()?;
+        if let CountSink::Parallel(counter) = &mut self.counter {
+            counter.add_sequence(bytes).map_err(io::Error::other)?;
+        } else {
+            let mut remaining = bytes;
+            while !remaining.is_empty() {
+                let take = remaining.len().min(BUFFER_SIZE - self.pending);
+                self.overlap.extend_from_slice(&remaining[..take]);
+                self.pending += take;
+                remaining = &remaining[take..];
+                if self.pending == BUFFER_SIZE {
+                    self.flush()?;
+                }
             }
         }
         self.bases += bytes.len() as u64;
@@ -167,9 +179,13 @@ impl<'a> Counting<'a> {
     }
 
     fn report(&self) -> io::Result<()> {
+        let mut stderr = io::stderr().lock();
+        if let Some(source) = &self.source {
+            write!(stderr, "{}: ", source.display())?;
+        }
         match &self.counter {
             CountSink::Serial(counter) => writeln!(
-                io::stderr().lock(),
+                stderr,
                 "{} records, {} bases, {} distinct k-mers, {:.1}s elapsed",
                 self.records,
                 self.bases,
@@ -177,7 +193,7 @@ impl<'a> Counting<'a> {
                 self.started.elapsed().as_secs_f64(),
             ),
             CountSink::Parallel(_) => writeln!(
-                io::stderr().lock(),
+                stderr,
                 "{} records, {} bases submitted, {:.1}s elapsed",
                 self.records,
                 self.bases,
@@ -185,6 +201,87 @@ impl<'a> Counting<'a> {
             ),
         }
     }
+
+    fn finish(mut self) -> io::Result<(u64, u64)> {
+        self.flush()?;
+        if let CountSink::Parallel(input) = self.counter {
+            input.finish().map_err(io::Error::other)?;
+        }
+        Ok((self.records, self.bases))
+    }
+}
+
+fn count_path(path: &Path, counting: &mut Counting<'_>) -> io::Result<()> {
+    let result = if path.as_os_str() == "-" {
+        count_reader(io::stdin().lock(), counting)
+    } else {
+        File::open(path).and_then(|file| count_reader(file, counting))
+    };
+    result.map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
+}
+
+fn concurrent_file(path: &Path) -> bool {
+    fn descriptor_alias(path: &Path) -> bool {
+        path == Path::new("/dev/stdin")
+            || path.starts_with("/dev/fd")
+            || path.starts_with("/proc/self/fd")
+            || path.starts_with("/proc/thread-self/fd")
+    }
+    if path.as_os_str() == "-" || descriptor_alias(path) {
+        return false;
+    }
+    let Ok(resolved) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    // fdescfs can report a regular file while opening it duplicates a shared
+    // descriptor offset. Resolve symlinks so these aliases also stay ordered.
+    !descriptor_alias(&resolved) && std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+fn count_parallel_inputs(
+    counter: &ParallelCounter,
+    inputs: &[PathBuf],
+    k: usize,
+    readers: usize,
+    progress: bool,
+) -> io::Result<(u64, u64)> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for index in 0..readers.min(inputs.len()) {
+            let next = &next;
+            handles.push(
+                std::thread::Builder::new()
+                    .name(format!("reader-{index}"))
+                    .spawn_scoped(scope, move || {
+                        let mut totals = (0, 0);
+                        while let Some(path) = inputs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            let mut counting = Counting::with_sink(
+                                CountSink::Parallel(counter.input()),
+                                k,
+                                progress,
+                            );
+                            counting.source = Some(path.clone());
+                            count_path(path, &mut counting)?;
+                            let (records, bases) = counting.finish()?;
+                            totals.0 += records;
+                            totals.1 += bases;
+                        }
+                        Ok::<_, io::Error>(totals)
+                    })?,
+            );
+        }
+        let mut totals = (0, 0);
+        for handle in handles {
+            let (records, bases) = handle
+                .join()
+                .map_err(|_| io::Error::other("input reader failed"))??;
+            totals.0 += records;
+            totals.1 += bases;
+        }
+        Ok(totals)
+    })
 }
 
 fn count_reader<R: Read>(reader: R, counting: &mut Counting<'_>) -> io::Result<()> {
@@ -230,7 +327,11 @@ fn check_output(inputs: &[PathBuf], output: &Path) -> io::Result<()> {
         Err(error) => return Err(error),
     };
     for path in inputs {
-        if path.as_os_str() != "-" && std::fs::canonicalize(path)? == output_path {
+        if path.as_os_str() != "-"
+            && std::fs::canonicalize(path).map_err(|error| {
+                io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+            })? == output_path
+        {
             return Err(io::Error::other("output must not be an input file"));
         }
     }
@@ -270,6 +371,7 @@ fn count_inputs(args: CountArgs) -> io::Result<()> {
         forward,
         capacity,
         threads,
+        readers,
         timings,
         format,
         output,
@@ -297,23 +399,26 @@ fn count_inputs(args: CountArgs) -> io::Result<()> {
     } else {
         None
     };
-    let mut counting = match &mut parallel {
-        Some(parallel) => Counting::with_sink(CountSink::Parallel(parallel), k, progress),
-        None => Counting::new(&mut counter, k, progress),
-    };
-    for path in inputs {
-        let result = if path.as_os_str() == "-" {
-            count_reader(io::stdin().lock(), &mut counting)
-        } else {
-            File::open(&path).and_then(|file| count_reader(file, &mut counting))
+    let (records, bases) = if let Some(parallel) = &parallel
+        && readers > 1
+        && inputs.len() > 1
+        // Blocking devices/FIFOs (including stdin aliases) cannot be interrupted
+        // when another file fails. Only regular files use concurrent readers.
+        && inputs.iter().all(|path| concurrent_file(path))
+    {
+        count_parallel_inputs(parallel, &inputs, k, readers, progress)?
+    } else {
+        let mut counting = match &mut parallel {
+            Some(parallel) => {
+                Counting::with_sink(CountSink::Parallel(parallel.input()), k, progress)
+            }
+            None => Counting::new(&mut counter, k, progress),
         };
-        result.map_err(|error| {
-            io::Error::new(error.kind(), format!("{}: {error}", path.display()))
-        })?;
-    }
-    let records = counting.records;
-    let bases = counting.bases;
-    drop(counting);
+        for path in &inputs {
+            count_path(path, &mut counting)?;
+        }
+        counting.finish()?
+    };
     let (counting_time, merge_time) = if let Some(parallel) = parallel {
         let (result, stats) = parallel.finish_with_stats().map_err(io::Error::other)?;
         counter = result;
@@ -390,6 +495,7 @@ mod tests {
                 assert!(counting.overlap.capacity() <= 2 * (BUFFER_SIZE + k - 1));
                 assert_eq!(counting.records, 3);
                 assert_eq!(counting.bases, sequence.len() as u64 + 4);
+                counting.finish().unwrap();
                 assert_eq!(
                     actual.counts().collect::<std::collections::HashMap<_, _>>(),
                     expected
@@ -414,6 +520,7 @@ mod tests {
         assert_eq!(counting.bases, bases);
         assert_eq!(counting.overlap.len(), 30);
         assert!(counting.overlap.capacity() <= 2 * (BUFFER_SIZE + 30));
+        counting.finish().unwrap();
         assert_eq!(
             counter.counts().collect::<Vec<_>>(),
             [(vec![b'A'; 31], bases - 30)]
@@ -436,6 +543,7 @@ mod tests {
             let mut counter = Counter::new(3, StrandMode::Canonical).unwrap();
             let mut counting = Counting::new(&mut counter, 3, false);
             count_reader(SingleByte(bytes), &mut counting).unwrap();
+            counting.finish().unwrap();
             assert_eq!(counter.counts().collect::<Vec<_>>(), [(b"ACG".to_vec(), 2)]);
         }
     }

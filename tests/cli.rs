@@ -408,7 +408,7 @@ fn binary_count_and_dump_refuse_overwriting_inputs() {
 
 #[test]
 fn parallel_cli_matches_serial_for_formats_compression_and_record_boundaries() {
-    let mut sequence = b"acGTTGCAGATTCGAC".repeat(40_000);
+    let mut sequence = b"acGTTGCAGATTCGAC".repeat(80_000);
     for index in [65_535, 65_536, 262_143, 262_144] {
         sequence[index] = b'N';
     }
@@ -464,4 +464,132 @@ fn parallel_cli_matches_serial_for_formats_compression_and_record_boundaries() {
                 .success()
         );
     }
+}
+
+#[test]
+fn concurrent_readers_preserve_counts_validation_and_final_progress_totals() {
+    let temp = TempDir::new();
+    let mut fasta = b">long\n".to_vec();
+    fasta.extend_from_slice(&b"acGTTGCAACGTNN".repeat(21_000));
+    fasta.extend_from_slice(b"\n>short\nAC\n");
+    let plain = temp.file("reference.fa", &fasta);
+    let mut fastq = Vec::new();
+    for _ in 0..400 {
+        fastq.extend_from_slice(b"@read\r\n");
+        fastq.extend_from_slice(&b"ACGTTGCA".repeat(20));
+        fastq.extend_from_slice(b"\r\n+\r\n");
+        fastq.extend_from_slice(&[b'@'; 160]);
+        fastq.extend_from_slice(b"\r\n");
+    }
+    let compressed = temp.file("reads.fq.gz", &gzip(&fastq));
+    let stdin_file = temp.file("stdin.fa", b">stdin\nACGTTGCAACGTTGCA\n");
+    for k in [31, 33, 65] {
+        let k = k.to_string();
+        for forward in [false, true] {
+            let mut args = vec!["count", "-k", &k, &plain, &stdin_file, &compressed];
+            if forward {
+                args.push("--forward");
+            }
+            let expected = table(&run(&args, b">stdin\nACGTTGCAACGTTGCA\n"));
+            for readers in ["1", "2", "8"] {
+                let mut args = args.clone();
+                args.extend([
+                    "-t",
+                    "3",
+                    "--readers",
+                    readers,
+                    "--format",
+                    "binary",
+                    "--progress",
+                ]);
+                let binary = run(&args, b">stdin\nACGTTGCAACGTTGCA\n");
+                assert!(
+                    binary.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&binary.stderr)
+                );
+                assert_eq!(table(&run(&["dump"], &binary.stdout)), expected);
+                assert!(
+                    String::from_utf8_lossy(&binary.stderr).contains("403 records, 358018 bases,")
+                );
+            }
+        }
+    }
+    let keep = temp.file("keep.kbolt", b"preserve output");
+    let mut corrupt = gzip(b">bad\nACGT\n");
+    let crc = corrupt.len() - 8;
+    corrupt[crc] ^= 1;
+    let corrupt = temp.file("corrupt.gz", &corrupt);
+    // Keep stdin open: literal and aliased stdin must not delay file errors.
+    #[cfg(not(unix))]
+    let aliases = ["-"];
+    #[cfg(unix)]
+    let aliases = ["-", "/dev/stdin", "/dev/fd/0"];
+    for alias in aliases {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_kbolt"))
+            .args(["count", "-k", "31", "-t", "3", &corrupt, alias])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let waiter =
+            std::thread::spawn(move || send.send(child.wait_with_output().unwrap()).unwrap());
+        let result = receive.recv_timeout(std::time::Duration::from_secs(5));
+        drop(stdin);
+        waiter.join().unwrap();
+        let output = result.expect("file error waited for unrelated stdin EOF");
+        assert!(!output.status.success(), "alias={alias}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains(&corrupt));
+    }
+    #[cfg(unix)]
+    {
+        // Descriptor aliases may report regular files when stdin is redirected.
+        // On fdescfs they share an offset, so they must also retain serial order.
+        let alias = temp.0.join("stdin-link");
+        std::os::unix::fs::symlink("/dev/stdin", &alias).unwrap();
+        for second in ["/dev/fd/0", alias.to_str().unwrap()] {
+            let count = |threads| {
+                Command::new(env!("CARGO_BIN_EXE_kbolt"))
+                    .args(["count", "-k", "31", "-t", threads, "/dev/stdin", second])
+                    .stdin(fs::File::open(&plain).unwrap())
+                    .output()
+                    .unwrap()
+            };
+            assert_eq!(table(&count("3")), table(&count("1")));
+        }
+    }
+    for bad in [corrupt.as_str(), "/nonexistent/kbolt-concurrent.fa"] {
+        let output = run(
+            &[
+                "count",
+                "-k",
+                "31",
+                "-t",
+                "3",
+                "--readers",
+                "2",
+                "-o",
+                &keep,
+                &plain,
+                bad,
+            ],
+            b"",
+        );
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(bad),
+            "bad={bad}; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read(&keep).unwrap(), b"preserve output");
+    }
+    assert!(
+        !run(&["count", "-k", "31", "--readers", "0"], b"")
+            .status
+            .success()
+    );
 }

@@ -183,36 +183,38 @@ impl Counter {
             return Ok(());
         }
         let key_bytes = self.k.div_ceil(4);
-        match &self.counts {
-            Counts::Packed(counts) => {
-                write_packed_binary(
-                    counts
-                        .iter()
-                        .map(|(&key, &count)| (key.to_le_bytes(), count)),
-                    key_bytes,
-                    &mut writer,
-                )?;
-            }
-            Counts::Packed128(counts) => {
-                write_packed_binary(
-                    counts.iter().map(|(&(high, low), &count)| {
-                        let key = ((high as u128) << 64) | low as u128;
-                        (key.to_le_bytes(), count)
-                    }),
-                    key_bytes,
-                    &mut writer,
-                )?;
-            }
-            Counts::Bytes(counts) => {
-                let mut record = buffer(key_bytes + 8)?;
-                for (key, &count) in counts {
-                    record[..key_bytes].fill(0);
-                    for (index, base) in key.iter().rev().enumerate() {
-                        let value = crate::DNA_BASES[*base as usize];
-                        record[index / 4] |= value << (2 * (index % 4));
+        for table in self.tables() {
+            match table {
+                Counts::Packed(counts) => {
+                    write_packed_binary(
+                        counts
+                            .iter()
+                            .map(|(&key, &count)| (key.to_le_bytes(), count)),
+                        key_bytes,
+                        &mut writer,
+                    )?;
+                }
+                Counts::Packed128(counts) => {
+                    write_packed_binary(
+                        counts.iter().map(|(&(high, low), &count)| {
+                            let key = ((high as u128) << 64) | low as u128;
+                            (key.to_le_bytes(), count)
+                        }),
+                        key_bytes,
+                        &mut writer,
+                    )?;
+                }
+                Counts::Bytes(counts) => {
+                    let mut record = buffer(key_bytes + 8)?;
+                    for (key, &count) in counts {
+                        record[..key_bytes].fill(0);
+                        for (index, base) in key.iter().rev().enumerate() {
+                            let value = crate::DNA_BASES[*base as usize];
+                            record[index / 4] |= value << (2 * (index % 4));
+                        }
+                        record[key_bytes..].copy_from_slice(&count.to_le_bytes());
+                        writer.write_all(&record)?;
                     }
-                    record[key_bytes..].copy_from_slice(&count.to_le_bytes());
-                    writer.write_all(&record)?;
                 }
             }
         }

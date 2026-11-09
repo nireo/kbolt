@@ -1,62 +1,100 @@
 # Counting benchmarks
 
-Run the full suite (optimized builds are automatic):
+Run the optimized suite or smoke-test its correctness checks:
 
 ```sh
 cargo bench --bench count
-```
-
-Smoke-test every case without collecting statistics:
-
-```sh
 cargo bench --bench count -- --test
 ```
 
-Save a reference, then compare subsequent changes against it:
+Save a baseline before a change, then compare against it:
 
 ```sh
-cargo bench --bench count -- --save-baseline naive
-cargo bench --bench count -- --baseline naive
+cargo bench --bench count -- --save-baseline reference
+cargo bench --bench count -- --baseline reference
 ```
 
-Filter to a workload or case by passing its name:
+Filter a case or use longer measurements:
 
 ```sh
 cargo bench --bench count -- random_long/canonical/31
-```
-
-## Work measured
-
-Every workload contains 1,000,000 input bases. Random DNA uses fixed-seed
-SplitMix64, so inputs stay identical between runs. Cases cover:
-
-- one long random record (many distinct keys);
-- the same random sequence split into 150-base reads (last read is 100 bases);
-- a homopolymer (one repeated key);
-- a repeating 12-base motif (a small set of repeated keys);
-- long random DNA with every 100th base replaced by N.
-
-Each runs at k=21 and k=31 in forward and canonical modes: 20 cases total.
-Before timing, each case checks that the sum of counts matches the number of
-valid windows. Functional tests remain the oracle for exact key correctness.
-
-Each timed iteration starts with a fresh counter. Timing includes map creation,
-allocations, counting all records, and destruction. It excludes input generation,
-validation assertions, parsing, sorting, and file I/O. The resulting counts are
-passed through `std::hint::black_box`.
-
-Criterion reports elapsed time and input bases/second (`elem/s`); `Melem/s` means
-million bases/second, not distinct k-mers/second. Ambiguous bases are included in
-the input-base total. Defaults are 1 second of warmup and 10 samples over a target
-of 2 seconds per case; use longer runs for small differences:
-
-```sh
 cargo bench --bench count -- --sample-size 30 --measurement-time 10
 ```
 
-Keep the machine, Rust version, power mode, input, and background load consistent.
-Record `rustc -Vv` and machine details with any reported results. Do not interpret
-small differences within the reported uncertainty as improvements. HashMap uses
-randomized hashing, so some run-to-run variation is expected. Criterion artifacts
-and saved baselines live under `target/criterion/` (not committed). These
-benchmarks do not measure peak memory or end-to-end file processing.
+## Workloads and scope
+
+Each workload contains 1,000,000 input bases:
+
+- fixed-seed random DNA in one long record;
+- the same DNA split into 150-base reads;
+- a homopolymer;
+- a repeating 12-base motif;
+- random DNA with every 100th base replaced by N.
+
+Each runs at k=21, 31, 33, and 63 in forward and canonical modes: 40 cases total.
+Untimed assertions check the total number of valid windows. Unit tests check
+exact keys and counts.
+
+Timing includes creating a fresh counter, allocation, counting, and destruction.
+Input generation, correctness assertions, key decoding, and file I/O are excluded.
+Packed keys use randomized FoldHash; larger byte-string keys retain the standard
+hasher. Results are observed through `std::hint::black_box` without decoding.
+
+Criterion reports elapsed time and input bases/second (`Melem/s` means million
+bases/second), including ambiguous input bases. Defaults are 10 samples, 1 second
+of warmup, and a target measurement time of 2 seconds per case.
+
+Keep hardware, compiler, power mode, and background load consistent. Randomized
+hash seeds introduce variation; do not treat differences within uncertainty as
+improvements. Criterion artifacts and baselines live in `target/criterion/` and
+are not committed. These benchmarks do not measure peak memory or end-to-end
+file processing.
+
+## Parallel counting and merge benchmarks
+
+```sh
+cargo bench --bench parallel
+cargo bench --bench parallel -- --test
+cargo bench --bench parallel -- 'parallel/sampled_reads_150/.*/31'
+KBOLT_BENCH_BASES=16777216 cargo bench --bench parallel
+```
+
+The default input size is 4 MiB (adjustable with `KBOLT_BENCH_BASES`, at least
+150 bases). Set `KBOLT_BENCH_WORKLOAD=sampled_reads_150` (or `random_long` or
+`homopolymer`) to skip other workloads' untimed counting checks. Workloads are
+one uniform random record, reads sampled from a fixed
+256 KiB random genome, and a homopolymer. Reads are 150 bases; every tenth read
+has one substitution. At the default size this approximates 16x coverage with
+sequencing errors. Generation uses fixed seeds and is outside timing.
+
+Each workload runs canonical k=31 and k=33, comparing serial counting with 1, 2,
+4, and 8 persistent workers. `workers_N` names the Crossbeam worker pipeline.
+The one-worker parallel case measures pipeline overhead; CLI `--threads 1`
+instead uses the direct serial path. Timing includes thread startup, copying
+input into reusable bounded batches, parallel extraction, partitioned updates,
+finalization, and destruction. Finalization retains key partitions without map
+merging. Total windows and distinct-key counts are checked before timing;
+functional tests compare exact key/count maps across record/chunk boundaries and
+all representations.
+
+Benchmark names include input size to keep different-size baselines separate.
+`merge/<workload>/<bases>_bases/31` isolates merging two counters. The counters
+are constructed outside timing with `iter_batched`; merging and destruction are timed. A single
+long record is split into two independent records for this test, so its boundary
+windows are intentionally absent. This measures map merging, not chunk semantics.
+
+For complete CLI wall time, phase timings, and peak RSS on local references,
+see [the dataset runner](datasets.md). Keep benchmark processes isolated from
+other benchmarks, builds, and tests. Small inputs expose startup costs; the
+larger reference and configurable synthetic sizes exercise tables beyond cache.
+
+See [the recorded parallel baseline](baseline.md) for measured speed, memory,
+phase timings, and the saved raw results.
+
+The [profiling investigation](read-profile.md) explains the former merge and
+input-stage bottlenecks. The [partitioned implementation measurements](partitioned.md)
+compare the resulting pipeline, gzip backend, and concurrent readers against the
+saved previous executable, with replay instructions.
+
+The [historical Crossbeam/DashMap comparison](crates.md) retains the dependency
+experiment results. DashMap has been removed from the current implementation.

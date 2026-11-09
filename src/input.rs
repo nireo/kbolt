@@ -241,6 +241,7 @@ mod tests {
                         assert_eq!(counting.records, records.len() as u64);
                         assert_eq!(counting.bases, records.iter().map(|r| r.len() as u64).sum());
                         assert!(counting.overlap.len() < k);
+                        counting.finish().unwrap();
                         assert_eq!(counts(&counter), counts(&expected), "k={k}, buffer={size}");
                     }
                 }
@@ -289,6 +290,7 @@ mod tests {
             &mut counting,
         )
         .unwrap();
+        counting.finish().unwrap();
         assert_eq!(counter.counts().collect::<Vec<_>>(), [(b"ACG".to_vec(), 1)]);
     }
 
@@ -298,6 +300,7 @@ mod tests {
             let mut counter = Counter::new(3, StrandMode::Canonical).unwrap();
             let mut counting = Counting::new(&mut counter, 3, false);
             count(BufReader::new(fixture), &mut counting).unwrap();
+            counting.finish().unwrap();
             assert!(counter.is_empty());
         }
     }

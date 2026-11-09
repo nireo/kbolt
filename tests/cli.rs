@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -592,4 +593,44 @@ fn concurrent_readers_preserve_counts_validation_and_final_progress_totals() {
             .status
             .success()
     );
+}
+
+#[test]
+fn gzip_input_errors_are_reported_while_the_pipe_stays_open() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kbolt"))
+        .args(["count", "-k", "3"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    // A sync flush makes the invalid record decodable before the stream ends.
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(b"@x\nAC GT\n+\n!!!!!\n").unwrap();
+    encoder.flush().unwrap();
+    stdin.write_all(encoder.get_ref()).unwrap();
+    stdin.flush().unwrap();
+    // Keep stdin open: the error must not wait for more input or EOF.
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > Duration::from_secs(20) {
+            child.kill().unwrap();
+            panic!("kbolt did not report the error while its input stayed open");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(stdin);
+    assert!(!status.success());
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(stderr.contains("line 2: invalid sequence byte"), "{stderr}");
 }

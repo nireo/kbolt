@@ -20,7 +20,7 @@
 
 use std::io::{self, Read, Write};
 
-use crate::{Counter, Counts, StrandMode, format_count};
+use crate::{Counter, Counts, OutputTable, StrandMode, format_count};
 
 const MAGIC: &[u8; 8] = b"KBOLTDB\0";
 const VERSION: u16 = 1;
@@ -183,42 +183,38 @@ impl Counter {
             return Ok(());
         }
         let key_bytes = self.k.div_ceil(4);
-        for table in self.tables() {
-            match table {
-                Counts::Packed(counts) => {
-                    write_packed_binary(
-                        counts
-                            .iter()
-                            .map(|(&key, &count)| (key.to_le_bytes(), count)),
-                        key_bytes,
-                        &mut writer,
-                    )?;
-                }
-                Counts::Packed128(counts) => {
-                    write_packed_binary(
-                        counts.iter().map(|(&(high, low), &count)| {
-                            let key = ((high as u128) << 64) | low as u128;
-                            (key.to_le_bytes(), count)
-                        }),
-                        key_bytes,
-                        &mut writer,
-                    )?;
-                }
-                Counts::Bytes(counts) => {
-                    let mut record = buffer(key_bytes + 8)?;
-                    for (key, &count) in counts {
-                        record[..key_bytes].fill(0);
-                        for (index, base) in key.iter().rev().enumerate() {
-                            let value = crate::DNA_BASES[*base as usize];
-                            record[index / 4] |= value << (2 * (index % 4));
-                        }
-                        record[key_bytes..].copy_from_slice(&count.to_le_bytes());
-                        writer.write_all(&record)?;
+        // Partitions encode independently; see `Counter::write_tables`.
+        self.write_tables(&mut writer, |table, writer| match table {
+            OutputTable::Packed(counts, partition) => write_packed_binary(
+                counts
+                    .partition_entries(partition)
+                    .map(|(key, count)| (key.to_le_bytes(), count)),
+                key_bytes,
+                writer,
+            ),
+            OutputTable::Map(Counts::Packed(_)) => unreachable!("packed tables are split"),
+            OutputTable::Map(Counts::Packed128(counts)) => write_packed_binary(
+                counts.iter().map(|(&(high, low), &count)| {
+                    let key = ((high as u128) << 64) | low as u128;
+                    (key.to_le_bytes(), count)
+                }),
+                key_bytes,
+                writer,
+            ),
+            OutputTable::Map(Counts::Bytes(counts)) => {
+                let mut record = buffer(key_bytes + 8)?;
+                for (key, &count) in counts {
+                    record[..key_bytes].fill(0);
+                    for (index, base) in key.iter().rev().enumerate() {
+                        let value = crate::DNA_BASES[*base as usize];
+                        record[index / 4] |= value << (2 * (index % 4));
                     }
+                    record[key_bytes..].copy_from_slice(&count.to_le_bytes());
+                    writer.write_all(&record)?;
                 }
+                Ok(())
             }
-        }
-        Ok(())
+        })
     }
 
     /// Load a database into RAM, validating records and rejecting duplicate keys.
@@ -233,8 +229,9 @@ impl Counter {
                     let mut packed = [0; 8];
                     let size = header.k.div_ceil(4);
                     packed[..size].copy_from_slice(&reader.record[..size]);
-                    counts.try_reserve(1).map_err(io::Error::other)?;
-                    counts.insert(u64::from_le_bytes(packed), count).is_some()
+                    !counts
+                        .insert_new(u64::from_le_bytes(packed), count)
+                        .map_err(io::Error::other)?
                 }
                 Counts::Packed128(counts) => {
                     let mut packed = [0; 16];
@@ -262,7 +259,7 @@ impl Counter {
 fn write_packed_binary<const WIDTH: usize>(
     entries: impl Iterator<Item = ([u8; WIDTH], u64)>,
     key_bytes: usize,
-    writer: &mut impl Write,
+    writer: &mut (impl Write + ?Sized),
 ) -> io::Result<()> {
     let mut batch = [0; 16 * 1024];
     let mut offset = 0;
@@ -408,11 +405,7 @@ mod tests {
         for k in [1, 31, 32, 33, 63, 64, 65] {
             let mut counter = Counter::new(k, StrandMode::Forward).unwrap();
             counter.add_record(&vec![b'T'; k]).unwrap();
-            match &mut counter.counts {
-                Counts::Packed(counts) => *counts.values_mut().next().unwrap() = u64::MAX,
-                Counts::Packed128(counts) => *counts.values_mut().next().unwrap() = u64::MAX,
-                Counts::Bytes(counts) => *counts.values_mut().next().unwrap() = u64::MAX,
-            }
+            counter.counts.set_counts(u64::MAX);
             let mut bytes = Vec::new();
             counter.write_binary(&mut bytes).unwrap();
             let mut expected = fixture(k as u64, 1, false);

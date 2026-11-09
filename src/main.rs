@@ -1,7 +1,7 @@
 mod input;
 
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -12,6 +12,9 @@ use kbolt::database::DatabaseReader;
 use kbolt::{Counter, ParallelCounter, ParallelInput, StrandMode};
 
 const BUFFER_SIZE: usize = 64 * 1024;
+/// Input read buffer. Larger reads mean fewer syscalls and fewer FASTQ
+/// records straddling a refill, which fall back to the line-by-line parser.
+const READ_BUFFER_SIZE: usize = 256 * 1024;
 
 #[derive(Parser)]
 #[command(
@@ -93,9 +96,13 @@ enum CountSink<'a> {
 
 struct Counting<'a> {
     counter: CountSink<'a>,
-    // Batch up to 64 KiB of new sequence bytes, keeping k-1 tail bytes after each
-    // flush. Wrapped lines share a batch; record boundaries always flush/reset it.
+    // Serial input: batch up to 64 KiB of new sequence bytes from one or more
+    // records, then count them together. `ends` closes each finished record in
+    // the batch; the current record starts at `record_start`. Each flush keeps
+    // the current record's last k-1 bytes so windows continue across flushes.
     overlap: Vec<u8>,
+    ends: Vec<usize>,
+    record_start: usize,
     pending: usize,
     k: usize,
     records: u64,
@@ -116,6 +123,8 @@ impl<'a> Counting<'a> {
         Self {
             counter,
             overlap: Vec::new(),
+            ends: Vec::new(),
+            record_start: 0,
             pending: 0,
             k,
             records: 0,
@@ -128,10 +137,15 @@ impl<'a> Counting<'a> {
     }
 
     fn start_record(&mut self) -> io::Result<()> {
-        self.flush()?;
-        self.overlap.clear();
-        if let CountSink::Parallel(counter) = &mut self.counter {
-            counter.start_record();
+        match &mut self.counter {
+            CountSink::Parallel(counter) => counter.start_record(),
+            // Close the current record; it is counted at the next flush.
+            CountSink::Serial(_) => {
+                if self.overlap.len() > self.record_start {
+                    self.ends.push(self.overlap.len());
+                }
+                self.record_start = self.overlap.len();
+            }
         }
         self.records += 1;
         Ok(())
@@ -141,15 +155,27 @@ impl<'a> Counting<'a> {
         if self.pending == 0 {
             return Ok(());
         }
-        match &mut self.counter {
-            CountSink::Serial(counter) => counter.add_record(&self.overlap),
-            CountSink::Parallel(counter) => counter.add_record(&self.overlap),
-        }
-        .map_err(io::Error::other)?;
-        let keep = (self.k - 1).min(self.overlap.len());
+        let CountSink::Serial(counter) = &mut self.counter else {
+            unreachable!("parallel input is not buffered here")
+        };
+        let (bytes, mut start) = (&self.overlap, 0);
+        let records = self
+            .ends
+            .iter()
+            .copied()
+            .chain(std::iter::once(bytes.len()))
+            .map(|end| {
+                let record = &bytes[start..end];
+                start = end;
+                record
+            });
+        counter.add_records(records).map_err(io::Error::other)?;
+        let keep = (self.k - 1).min(self.overlap.len() - self.record_start);
         let start = self.overlap.len() - keep;
         self.overlap.copy_within(start.., 0);
         self.overlap.truncate(keep);
+        self.ends.clear();
+        self.record_start = 0;
         self.pending = 0;
         Ok(())
     }
@@ -213,7 +239,7 @@ impl<'a> Counting<'a> {
 
 fn count_path(path: &Path, counting: &mut Counting<'_>) -> io::Result<()> {
     let result = if path.as_os_str() == "-" {
-        count_reader(io::stdin().lock(), counting)
+        count_reader(io::stdin(), counting)
     } else {
         File::open(path).and_then(|file| count_reader(file, counting))
     };
@@ -284,10 +310,13 @@ fn count_parallel_inputs(
     })
 }
 
-fn count_reader<R: Read>(reader: R, counting: &mut Counting<'_>) -> io::Result<()> {
-    let mut reader = BufReader::with_capacity(BUFFER_SIZE, reader);
+fn count_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    counting: &mut Counting<'_>,
+) -> io::Result<()> {
     // Inspect bytes rather than extensions, including for stdin. Loop to
-    // handle readers which return only one byte per read.
+    // handle readers which return only one byte per read. Reading the magic
+    // directly (not through a second buffer) avoids copying all input twice.
     let mut magic = [0; 2];
     let mut size = 0;
     while size < magic.len() {
@@ -299,14 +328,125 @@ fn count_reader<R: Read>(reader: R, counting: &mut Counting<'_>) -> io::Result<(
         }
     }
     let reader = io::Cursor::new(magic[..size].to_vec()).chain(reader);
-    let reader = BufReader::with_capacity(BUFFER_SIZE, reader);
+    let reader = BufReader::with_capacity(READ_BUFFER_SIZE, reader);
     if size == 2 && magic == [0x1f, 0x8b] {
-        input::count(
-            BufReader::with_capacity(BUFFER_SIZE, MultiGzDecoder::new(reader)),
-            counting,
-        )
+        decompress_concurrently(MultiGzDecoder::new(reader), |decoded| {
+            input::count(decoded, counting)
+        })
     } else {
         input::count(reader, counting)
+    }
+}
+
+/// Decompressed bytes handed from the decoder thread to the parser at a time.
+const DECODED_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// Run `decoder` on its own thread while `parse` consumes its output.
+///
+/// Inflating and parsing a single gzip stream are both sequential, but they
+/// need not share a thread. Bounded, recycled chunks keep memory constant.
+/// Decoder errors arrive after all bytes decoded before them, in stream order.
+/// Each decoded read is handed over immediately, so input arriving slowly
+/// (such as from a pipe) is parsed as soon as it can be decoded.
+///
+/// The decoder thread owns its input. When parsing fails, this returns
+/// without waiting for it: a decoder blocked reading a slow pipe would
+/// otherwise delay the error. It exits at its next send (or with the process).
+fn decompress_concurrently<D: Read + Send + 'static>(
+    mut decoder: D,
+    parse: impl FnOnce(&mut DecodedChunks) -> io::Result<()>,
+) -> io::Result<()> {
+    let (sender, receiver) = crossbeam_channel::bounded::<io::Result<(Vec<u8>, usize)>>(4);
+    let (recycle, recycled) = crossbeam_channel::bounded::<Vec<u8>>(8);
+    let decoding = std::thread::Builder::new()
+        .name("decoder".into())
+        .spawn(move || {
+            loop {
+                // Buffers keep their full length; only the filled prefix is sent.
+                let mut chunk = recycled
+                    .try_recv()
+                    .unwrap_or_else(|_| vec![0; DECODED_CHUNK_SIZE]);
+                let read = loop {
+                    match decoder.read(&mut chunk) {
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                        result => break result,
+                    }
+                };
+                match read {
+                    Ok(0) => return, // End of stream: dropping the sender signals EOF.
+                    Ok(len) => {
+                        if sender.send(Ok((chunk, len))).is_err() {
+                            return; // The parser stopped early.
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                        return;
+                    }
+                }
+            }
+        })?;
+    let mut chunks = DecodedChunks {
+        receiver,
+        recycle,
+        chunk: Vec::new(),
+        len: 0,
+        position: 0,
+    };
+    let result = parse(&mut chunks);
+    // Dropping the receiver releases a decoder blocked on a full queue.
+    drop(chunks);
+    result?;
+    // Parsing succeeded, so it read to the end of the stream and the decoder
+    // has finished. A panicking decoder also ends the stream early; report it
+    // rather than accepting truncated input.
+    decoding
+        .join()
+        .map_err(|_| io::Error::other("gzip decoder failed"))
+}
+
+/// A `BufRead` view over chunks produced by `decompress_concurrently`.
+struct DecodedChunks {
+    receiver: crossbeam_channel::Receiver<io::Result<(Vec<u8>, usize)>>,
+    recycle: crossbeam_channel::Sender<Vec<u8>>,
+    // The current chunk; bytes `position..len` are unread.
+    chunk: Vec<u8>,
+    len: usize,
+    position: usize,
+}
+
+impl Read for DecodedChunks {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let available = self.fill_buf()?;
+        let len = available.len().min(buffer.len());
+        buffer[..len].copy_from_slice(&available[..len]);
+        self.consume(len);
+        Ok(len)
+    }
+}
+
+impl BufRead for DecodedChunks {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        while self.position == self.len {
+            match self.receiver.recv() {
+                Ok(chunk) => {
+                    let (chunk, len) = chunk?;
+                    let used = std::mem::replace(&mut self.chunk, chunk);
+                    (self.len, self.position) = (len, 0);
+                    // Only full-size buffers are reused for decoding.
+                    if used.len() == DECODED_CHUNK_SIZE {
+                        let _ = self.recycle.try_send(used);
+                    }
+                }
+                // The decoder finished (or failed after reporting its error).
+                Err(_) => return Ok(&[]),
+            }
+        }
+        Ok(&self.chunk[self.position..self.len])
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.position = (self.position + amount).min(self.len);
     }
 }
 
@@ -489,7 +629,7 @@ mod tests {
                 }
                 let mut actual = Counter::new(k, strand).unwrap();
                 let mut counting = Counting::new(&mut actual, k, false);
-                count_reader(fasta.as_slice(), &mut counting).unwrap();
+                count_reader(io::Cursor::new(fasta.clone()), &mut counting).unwrap();
                 assert_eq!(counting.pending, 0);
                 assert!(counting.overlap.len() < k);
                 assert!(counting.overlap.capacity() <= 2 * (BUFFER_SIZE + k - 1));
@@ -542,7 +682,7 @@ mod tests {
         for bytes in [b">x\nACGT\n".as_slice(), compressed.as_slice()] {
             let mut counter = Counter::new(3, StrandMode::Canonical).unwrap();
             let mut counting = Counting::new(&mut counter, 3, false);
-            count_reader(SingleByte(bytes), &mut counting).unwrap();
+            count_reader(SingleByte(io::Cursor::new(bytes.to_vec())), &mut counting).unwrap();
             counting.finish().unwrap();
             assert_eq!(counter.counts().collect::<Vec<_>>(), [(b"ACG".to_vec(), 2)]);
         }

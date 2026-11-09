@@ -88,12 +88,7 @@ impl<R: BufRead> Lines<R> {
 
     fn sequence(&mut self, counting: &mut Counting<'_>) -> io::Result<u64> {
         self.line(|bytes| {
-            // Alphabetic ambiguity codes and alignment gaps break valid runs
-            // in Counter. Whitespace and structural punctuation are errors.
-            if !bytes
-                .iter()
-                .all(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'.' | b'-'))
-            {
+            if !valid_sequence(bytes) {
                 return Err(invalid(
                     "invalid sequence byte (expected letters, '.' or '-')",
                 ));
@@ -101,6 +96,93 @@ impl<R: BufRead> Lines<R> {
             counting.sequence(bytes)
         })
     }
+
+    /// Count consecutive complete, single-line FASTQ records held entirely in
+    /// the current buffer, stopping before anything else.
+    ///
+    /// Only records the general parser would accept identically are taken
+    /// here: four newline-terminated lines, a named header, no wrapping, valid
+    /// bytes, and matching sequence/quality lengths. A record that straddles
+    /// the buffer end, wraps, or is invalid is left unconsumed, so the general
+    /// parser handles it and reports any error with the same line number.
+    fn fastq_records(&mut self, counting: &mut Counting<'_>) -> io::Result<()> {
+        let buffer = self.reader.fill_buf()?;
+        let mut consumed = 0;
+        let mut records = 0;
+        let mut result = Ok(());
+        while let Some((record, sequence)) = split_fastq_record(&buffer[consumed..]) {
+            counting.start_record()?;
+            if let Err(error) = counting.sequence(sequence) {
+                // Prefix the sequence line's number, as `Lines::line` does.
+                let line = self.number + 4 * records + 2;
+                result = Err(io::Error::new(
+                    error.kind(),
+                    format!("line {line}: {error}"),
+                ));
+                break;
+            }
+            consumed += record;
+            records += 1;
+        }
+        self.reader.consume(consumed);
+        self.number += 4 * records;
+        result
+    }
+}
+
+/// Alphabetic ambiguity codes and alignment gaps break valid runs in Counter;
+/// whitespace and structural punctuation are errors.
+// Branch-free folds let LLVM validate many bytes per vector instruction.
+#[inline]
+fn valid_sequence(bytes: &[u8]) -> bool {
+    bytes.iter().fold(true, |valid, &byte| {
+        let folded = byte | 0x20;
+        valid & ((folded.wrapping_sub(b'a') < 26) | (byte == b'.') | (byte == b'-'))
+    })
+}
+
+/// Quality scores are printable ASCII, '!' through '~'.
+#[inline]
+fn valid_quality(bytes: &[u8]) -> bool {
+    bytes.iter().fold(true, |valid, &byte| {
+        valid & (byte.wrapping_sub(b'!') <= b'~' - b'!')
+    })
+}
+
+/// Remove one line-ending CR, matching `Lines::line`.
+#[inline]
+fn without_cr(line: &[u8]) -> &[u8] {
+    line.strip_suffix(b"\r").unwrap_or(line)
+}
+
+/// Split one complete four-line FASTQ record from the start of `bytes`,
+/// returning its length including the final newline and its sequence.
+/// Returns `None` for anything the fast path does not handle.
+#[inline]
+fn split_fastq_record(bytes: &[u8]) -> Option<(usize, &[u8])> {
+    if bytes.first() != Some(&b'@') {
+        return None;
+    }
+    let header_end = memchr::memchr(b'\n', bytes)?;
+    let sequence_start = header_end + 1;
+    let sequence_end = sequence_start + memchr::memchr(b'\n', &bytes[sequence_start..])?;
+    let separator_start = sequence_end + 1;
+    // Anything other than '+' here is a wrapped sequence (or an error).
+    if bytes.get(separator_start) != Some(&b'+') {
+        return None;
+    }
+    let quality_start = separator_start + memchr::memchr(b'\n', &bytes[separator_start..])? + 1;
+    let quality_end = quality_start + memchr::memchr(b'\n', &bytes[quality_start..])?;
+    let header = without_cr(&bytes[1..header_end]);
+    let sequence = without_cr(&bytes[sequence_start..sequence_end]);
+    let quality = without_cr(&bytes[quality_start..quality_end]);
+    // `valid_sequence` rejects a leading '+', which the general parser would
+    // read as the separator of an empty record.
+    let accepted = sequence.len() == quality.len()
+        && header.iter().any(|byte| !byte.is_ascii_whitespace())
+        && valid_sequence(sequence)
+        && valid_quality(quality);
+    accepted.then_some((quality_end + 1, sequence))
 }
 
 pub(super) fn count<R: BufRead>(reader: R, counting: &mut Counting<'_>) -> io::Result<()> {
@@ -128,7 +210,9 @@ fn fasta<R: BufRead>(lines: &mut Lines<R>, counting: &mut Counting<'_>) -> io::R
 }
 
 fn fastq<R: BufRead>(lines: &mut Lines<R>, counting: &mut Counting<'_>) -> io::Result<()> {
-    while let Some(first) = lines.peek()? {
+    loop {
+        lines.fastq_records(counting)?;
+        let Some(first) = lines.peek()? else { break };
         if first != b'@' {
             return Err(invalid(format!(
                 "line {}: expected a FASTQ '@' header",
@@ -160,7 +244,7 @@ fn fastq<R: BufRead>(lines: &mut Lines<R>, counting: &mut Counting<'_>) -> io::R
                 return Err(invalid("unexpected end of FASTQ: truncated quality scores"));
             }
             lines.line(|bytes| {
-                if !bytes.iter().all(|byte| (b'!'..=b'~').contains(byte)) {
+                if !valid_quality(bytes) {
                     return Err(invalid(
                         "quality scores must be printable ASCII ('!' through '~')",
                     ));

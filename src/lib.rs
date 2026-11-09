@@ -5,13 +5,17 @@ use std::io::{self, Write};
 
 pub mod database;
 mod parallel;
+mod table;
 
 pub use parallel::{ParallelCounter, ParallelInput, ParallelStats};
+use table::PackedCounts;
 
 // Store the high and low words separately to avoid u128 alignment padding in map entries.
 type PackedCounts128 = HashMap<(u64, u64), u64, foldhash::fast::RandomState>;
 
-type PackedCounts = HashMap<u64, u64, foldhash::fast::RandomState>;
+/// Partition bits for packed (k <= 32) tables. Partitions bound growth pauses
+/// and leave count bits in each compact slot; see `table`.
+const PACKED_PARTITION_BITS: u32 = 10;
 
 const DNA_BASES: [u8; 256] = {
     let mut codes = [u8::MAX; 256];
@@ -67,6 +71,7 @@ impl std::error::Error for Error {}
 // Keep the representation private so wider packed keys can be added without
 // changing the public output format.
 enum Counts {
+    /// k <= 32: compact, self-partitioned tables (never in `Counter::partitions`).
     Packed(PackedCounts),
     Packed128(PackedCounts128),
     Bytes(HashMap<Vec<u8>, u64>),
@@ -77,15 +82,79 @@ enum Counts {
 /// Output keys are uppercase ASCII DNA sequences; counts accumulate across records.
 /// Rolling 2-bit keys use 64 bits for k <= 32 and 128 bits for k <= 64.
 /// Larger k uses byte-string storage, with no maximum other than practical memory limits.
-/// Packed-key hashing uses noncryptographic FoldHash, not intended to resist adaptive
-/// collision attacks.
+/// For k <= 32, keys are stored in compact partitioned tables addressed by a seeded,
+/// invertible mixing function; wider keys use FoldHash. Neither is intended to resist
+/// adaptive collision attacks.
 pub struct Counter {
     counts: Counts,
-    // Partition zero is `counts`; remaining partitions retain their own maps.
+    // For wider keys from `ParallelCounter`, partition zero is `counts` and the
+    // remaining partitions retain their own maps. Packed counts partition themselves.
     partitions: Vec<Counts>,
     partition_hash: Option<foldhash::fast::RandomState>,
+    // Threads that may encode independent partitions during output. Results
+    // from `ParallelCounter` inherit its worker count; other counters use one.
+    output_threads: usize,
     strand: StrandMode,
     k: usize,
+}
+
+/// Bytes an output encoder buffers before handing a chunk to the writer.
+const OUTPUT_CHUNK: usize = 1024 * 1024;
+
+/// Messages from an output encoder: a chunk, the end of a table (`None`), or
+/// the encoder's own error.
+type EncodedChunk = io::Result<Option<Vec<u8>>>;
+
+// An in-memory writer that streams fixed-size chunks to the output thread.
+// The final chunk of a table is followed by `None`.
+struct ChunkSink<'a> {
+    buffer: Vec<u8>,
+    sender: &'a crossbeam_channel::Sender<EncodedChunk>,
+    recycled: &'a crossbeam_channel::Receiver<Vec<u8>>,
+}
+
+impl ChunkSink<'_> {
+    fn send(&mut self) -> io::Result<()> {
+        let replacement = self.recycled.try_recv().unwrap_or_default();
+        let chunk = std::mem::replace(&mut self.buffer, replacement);
+        // A disconnected receiver means the writer stopped after an error;
+        // it reports that error itself.
+        self.sender
+            .send(Ok(Some(chunk)))
+            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        if !self.buffer.is_empty() {
+            self.send()?;
+        }
+        self.sender
+            .send(Ok(None))
+            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
+    }
+}
+
+/// One independently encodable piece of a counter's output.
+#[derive(Clone, Copy)]
+enum OutputTable<'a> {
+    /// One partition of compact packed tables.
+    Packed(&'a PackedCounts, usize),
+    /// A whole map for wider keys.
+    Map(&'a Counts),
+}
+
+impl Write for ChunkSink<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.buffer.extend_from_slice(bytes);
+        if self.buffer.len() >= OUTPUT_CHUNK {
+            self.send()?;
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl Counter {
@@ -106,11 +175,11 @@ impl Counter {
 
         Ok(Self {
             counts: if k <= 32 {
-                let mut counts = PackedCounts::default();
-                counts
-                    .try_reserve(capacity)
-                    .map_err(|_| Error::ReserveFailed)?;
-                Counts::Packed(counts)
+                Counts::Packed(PackedCounts::with_capacity(
+                    k,
+                    PACKED_PARTITION_BITS,
+                    capacity,
+                )?)
             } else if k <= 64 {
                 let mut counts = PackedCounts128::default();
                 counts
@@ -126,6 +195,7 @@ impl Counter {
             },
             partitions: Vec::new(),
             partition_hash: None,
+            output_threads: 1,
             strand,
             k,
         })
@@ -142,15 +212,16 @@ impl Counter {
             return Ok(());
         }
 
+        if let Counts::Packed(counts) = &mut self.counts {
+            let (k, strand) = (self.k, self.strand);
+            let mut adder = counts.adder();
+            visit_packed(sequence, k, strand, |key| adder.push(key))?;
+            return adder.finish();
+        }
         if !self.partitions.is_empty() {
             let (k, strand) = (self.k, self.strand);
             return match &self.counts {
-                Counts::Packed(_) => visit_packed(sequence, k, strand, |key| {
-                    let Counts::Packed(map) = self.partition_mut(&key) else {
-                        unreachable!()
-                    };
-                    add_delta(map, key, 1)
-                }),
+                Counts::Packed(_) => unreachable!("packed counts partition themselves"),
                 Counts::Packed128(_) => visit_packed128(sequence, k, strand, |key| {
                     let Counts::Packed128(map) = self.partition_mut(&key) else {
                         unreachable!()
@@ -166,16 +237,39 @@ impl Counter {
             };
         }
         match &mut self.counts {
-            Counts::Packed(counts) => match self.strand {
-                StrandMode::Forward => add_packed_record::<false>(counts, sequence, self.k),
-                StrandMode::Canonical => add_packed_record::<true>(counts, sequence, self.k),
-            },
+            Counts::Packed(_) => unreachable!("handled above"),
             Counts::Packed128(counts) => match self.strand {
                 StrandMode::Forward => add_packed128_record::<false>(counts, sequence, self.k),
                 StrandMode::Canonical => add_packed128_record::<true>(counts, sequence, self.k),
             },
             Counts::Bytes(counts) => add_byte_record(counts, sequence, self.k, self.strand),
         }
+    }
+
+    /// Count several complete records, exactly as calling [`Counter::add_record`]
+    /// for each in order would.
+    ///
+    /// Batching short records (such as reads) lets the counter overlap memory
+    /// accesses across record boundaries. Windows never cross records. On
+    /// overflow, earlier windows, including those in earlier records, remain
+    /// counted, and later windows and records are not counted.
+    pub fn add_records<'a>(
+        &mut self,
+        records: impl IntoIterator<Item = &'a [u8]>,
+    ) -> Result<(), Error> {
+        let (k, strand) = (self.k, self.strand);
+        if let Counts::Packed(counts) = &mut self.counts {
+            let mut adder = counts.adder();
+            for record in records {
+                if record.len() >= k {
+                    visit_packed(record, k, strand, |key| adder.push(key))?;
+                }
+            }
+            return adder.finish();
+        }
+        records
+            .into_iter()
+            .try_for_each(|record| self.add_record(record))
     }
 
     /// Consume another counter with the same k and strand mode, adding its counts.
@@ -185,12 +279,16 @@ impl Counter {
         if self.k != other.k || self.strand != other.strand {
             return Err(Error::IncompatibleCounters);
         }
+        if let (Counts::Packed(target), Counts::Packed(source)) = (&mut self.counts, &other.counts)
+        {
+            // Keys are routed by this counter's own mixer and partitions.
+            return source
+                .entries()
+                .try_for_each(|(key, delta)| target.add_key(key, delta));
+        }
         for source in std::iter::once(other.counts).chain(other.partitions) {
             if self.partitions.is_empty() {
                 match (&mut self.counts, source) {
-                    (Counts::Packed(target), Counts::Packed(source)) => {
-                        merge_counts(target, source)?
-                    }
                     (Counts::Packed128(target), Counts::Packed128(source)) => {
                         merge_counts(target, source)?
                     }
@@ -199,13 +297,8 @@ impl Counter {
                 }
             } else {
                 match source {
-                    Counts::Packed(source) => {
-                        for (key, delta) in source {
-                            let Counts::Packed(target) = self.partition_mut(&key) else {
-                                unreachable!()
-                            };
-                            add_delta(target, key, delta)?;
-                        }
+                    Counts::Packed(_) => {
+                        unreachable!("matching k selects matching representations")
                     }
                     Counts::Packed128(source) => {
                         for (key, delta) in source {
@@ -234,6 +327,7 @@ impl Counter {
         strand: StrandMode,
         partitions: Vec<Counts>,
         hash: foldhash::fast::RandomState,
+        output_threads: usize,
     ) -> Self {
         debug_assert!(partitions.len().is_power_of_two());
         let mut partitions = partitions.into_iter();
@@ -241,6 +335,23 @@ impl Counter {
             counts: partitions.next().unwrap(),
             partitions: partitions.collect(),
             partition_hash: Some(hash),
+            output_threads: output_threads.max(1),
+            k,
+            strand,
+        }
+    }
+
+    pub(crate) fn from_packed(
+        k: usize,
+        strand: StrandMode,
+        counts: PackedCounts,
+        output_threads: usize,
+    ) -> Self {
+        Self {
+            counts: Counts::Packed(counts),
+            partitions: Vec::new(),
+            partition_hash: None,
+            output_threads: output_threads.max(1),
             k,
             strand,
         }
@@ -248,6 +359,76 @@ impl Counter {
 
     fn tables(&self) -> impl Iterator<Item = &Counts> {
         std::iter::once(&self.counts).chain(&self.partitions)
+    }
+
+    /// Encode every table with `encode`, writing the bytes in table order.
+    ///
+    /// Partitioned results encode tables concurrently on up to
+    /// `output_threads` scoped threads. Each encoder streams bounded chunks
+    /// through its own small queue, and the calling thread writes them in
+    /// order, so buffered output stays proportional to the thread count
+    /// (about 17 MiB per encoder) rather than the table size.
+    fn write_tables(
+        &self,
+        writer: &mut dyn Write,
+        encode: impl Fn(OutputTable<'_>, &mut dyn Write) -> io::Result<()> + Sync,
+    ) -> io::Result<()> {
+        let tables: Vec<OutputTable<'_>> = match &self.counts {
+            Counts::Packed(counts) => (0..counts.tables().len())
+                .map(|partition| OutputTable::Packed(counts, partition))
+                .collect(),
+            _ => self.tables().map(OutputTable::Map).collect(),
+        };
+        let threads = self.output_threads.min(tables.len());
+        if threads <= 1 {
+            return tables
+                .into_iter()
+                .try_for_each(|table| encode(table, &mut *writer));
+        }
+        std::thread::scope(|scope| {
+            let (recycle, recycled) = crossbeam_channel::unbounded::<Vec<u8>>();
+            let mut streams = Vec::with_capacity(threads);
+            for first in 0..threads {
+                // Each encoder may run this many chunks ahead of the writer;
+                // enough to buffer a typical partition while others are written.
+                let (sender, receiver) = crossbeam_channel::bounded(16);
+                streams.push(receiver);
+                let (tables, encode, recycled) = (&tables, &encode, recycled.clone());
+                std::thread::Builder::new()
+                    .name(format!("output-{first}"))
+                    .spawn_scoped(scope, move || {
+                        // Encoder `first` owns tables first, first + threads, ...
+                        for &table in tables.iter().skip(first).step_by(threads) {
+                            let mut sink = ChunkSink {
+                                buffer: recycled.try_recv().unwrap_or_default(),
+                                sender: &sender,
+                                recycled: &recycled,
+                            };
+                            if let Err(error) =
+                                encode(table, &mut sink).and_then(|()| sink.finish())
+                            {
+                                // Forward the encoder's own error; this fails
+                                // harmlessly if the writer already stopped.
+                                let _ = sender.send(Err(error));
+                                return;
+                            }
+                        }
+                    })?;
+            }
+            drop(recycled);
+            for index in 0..tables.len() {
+                // Returning early drops every receiver, releasing blocked encoders.
+                while let Some(mut chunk) = streams[index % threads]
+                    .recv()
+                    .map_err(|_| io::Error::other("output encoder failed"))??
+                {
+                    writer.write_all(&chunk)?;
+                    chunk.clear();
+                    let _ = recycle.send(chunk);
+                }
+            }
+            Ok(())
+        })
     }
 
     fn partition_mut<K: Hash + ?Sized>(&mut self, key: &K) -> &mut Counts {
@@ -264,7 +445,7 @@ impl Counter {
     pub fn len(&self) -> usize {
         self.tables()
             .map(|table| match table {
-                Counts::Packed(map) => map.len(),
+                Counts::Packed(counts) => counts.len(),
                 Counts::Packed128(map) => map.len(),
                 Counts::Bytes(map) => map.len(),
             })
@@ -283,35 +464,27 @@ impl Counter {
     /// or stdout in a [`io::BufWriter`] to batch writes. This method does not flush
     /// the writer; write failures may leave partial output.
     pub fn write_tsv(&self, mut writer: impl Write) -> io::Result<()> {
-        // A u64 has at most 20 decimal digits, plus a tab and newline.
-        let mut suffix = [0; 22];
-        for table in self.tables() {
-            match table {
-                Counts::Packed(counts) => {
-                    write_packed_tsv::<32, _>(
-                        counts.iter().map(|(&key, &count)| (key, count)),
-                        self.k,
-                        &mut writer,
-                        decode_packed_into,
-                    )?;
-                }
-                Counts::Packed128(counts) => {
-                    write_packed_tsv::<64, _>(
-                        counts.iter().map(|(&key, &count)| (key, count)),
-                        self.k,
-                        &mut writer,
-                        decode_packed128_into,
-                    )?;
-                }
-                Counts::Bytes(counts) => {
-                    for (key, &count) in counts {
-                        writer.write_all(key)?;
-                        writer.write_all(format_count(count, &mut suffix))?;
-                    }
-                }
+        self.write_tables(&mut writer, |table, writer| match table {
+            OutputTable::Packed(counts, partition) => {
+                write_packed64_tsv(counts.partition_entries(partition), self.k, writer)
             }
-        }
-        Ok(())
+            OutputTable::Map(Counts::Packed(_)) => unreachable!("packed tables are split"),
+            OutputTable::Map(Counts::Packed128(counts)) => write_packed_tsv::<64, _>(
+                counts.iter().map(|(&key, &count)| (key, count)),
+                self.k,
+                writer,
+                decode_packed128_into,
+            ),
+            OutputTable::Map(Counts::Bytes(counts)) => {
+                // A u64 has at most 20 decimal digits, plus a tab and newline.
+                let mut suffix = [0; 22];
+                for (key, &count) in counts {
+                    writer.write_all(key)?;
+                    writer.write_all(format_count(count, &mut suffix))?;
+                }
+                Ok(())
+            }
+        })
     }
 
     /// Iterate over distinct uppercase DNA keys and their counts, in unspecified order.
@@ -331,14 +504,14 @@ impl Counter {
     pub fn counts(&self) -> impl Iterator<Item = (Vec<u8>, u64)> + '_ {
         self.tables().flat_map(move |table| {
             let (packed, wide, bytes) = match table {
-                Counts::Packed(counts) => (Some(counts.iter()), None, None),
+                Counts::Packed(counts) => (Some(counts.entries()), None, None),
                 Counts::Packed128(counts) => (None, Some(counts.iter()), None),
                 Counts::Bytes(counts) => (None, None, Some(counts.iter())),
             };
             packed
                 .into_iter()
                 .flatten()
-                .map(|(&key, &count)| (decode_packed(key, self.k), count))
+                .map(|(key, count)| (decode_packed(key, self.k), count))
                 .chain(wide.into_iter().flatten().map(|(&key, &count)| {
                     let mut dna = vec![0; self.k];
                     decode_packed128_into(key, &mut dna);
@@ -373,11 +546,10 @@ fn merge_counts<K: Eq + std::hash::Hash, S: std::hash::BuildHasher>(
 fn write_packed_tsv<const MAX: usize, K>(
     entries: impl Iterator<Item = (K, u64)>,
     k: usize,
-    writer: &mut impl Write,
+    writer: &mut (impl Write + ?Sized),
     decode: impl Fn(K, &mut [u8]),
 ) -> io::Result<()> {
     let mut batch = [0; 16 * 1024];
-    let mut suffix = [0; 22];
     let mut offset = 0;
     for (key, count) in entries {
         if offset + MAX + 22 > batch.len() {
@@ -385,28 +557,86 @@ fn write_packed_tsv<const MAX: usize, K>(
             offset = 0;
         }
         decode(key, &mut batch[offset..offset + k]);
-        let suffix = format_count(count, &mut suffix);
-        let end = offset + k + suffix.len();
-        batch[offset + k..end].copy_from_slice(suffix);
-        offset = end;
+        offset = push_count(&mut batch, offset + k, count);
     }
     writer.write_all(&batch[..offset])
 }
 
-// Specialize by strand once per record, leaving no reverse-complement work in
-// the forward-only loop. Callers guarantee 1 <= k <= 32.
-fn add_packed_record<const CANONICAL: bool>(
-    counts: &mut PackedCounts,
-    sequence: &[u8],
+/// `write_packed_tsv` for keys of at most 32 bases, decoding a whole key at
+/// once. Each row first stores 32 decoded bytes; the count then overwrites
+/// any bases beyond k.
+fn write_packed64_tsv(
+    entries: impl Iterator<Item = (u64, u64)>,
     k: usize,
-) -> Result<(), Error> {
-    visit_packed_record::<CANONICAL>(sequence, k, |key| {
-        let count = counts.entry(key).or_insert(0);
-        *count = count.checked_add(1).ok_or(Error::CountOverflow)?;
-        Ok(())
-    })
+    writer: &mut (impl Write + ?Sized),
+) -> io::Result<()> {
+    let mut batch = [0; 16 * 1024];
+    let mut offset = 0;
+    for (key, count) in entries {
+        if offset + 32 + 22 > batch.len() {
+            writer.write_all(&batch[..offset])?;
+            offset = 0;
+        }
+        batch[offset..offset + 32].copy_from_slice(&decode_packed32(key, k));
+        offset = push_count(&mut batch, offset + k, count);
+    }
+    writer.write_all(&batch[..offset])
 }
 
+/// Write `\tCOUNT\n` at `offset`, returning the end. Needs 22 bytes of room.
+#[inline(always)]
+fn push_count(batch: &mut [u8], offset: usize, count: u64) -> usize {
+    // Most k-mers in large references occur fewer than ten times.
+    if count < 10 {
+        batch[offset..offset + 3].copy_from_slice(&[b'\t', b'0' + count as u8, b'\n']);
+        return offset + 3;
+    }
+    let mut suffix = [0; 22];
+    let suffix = format_count(count, &mut suffix);
+    batch[offset..offset + suffix.len()].copy_from_slice(suffix);
+    offset + suffix.len()
+}
+
+/// Decode the k <= 32 bases of a packed key into the first k bytes of the
+/// result; the remaining bytes are unspecified.
+#[inline(always)]
+fn decode_packed32(key: u64, k: usize) -> [u8; 32] {
+    debug_assert!((1..=32).contains(&k));
+    // Left-align the key: the first base occupies the top two bits, so the
+    // big-endian bytes hold four bases each, in order.
+    let aligned = key << (64 - 2 * k);
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is mandatory on aarch64; all loads and stores are in bounds.
+    unsafe {
+        use core::arch::aarch64::*;
+        const LOW: [u8; 16] = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3];
+        const HIGH: [u8; 16] = [4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7];
+        const SHIFTS: [i8; 16] = [-6, -4, -2, 0, -6, -4, -2, 0, -6, -4, -2, 0, -6, -4, -2, 0];
+        let bytes = vcreate_u8(aligned.swap_bytes());
+        let bytes = vcombine_u8(bytes, bytes);
+        let shifts = vld1q_s8(SHIFTS.as_ptr());
+        let mask = vdupq_n_u8(3);
+        let letters = vld1q_u8(b"ACGTACGTACGTACGT".as_ptr());
+        let expand = |indices: [u8; 16]| {
+            let replicated = vqtbl1q_u8(bytes, vld1q_u8(indices.as_ptr()));
+            let codes = vandq_u8(vshlq_u8(replicated, shifts), mask);
+            vqtbl1q_u8(letters, codes)
+        };
+        let mut dna = [0; 32];
+        vst1q_u8(dna.as_mut_ptr(), expand(LOW));
+        vst1q_u8(dna.as_mut_ptr().add(16), expand(HIGH));
+        dna
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut dna = [0; 32];
+        decode_packed_into(aligned, &mut dna);
+        dna
+    }
+}
+
+// Specialize by strand once per record, leaving no reverse-complement work in
+// the forward-only loop. Callers guarantee 1 <= k <= 32.
 fn visit_packed(
     sequence: &[u8],
     k: usize,
@@ -653,6 +883,21 @@ fn add_byte_delta(map: &mut HashMap<Vec<u8>, u64>, key: &[u8], delta: u64) -> Re
     }
 }
 
+/// Replace every stored count; tests use this to construct overflow cases.
+#[cfg(test)]
+impl Counts {
+    fn set_counts(&mut self, count: u64) {
+        match self {
+            Counts::Packed(counts) => counts
+                .tables_mut()
+                .iter_mut()
+                .for_each(|table| table.set_counts(count)),
+            Counts::Packed128(map) => map.values_mut().for_each(|value| *value = count),
+            Counts::Bytes(map) => map.values_mut().for_each(|value| *value = count),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,6 +924,22 @@ mod tests {
                     .map(|index| b"ACGT"[((state >> (2 * (len - 1 - index))) & 3) as usize])
                     .collect();
                 assert_eq!(&actual[..len], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn whole_key_decoder_matches_base_decoder_for_every_length() {
+        let mut state = 42_u64;
+        for _ in 0..1024 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            for k in 1..=32 {
+                let key = state & (u64::MAX >> (64 - 2 * k));
+                let mut expected = vec![0; k];
+                decode_packed_into(key, &mut expected);
+                assert_eq!(&decode_packed32(key, k)[..k], expected, "k={k}");
             }
         }
     }
@@ -793,22 +1054,30 @@ mod tests {
         for k in [1, 32, 33, 63, 64, 65] {
             let mut counter = Counter::new(k, StrandMode::Forward).unwrap();
             counter.add_record(&vec![b'A'; k]).unwrap();
-            let mut values = vec![0, u64::MAX];
+            // Stored counts are never zero (see `format_count` below for 0).
+            let mut values = vec![u64::MAX];
             for exponent in 0..=19 {
                 let power = 10_u64.pow(exponent);
                 values.extend([power - 1, power, power + 1]);
             }
-            for value in values {
-                match &mut counter.counts {
-                    Counts::Packed(counts) => *counts.values_mut().next().unwrap() = value,
-                    Counts::Packed128(counts) => *counts.values_mut().next().unwrap() = value,
-                    Counts::Bytes(counts) => *counts.values_mut().next().unwrap() = value,
-                }
+            for value in values.into_iter().filter(|&value| value > 0) {
+                // The counter holds exactly one key.
+                counter.counts.set_counts(value);
                 let mut output = Vec::new();
                 counter.write_tsv(&mut output).unwrap();
                 assert_eq!(output, format!("{}\t{value}\n", "A".repeat(k)).as_bytes());
             }
         }
+    }
+
+    #[test]
+    fn formats_zero_and_maximum_counts() {
+        let mut buffer = [0; 22];
+        assert_eq!(format_count(0, &mut buffer), b"\t0\n");
+        assert_eq!(
+            format_count(u64::MAX, &mut buffer),
+            format!("\t{}\n", u64::MAX).as_bytes()
+        );
     }
 
     #[test]
@@ -935,10 +1204,8 @@ mod tests {
     fn reports_overflow_without_changing_the_overflowing_count() {
         let mut counter = Counter::new(3, StrandMode::Forward).unwrap();
         counter.add_record(b"ACG").unwrap();
-        let Counts::Packed(counts) = &mut counter.counts else {
-            panic!("expected packed backend");
-        };
-        *counts.values_mut().next().unwrap() = u64::MAX - 1;
+        assert!(matches!(counter.counts, Counts::Packed(_)));
+        counter.counts.set_counts(u64::MAX - 1);
         counter.add_record(b"ACG").unwrap();
         assert_eq!(counter.add_record(b"ACG"), Err(Error::CountOverflow));
         assert_counts(&counter, &[("ACG", u64::MAX)]);
@@ -950,11 +1217,7 @@ mod tests {
             for strand in [StrandMode::Forward, StrandMode::Canonical] {
                 let mut counter = Counter::new(k, strand).unwrap();
                 counter.add_record(&vec![b'A'; k]).unwrap();
-                match &mut counter.counts {
-                    Counts::Packed(counts) => *counts.values_mut().next().unwrap() = u64::MAX,
-                    Counts::Packed128(counts) => *counts.values_mut().next().unwrap() = u64::MAX,
-                    Counts::Bytes(counts) => *counts.values_mut().next().unwrap() = u64::MAX,
-                }
+                counter.counts.set_counts(u64::MAX);
                 let mut record = vec![b'C'];
                 record.extend(vec![b'A'; k + 1]);
                 record.push(b'G');

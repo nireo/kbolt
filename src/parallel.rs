@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::table::{self, CompactTable, Layout, Mixer, Overflow, PackedCounts};
 use crate::{
     Counter, Counts, Error, StrandMode, add_delta, visit_bytes, visit_packed, visit_packed128,
 };
@@ -42,6 +43,146 @@ impl Batch {
 #[repr(align(128))]
 struct Shard<T>(Mutex<T>);
 
+/// Apply each nonempty worker-local partition buffer to its shard.
+///
+/// Different workers start at different partitions, and a partition held by
+/// another worker is skipped and revisited instead of waited on. Only when
+/// every remaining partition is busy does a worker block on one. Ownership
+/// follows the partition, not the worker or input batch.
+fn apply_partitions<T, U>(
+    shards: &[Shard<T>],
+    partitions: &mut [Vec<U>],
+    pending: &mut Vec<usize>,
+    offset: usize,
+    drain: impl Fn(&mut T, &mut Vec<U>) -> Result<(), Error>,
+) -> Result<(), Error> {
+    pending.clear();
+    let mask = shards.len() - 1;
+    pending.extend(
+        (0..shards.len())
+            .map(|step| (step + offset) & mask)
+            .filter(|&index| !partitions[index].is_empty()),
+    );
+    while !pending.is_empty() {
+        let before = pending.len();
+        let mut result = Ok(());
+        pending.retain(|&index| {
+            if result.is_err() {
+                return true;
+            }
+            match shards[index].0.try_lock() {
+                Ok(mut table) => {
+                    result = drain(&mut table, &mut partitions[index]);
+                    false
+                }
+                Err(std::sync::TryLockError::WouldBlock) => true,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    result = Err(Error::WorkerFailed);
+                    true
+                }
+            }
+        });
+        result?;
+        if pending.len() == before {
+            let index = pending.swap_remove(0);
+            let mut table = shards[index].0.lock().map_err(|_| Error::WorkerFailed)?;
+            drain(&mut table, &mut partitions[index])?;
+        }
+    }
+    Ok(())
+}
+
+/// Partition bits for parallel packed counting. Each worker scatters k-mers
+/// into one buffer per partition; fewer partitions keep that scatter cache
+/// resident, while enough remain to avoid lock contention between workers.
+/// Partition bits also leave count bits in each slot (see `crate::table`).
+const PARALLEL_PARTITION_BITS: u32 = 8;
+
+/// Shared compact tables for packed keys (k <= 32); see `crate::table`.
+struct PackedShared {
+    mixer: Mixer,
+    layout: Layout,
+    shards: Vec<Shard<CompactTable>>,
+}
+
+/// Worker-local pending updates for packed keys. Each entry stores a key's
+/// remainder in its low bits and a run of repeated increments above them.
+struct PackedUpdates {
+    partitions: Vec<Vec<u64>>,
+    pending: Vec<usize>,
+}
+
+impl PackedShared {
+    fn new(k: usize, capacity: usize) -> Result<Self, Error> {
+        let counts = PackedCounts::with_capacity(k, PARALLEL_PARTITION_BITS, capacity)?;
+        let (mixer, layout) = (counts.mixer(), counts.layout());
+        Ok(Self {
+            mixer,
+            layout,
+            shards: counts
+                .into_tables()
+                .into_iter()
+                .map(|table| Shard(Mutex::new(table)))
+                .collect(),
+        })
+    }
+
+    #[inline(always)]
+    fn push(&self, updates: &mut PackedUpdates, key: u64) {
+        let (partition, remainder) = table::route(self.mixer, self.layout, key);
+        let run = 1_u64 << self.layout.remainder_bits;
+        let buffer = &mut updates.partitions[partition];
+        // Run aggregation handles hot keys and short motifs cheaply.
+        match buffer.last_mut() {
+            Some(last)
+                if *last & self.layout.remainder_mask() == remainder
+                    && *last >> self.layout.remainder_bits
+                        < u64::MAX >> self.layout.remainder_bits =>
+            {
+                *last += run;
+            }
+            _ => buffer.push(run | remainder),
+        }
+    }
+
+    fn apply(&self, updates: &mut PackedUpdates, offset: usize) -> Result<(), Error> {
+        // Prefetch this far ahead within one partition's updates.
+        const AHEAD: usize = 16;
+        let layout = self.layout;
+        let mask = layout.remainder_mask();
+        apply_partitions(
+            &self.shards,
+            &mut updates.partitions,
+            &mut updates.pending,
+            offset,
+            |table: &mut CompactTable, entries: &mut Vec<u64>| {
+                for index in 0..entries.len() {
+                    if let Some(&ahead) = entries.get(index + AHEAD) {
+                        table.prefetch(ahead & mask);
+                    }
+                    let entry = entries[index];
+                    table.add(
+                        entry & mask,
+                        entry >> layout.remainder_bits,
+                        Overflow::Reject,
+                    )?;
+                }
+                entries.clear();
+                Ok(())
+            },
+        )
+    }
+
+    fn into_counts(self) -> Result<PackedCounts, Error> {
+        let tables = self
+            .shards
+            .into_iter()
+            .map(|shard| shard.0.into_inner().map_err(|_| Error::WorkerFailed))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(PackedCounts::from_tables(self.mixer, self.layout, tables))
+    }
+}
+
 struct Partitioned<K, S> {
     shards: Vec<Shard<HashMap<K, u64, S>>>,
     hash: foldhash::fast::RandomState,
@@ -66,22 +207,17 @@ impl<K: Eq + Hash, S: BuildHasher + Default> Partitioned<K, S> {
     }
 
     fn apply(&self, buffers: &mut Updates<K>, offset: usize) -> Result<(), Error> {
-        // Different workers start at different partitions to avoid lock convoys.
-        // Ownership follows the partition, not the worker or input batch.
-        for step in 0..self.shards.len() {
-            let index = (step + offset) & (self.shards.len() - 1);
-            let updates = &mut buffers.partitions[index];
-            if updates.is_empty() {
-                continue;
-            }
-            let mut map = self.shards[index]
-                .0
-                .lock()
-                .map_err(|_| Error::WorkerFailed)?;
-            for (key, delta) in updates.drain(..) {
-                add_delta(&mut map, key, delta)?;
-            }
-        }
+        apply_partitions(
+            &self.shards,
+            &mut buffers.partitions,
+            &mut buffers.pending,
+            offset,
+            |map: &mut HashMap<K, u64, S>, updates: &mut Vec<(K, u64)>| {
+                updates
+                    .drain(..)
+                    .try_for_each(|(key, delta)| add_delta(map, key, delta))
+            },
+        )?;
         buffers.buffered_bytes = 0;
         Ok(())
     }
@@ -107,6 +243,8 @@ impl<K: Eq + Hash, S: BuildHasher + Default> Partitioned<K, S> {
 
 struct Updates<K> {
     partitions: Vec<Vec<(K, u64)>>,
+    // Reused list of nonempty partitions still waiting for their lock.
+    pending: Vec<usize>,
     buffered_bytes: usize,
     #[cfg(test)]
     peak_buffered_bytes: usize,
@@ -116,6 +254,7 @@ impl<K: Eq + Hash> Updates<K> {
     fn new(partitions: usize) -> Self {
         Self {
             partitions: (0..partitions).map(|_| Vec::new()).collect(),
+            pending: Vec::with_capacity(partitions),
             buffered_bytes: 0,
             #[cfg(test)]
             peak_buffered_bytes: 0,
@@ -162,13 +301,13 @@ impl Updates<Vec<u8>> {
 }
 
 enum SharedCounts {
-    Packed(Partitioned<u64, foldhash::fast::RandomState>),
+    Packed(PackedShared),
     Packed128(Partitioned<(u64, u64), foldhash::fast::RandomState>),
     Bytes(Partitioned<Vec<u8>, std::collections::hash_map::RandomState>),
 }
 
 enum Buffers {
-    Packed(Updates<u64>),
+    Packed(PackedUpdates),
     Packed128(Updates<(u64, u64)>),
     Bytes(Updates<Vec<u8>>),
 }
@@ -176,7 +315,7 @@ enum Buffers {
 impl SharedCounts {
     fn new(k: usize, partitions: usize, capacity: usize) -> Result<Self, Error> {
         Ok(if k <= 32 {
-            Self::Packed(Partitioned::new(partitions, capacity)?)
+            Self::Packed(PackedShared::new(k, capacity)?)
         } else if k <= 64 {
             Self::Packed128(Partitioned::new(partitions, capacity)?)
         } else {
@@ -184,11 +323,14 @@ impl SharedCounts {
         })
     }
 
-    fn buffers(&self, partitions: usize) -> Buffers {
+    fn buffers(&self) -> Buffers {
         match self {
-            Self::Packed(_) => Buffers::Packed(Updates::new(partitions)),
-            Self::Packed128(_) => Buffers::Packed128(Updates::new(partitions)),
-            Self::Bytes(_) => Buffers::Bytes(Updates::new(partitions)),
+            Self::Packed(table) => Buffers::Packed(PackedUpdates {
+                partitions: (0..table.shards.len()).map(|_| Vec::new()).collect(),
+                pending: Vec::with_capacity(table.shards.len()),
+            }),
+            Self::Packed128(table) => Buffers::Packed128(Updates::new(table.shards.len())),
+            Self::Bytes(table) => Buffers::Bytes(Updates::new(table.shards.len())),
         }
     }
 
@@ -203,7 +345,10 @@ impl SharedCounts {
         match (self, buffers) {
             (Self::Packed(table), Buffers::Packed(buffers)) => {
                 for record in batch.records() {
-                    visit_packed(record, k, strand, |key| buffers.push(&table.hash, key))?;
+                    visit_packed(record, k, strand, |key| {
+                        table.push(buffers, key);
+                        Ok(())
+                    })?;
                 }
                 table.apply(buffers, offset)
             }
@@ -235,13 +380,22 @@ impl SharedCounts {
         }
     }
 
-    fn finish(self, k: usize, strand: StrandMode) -> Result<Counter, Error> {
+    fn finish(self, k: usize, strand: StrandMode, threads: usize) -> Result<Counter, Error> {
         let (partitions, hash) = match self {
-            Self::Packed(table) => table.into_counts(Counts::Packed)?,
+            Self::Packed(table) => {
+                return Ok(Counter::from_packed(
+                    k,
+                    strand,
+                    table.into_counts()?,
+                    threads,
+                ));
+            }
             Self::Packed128(table) => table.into_counts(Counts::Packed128)?,
             Self::Bytes(table) => table.into_counts(Counts::Bytes)?,
         };
-        Ok(Counter::from_partitions(k, strand, partitions, hash))
+        Ok(Counter::from_partitions(
+            k, strand, partitions, hash, threads,
+        ))
     }
 }
 
@@ -269,6 +423,7 @@ pub struct ParallelCounter {
     workers: Vec<JoinHandle<Result<(), Error>>>,
     failure: Arc<Mutex<Option<Error>>>,
     shared: Option<Arc<SharedCounts>>,
+    threads: usize,
     k: usize,
     strand: StrandMode,
     started: Instant,
@@ -296,7 +451,9 @@ impl ParallelCounter {
             .checked_mul(2)
             .filter(|&n| n > 0)
             .ok_or(Error::InvalidThreads)?;
-        let partitions = (threads.min(32) * 8).next_power_of_two().max(16);
+        // Partitions for wider keys (k > 32). Enough that workers rarely find a
+        // partition busy, few enough to keep per-worker buffers cache friendly.
+        let partitions = (threads.min(32) * 32).next_power_of_two().clamp(16, 1024);
         let shared = Arc::new(SharedCounts::new(k, partitions, capacity)?);
         let mut workers = Vec::new();
         workers
@@ -320,6 +477,7 @@ impl ParallelCounter {
             workers,
             failure,
             shared: Some(Arc::clone(&shared)),
+            threads,
             k,
             strand,
             started,
@@ -335,7 +493,7 @@ impl ParallelCounter {
                     // Turn panics into a shared failure so other receivers stop and
                     // a producer blocked on a full queue is eventually released.
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let mut buffers = shared.buffers(partitions);
+                        let mut buffers = shared.buffers();
                         let mut offset = index;
                         while let Ok(mut batch) = receiver.recv() {
                             if let Some(error) = *failure.lock().map_err(|_| Error::WorkerFailed)? {
@@ -415,7 +573,7 @@ impl ParallelCounter {
         let merging = Instant::now();
         let shared =
             Arc::try_unwrap(self.shared.take().unwrap()).map_err(|_| Error::WorkerFailed)?;
-        let counter = shared.finish(self.k, self.strand)?;
+        let counter = shared.finish(self.k, self.strand, self.threads)?;
         Ok((
             counter,
             ParallelStats {
@@ -564,7 +722,6 @@ impl Drop for ParallelInput<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Counts;
     use std::collections::BTreeMap;
 
     fn table(counter: &Counter) -> BTreeMap<Vec<u8>, u64> {
@@ -586,7 +743,7 @@ mod tests {
         for k in [65, 257] {
             for strand in [StrandMode::Forward, StrandMode::Canonical] {
                 let shared = SharedCounts::new(k, 32, 0).unwrap();
-                let mut buffers = shared.buffers(32);
+                let mut buffers = shared.buffers();
                 let batch = Batch {
                     bases: sequence.clone(),
                     ends: vec![sequence.len()],
@@ -601,7 +758,7 @@ mod tests {
                         <= BYTE_UPDATE_BYTES + k + std::mem::size_of::<(Vec<u8>, u64)>()
                 );
                 assert_eq!(updates.buffered_bytes, 0);
-                let result = shared.finish(k, strand).unwrap();
+                let result = shared.finish(k, strand, 1).unwrap();
                 let mut expected = Counter::new(k, strand).unwrap();
                 expected.add_record(&sequence).unwrap();
                 assert_eq!(table(&result), table(&expected), "k={k} {strand:?}");
@@ -664,7 +821,11 @@ mod tests {
                 let mut parallel = ParallelCounter::new(k, strand, 3).unwrap();
                 parallel.add_record(&record).unwrap();
                 let mut result = parallel.finish().unwrap();
-                assert!(!result.partitions.is_empty());
+                // Packed keys partition internally; wider keys keep separate maps.
+                assert!(match &result.counts {
+                    Counts::Packed(counts) => counts.tables().len() > 1,
+                    _ => !result.partitions.is_empty(),
+                });
                 result.add_record(&record).unwrap();
                 let mut other = ParallelCounter::new(k, strand, 2).unwrap();
                 other.add_record(&record).unwrap();
@@ -699,11 +860,7 @@ mod tests {
                 for counts in
                     std::iter::once(&mut partitioned.counts).chain(&mut partitioned.partitions)
                 {
-                    match counts {
-                        Counts::Packed(map) => map.values_mut().for_each(|n| *n = u64::MAX),
-                        Counts::Packed128(map) => map.values_mut().for_each(|n| *n = u64::MAX),
-                        Counts::Bytes(map) => map.values_mut().for_each(|n| *n = u64::MAX),
-                    }
+                    counts.set_counts(u64::MAX);
                 }
                 let before = table(&partitioned);
                 assert_eq!(
@@ -727,8 +884,13 @@ mod tests {
             let SharedCounts::Packed(table) = counter.shared.as_ref().unwrap().as_ref() else {
                 unreachable!()
             };
-            let index = table.hash.hash_one(0_u64) as usize & (table.shards.len() - 1);
-            table.shards[index].0.lock().unwrap().insert(0, u64::MAX);
+            let (partition, remainder) = table::route(table.mixer, table.layout, 0);
+            table.shards[partition]
+                .0
+                .lock()
+                .unwrap()
+                .add(remainder, u64::MAX, Overflow::Reject)
+                .unwrap();
             let result = counter.add_record(&vec![b'A'; BATCH_BASES * 32]);
             let result = result.and_then(|()| counter.finish().map(|_| ()));
             send.send(result).unwrap();
@@ -837,11 +999,7 @@ mod tests {
 
                 let mut overflowing = Counter::new(k, strand).unwrap();
                 overflowing.add_record(&vec![b'A'; k]).unwrap();
-                match &mut overflowing.counts {
-                    Counts::Packed(map) => *map.values_mut().next().unwrap() = u64::MAX,
-                    Counts::Packed128(map) => *map.values_mut().next().unwrap() = u64::MAX,
-                    Counts::Bytes(map) => *map.values_mut().next().unwrap() = u64::MAX,
-                }
+                overflowing.counts.set_counts(u64::MAX);
                 let before = table(&overflowing);
                 let mut delta = Counter::new(k, strand).unwrap();
                 delta.add_record(&vec![b'A'; k]).unwrap();

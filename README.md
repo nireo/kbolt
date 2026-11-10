@@ -1,134 +1,90 @@
 # kbolt
 
-kbolt is a Rust library and CLI that counts DNA k-mers exactly in memory. It
-packs k-mers of up to 32 bases into 64-bit integers, uses 128-bit packed keys
-through k=64, and uses byte strings for longer k-mers.
+kbolt counts k-mers in DNA. Point it at a genome or a batch of sequencing reads
+and it lists every substring of length k along with how many times it shows up.
+The counts are exact, not estimates. It reads FASTA and FASTQ, gzipped or not,
+and you can use it from the command line or as a Rust library.
 
-## CLI
+It's built to be fast on an ordinary machine. Everything stays in memory, so it
+works best when the distinct k-mers fit in RAM. Here's how it compares with
+FastK and Jellyfish, two widely used exact counters, on the same inputs:
 
-Install from this checkout:
+![k-mer counting throughput of kbolt, FastK and Jellyfish at 1, 4 and 8 threads](docs/benchmark.png)
+
+Wall time to count canonical 31-mers (median of 3 runs, Apple M5):
+
+| Workload | Threads | kbolt | FastK | Jellyfish |
+|---|---:|---:|---:|---:|
+| Arabidopsis genome, 120 Mbp | 1 | **2.49 s** | 6.45 s | 29.8 s |
+|  | 8 | **0.77 s** | 1.88 s | 6.57 s |
+| Reads, 134 Mbp FASTQ | 1 | **0.56 s** | 2.09 s | 6.46 s |
+|  | 8 | **0.13 s** | 0.61 s | 2.30 s |
+| Same reads, gzip | 1 | **0.59 s** | 2.37 s | 7.29 s |
+|  | 8 | **0.23 s** | 0.80 s | 2.96 s |
+
+kbolt is 2.4–4.6× faster than FastK and 8.5–17× faster than Jellyfish here,
+and all three report identical counts.
+
+## Usage
 
 ```sh
 cargo install --path .
+
+kbolt count -k 31 reads.fastq.gz > counts.tsv
+kbolt count -k 31 -t 8 sample_R1.fastq.gz sample_R2.fastq.gz -o counts.tsv
+kbolt count -k 31 -t 8 --format binary reads.fastq.gz -o counts.kbolt
+kbolt dump counts.kbolt > counts.tsv
 ```
 
-Count canonical k-mers from one or more FASTA/FASTQ files:
+- Output is `KMER<TAB>COUNT` per line, in no particular order.
+- Reverse complements are combined by default; `--forward` counts each strand
+  separately.
+- Format and compression are detected from the content. With no input files,
+  kbolt reads stdin.
+- `-t N` sets the number of counting threads. `--progress` and `--timings`
+  report on stderr.
+- Every distinct k-mer is held in RAM; there is no disk spill.
 
-```sh
-kbolt count -k 31 reads.fastq.gz --output counts.tsv --progress
-kbolt count -k 31 --threads 4 --format binary reads.fastq.gz -o counts.kbolt --timings
-kbolt count -k 31 -t 8 --readers 2 sample_R1.fastq.gz sample_R2.fastq.gz -o counts.tsv
-kbolt count -k 21 sample_R1.fastq.gz sample_R2.fastq.gz > counts.tsv
-cat reference.fasta | kbolt count -k 31 > counts.tsv
-kbolt count -k 31 --forward reference.fasta > forward.tsv
-kbolt count --help
-```
+See `kbolt count --help` for all options.
 
-- Input format and gzip compression are detected from content, not extensions.
-  Files may use different formats/compression. Concatenated gzip members work.
-- No input paths means stdin; use `-` to include stdin explicitly (at most once).
-  `--output -` (the default) writes to stdout.
-- Output is headerless `KMER<TAB>COUNT`, in unspecified order. Canonical mode
-  combines reverse complements by default; `--forward` keeps them separate.
-- Input is parsed in 64 KiB fragments, retaining up to `k-1` sequence bytes at
-  counting-batch boundaries. Even enormous single-line FASTA records, headers, and FASTQ
-  quality lines are not loaded in full. Windows cross wrapped lines and chunks,
-  but never records or files. Paired-end reads are separate records, not joined.
-- `--threads N` (`-t N`) selects persistent counting workers. The default of 1
-  retains the direct serial path. Parallel workers extract keys from reusable
-  batches that grow from 64 KiB to 1 MiB, and buffer updates by key partition.
-  Each key lives in exactly one partition; workers acquire a partition once per batch and combine repeated
-  updates locally. Finalization and output retain those maps without a global
-  merge. `--capacity` is a total initial hint divided among partitions, not a
-  memory limit. Batch dispatch uses a bounded Crossbeam queue.
-- `--readers N` selects concurrent input readers when `--threads` exceeds 1.
-  The default is 2, capped by the number of inputs. One input is parsed on the
-  calling thread; multiple readers independently parse/decompress files into
-  the shared bounded queue. Reader threads are additional to counting workers.
-  Use `--readers 1` for sequential input. Concurrent readers accept regular files;
-  stdin, devices, and FIFOs retain sequential input order. Gzip decoding uses `zlib-rs`;
-  one ordinary gzip stream still has one decoder. Parallel readers do not split a
-  compressed file into arbitrary byte ranges.
-- `--timings` prints counting (including parsing/decompression and worker startup),
-  finalization (`merging` for compatibility), output, and total wall times to
-  stderr. The benchmark runner additionally measures process teardown and peak RSS.
-- **The distinct-k-mer table still lives entirely in RAM.** Streaming bounds
-  input buffering, not counting memory; there is no disk spill or memory limit.
-- FASTA and FASTQ support wrapped sequence lines, LF/CRLF, and a final line
-  without a newline. Headers must start with `>`/`@` in column one and include a
-  name. Sequence bytes may be ASCII letters, `.` or `-`; case is ignored and
-  anything other than A/C/G/T breaks a valid run. FASTA blank sequence lines
-  are allowed; leading blank lines and FASTA comment lines are not supported.
-- FASTQ requires a `+` separator and exactly one printable ASCII quality score
-  (`!` through `~`) per sequence byte. Quality lines may wrap independently of
-  sequence lines. Optional `+` text is ignored; qualities are validated, not
-  used for filtering. Empty FASTQ records require an empty quality line.
-- Malformed input produces a nonzero exit status and a diagnostic on stderr.
-  Output is opened only after all inputs have been validated, so input errors
-  do not truncate an existing output file. Output write failures can leave a
-  partial file. Empty input is accepted and contributes no records.
-- `--progress` reports records, sequence bases (including ambiguity), distinct
-  k-mers, and elapsed time on stderr, approximately once a second while counting
-  and once at completion. With parallel workers, periodic reports show submitted
-  bases; the exact distinct count is available after finalization. Concurrent
-  readers report per-file progress with a path prefix; the final summary combines
-  every input. Counts alone go to stdout/the output file.
-
-## Library usage
+## Library
 
 ```rust
 use kbolt::{Counter, StrandMode};
 
 fn main() -> Result<(), kbolt::Error> {
     let mut counter = Counter::new(3, StrandMode::Canonical)?;
-
-    // Add each read or sequence record separately.
     counter.add_record(b"ACGT")?;
     counter.add_record(b"acg")?;
 
     for (kmer, count) in counter.counts() {
-        println!("{} {count}", String::from_utf8_lossy(&kmer));
+        println!("{} {count}", String::from_utf8_lossy(&kmer)); // ACG 3
     }
-
     Ok(())
 }
 ```
 
-Output:
+For many short reads, `add_records` is faster than repeated `add_record`
+calls. `ParallelCounter` counts on several threads and `finish()` returns a
+normal `Counter`.
 
-```text
-ACG 3
-```
+## How it works
 
-Canonical mode combines the counts of a k-mer and its reverse complement.
-Both `ACG` and `CGT` contribute to `ACG` in this example. Use `StrandMode::Forward`
-to count them separately.
-
-For parallel library counting, submit each complete record to
-`ParallelCounter::new(k, strand, workers)?`, then call `finish()?` to obtain a
-normal `Counter` retaining its key partitions. `finish_with_stats()?` also returns
-counting and finalization wall times. Errors from workers can surface during
-finalization. Dropping the parallel
-counter closes its bounded queue and joins all workers. `Counter::merge` consumes
-another counter with the same k/strand mode, adding counts with overflow checks.
-Batch dispatch uses `crossbeam-channel`.
-
-For fragmented records, call `start_record()` and then `add_sequence(fragment)?`
-for each fragment; windows cross fragments but not `start_record()` boundaries.
-Use `parallel.input()` to create independent producers for scoped reader threads.
-Each producer supports the same record/fragment methods; call `input.finish()?`
-to submit its final partial batch and report submission errors. Producer borrows
-prevent finishing the counter until all producers have been released. A dropped
-producer also attempts to submit its partial batch. Finished partitioned counters
-support subsequent `add_record`, `merge`, and both output formats.
+For k ≤ 32, each k-mer is packed into 64 bits and passed through an invertible
+hash. The top hash bits choose a partition, and the rest are stored in a single
+64-bit slot alongside a small count. Rare large counts move to a side table, so
+every count stays exact. Slots sit in 64-byte buckets of eight, so a lookup
+touches one cache line, and updates are buffered so buckets can be prefetched
+ahead of time. Longer k-mers use ordinary hash maps.
 
 ## Development
 
 ```sh
 cargo test
 cargo clippy --all-targets -- -D warnings
-cargo bench --bench count
-cargo bench --bench parallel
+cargo bench
 ```
 
-See [the benchmark guide](benches/README.md) for workloads and baseline comparisons.
+`python3 benches/compare.py` reruns the comparison (FastK and Jellyfish from
+Homebrew, inputs from `benches/generate_inputs.py`). Redraw the chart with
+`uv run --no-project --with matplotlib python benches/plot_compare.py`.

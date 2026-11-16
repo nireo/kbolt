@@ -25,9 +25,18 @@ Wall time to count canonical 31-mers (median of 3 runs, Apple M5):
 kbolt is 2.6–4.7× faster than FastK, 1.7–12× faster than KMC and 9–20× faster
 than Jellyfish here, and all four report identical counts.
 
-These inputs are small. KMC is built for read sets larger than memory, which
-it splits into bins on disk, and it pays fixed costs here that matter less at
-that scale; kbolt cannot count those inputs at all.
+Those inputs are small. On a real read set whose table is far larger than the
+CPU caches (C. elegans SRR065390: two gzipped FASTQ files, 6.76 Gbp, 488
+million distinct 31-mers), at 8 threads:
+
+| | Wall time | CPU time | Peak memory |
+|---|---:|---:|---:|
+| kbolt | **15.8 s** | 137 s | 6.3 GiB |
+| KMC | 37.0 s | 224 s | 11.1 GiB |
+| FastK | 46.8 s | 205 s | 9.7 GiB |
+
+KMC and FastK split their input into bins on disk, so they can also count read
+sets whose k-mers do not fit in memory; kbolt cannot.
 
 ## Usage
 
@@ -93,3 +102,5 @@ cargo bench
 Homebrew, KMC from its GitHub releases, inputs from
 `benches/generate_inputs.py`). Redraw the chart with
 `uv run --no-project --with matplotlib python benches/plot_compare.py`.
+`python3 benches/reads.py` reruns the real-read comparison after
+`python3 benches/reads.py --fetch` has downloaded the reads (5 GB).

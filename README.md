@@ -7,23 +7,27 @@ and you can use it from the command line or as a Rust library.
 
 It's built to be fast on an ordinary machine. Everything stays in memory, so it
 works best when the distinct k-mers fit in RAM. Here's how it compares with
-FastK and Jellyfish, two widely used exact counters, on the same inputs:
+FastK, KMC and Jellyfish, three widely used exact counters, on the same inputs:
 
-![k-mer counting throughput of kbolt, FastK and Jellyfish at 1, 4 and 8 threads](docs/benchmark.png)
+![k-mer counting throughput of kbolt, FastK, KMC and Jellyfish at 1, 4 and 8 threads](docs/benchmark.png)
 
 Wall time to count canonical 31-mers (median of 3 runs, Apple M5):
 
-| Workload | Threads | kbolt | FastK | Jellyfish |
-|---|---:|---:|---:|---:|
-| Arabidopsis genome, 120 Mbp | 1 | **2.49 s** | 6.45 s | 29.8 s |
-|  | 8 | **0.77 s** | 1.88 s | 6.57 s |
-| Reads, 134 Mbp FASTQ | 1 | **0.56 s** | 2.09 s | 6.46 s |
-|  | 8 | **0.13 s** | 0.61 s | 2.30 s |
-| Same reads, gzip | 1 | **0.59 s** | 2.37 s | 7.29 s |
-|  | 8 | **0.23 s** | 0.80 s | 2.96 s |
+| Workload | Threads | kbolt | FastK | KMC | Jellyfish |
+|---|---:|---:|---:|---:|---:|
+| Arabidopsis genome, 120 Mbp | 1 | **2.47 s** | 6.57 s | 4.11 s | 29.7 s |
+|  | 8 | **0.73 s** | 1.86 s | 1.65 s | 6.81 s |
+| Reads, 134 Mbp FASTQ | 1 | **0.53 s** | 2.12 s | 4.90 s | 6.85 s |
+|  | 8 | **0.13 s** | 0.61 s | 1.56 s | 2.65 s |
+| Same reads, gzip | 1 | **0.56 s** | 2.38 s | 4.89 s | 6.98 s |
+|  | 8 | **0.22 s** | 0.80 s | 1.95 s | 2.26 s |
 
-kbolt is 2.4–4.6× faster than FastK and 8.5–17× faster than Jellyfish here,
-and all three report identical counts.
+kbolt is 2.6–4.7× faster than FastK, 1.7–12× faster than KMC and 9–20× faster
+than Jellyfish here, and all four report identical counts.
+
+These inputs are small. KMC is built for read sets larger than memory, which
+it splits into bins on disk, and it pays fixed costs here that matter less at
+that scale; kbolt cannot count those inputs at all.
 
 ## Usage
 
@@ -86,5 +90,6 @@ cargo bench
 ```
 
 `python3 benches/compare.py` reruns the comparison (FastK and Jellyfish from
-Homebrew, inputs from `benches/generate_inputs.py`). Redraw the chart with
+Homebrew, KMC from its GitHub releases, inputs from
+`benches/generate_inputs.py`). Redraw the chart with
 `uv run --no-project --with matplotlib python benches/plot_compare.py`.

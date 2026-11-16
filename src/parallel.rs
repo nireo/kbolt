@@ -120,8 +120,10 @@ const DIRECT_BUCKETS: usize = if cfg!(test) { 2 } else { 8192 };
 /// Prefetch this far ahead within a run of updates.
 const AHEAD: usize = 16;
 /// A worker that finds a group busy leaves its updates queued, unless the
-/// queue has grown to this many thresholds; then it waits for the group.
+/// queue has grown to this many thresholds (and at least `MIN_BACKLOG`
+/// updates, 2 MiB); then it waits for the group.
 const BACKLOG: usize = 4;
+const MIN_BACKLOG: usize = if cfg!(test) { 256 } else { 256 * 1024 };
 
 /// One group of compact tables and the updates queued for them.
 // Keep unrelated groups' locks off the same cache line.
@@ -157,6 +159,8 @@ struct PackedUpdates {
     split: Vec<u64>,
     /// Where each table's updates end (then, while scattering, the cursors).
     ends: Vec<usize>,
+    /// Small groups found busy during a pass, to revisit at its end.
+    busy: Vec<usize>,
 }
 
 /// The queue length at which a group with these tables is applied, or zero
@@ -225,65 +229,89 @@ impl PackedShared {
         }
     }
 
-    /// Queue this worker's buffered updates, and apply the queue of every
-    /// group that has collected enough of them and is free.
+    /// Hand this worker's buffered updates to their groups.
     ///
-    /// Different workers start at different groups. A group being applied by
-    /// another worker keeps its queue for that worker's next visit, so no
-    /// worker waits on a table unless a queue has grown far past its threshold.
+    /// Different workers start at different groups. A small group that
+    /// another worker is updating is skipped and revisited after the others,
+    /// and a large one simply keeps the queued updates for that worker's next
+    /// visit, so no worker waits on a table unless a queue has grown far past
+    /// its threshold.
     fn submit(&self, updates: &mut PackedUpdates, offset: usize) -> Result<(), Error> {
         let mask = self.groups.len() - 1;
+        updates.busy.clear();
         for step in 0..self.groups.len() {
             let index = (step + offset) & mask;
-            if updates.local[index].is_empty() {
-                continue;
+            if !updates.local[index].is_empty() && !self.submit_group(index, updates, false)? {
+                updates.busy.push(index);
             }
-            let group = &self.groups[index];
-            let threshold = group.threshold.load(Ordering::Relaxed);
-            if threshold == 0
-                && let Ok(mut tables) = group.tables.try_lock()
-            {
-                // A small group: first anything queued while it was busy,
-                // then this worker's updates straight from its buffer.
-                self.apply(group, &mut tables, updates)?;
-                self.add_direct(&mut tables, &updates.local[index])?;
-                updates.local[index].clear();
-                group
-                    .threshold
-                    .store(pending_threshold(&tables), Ordering::Relaxed);
-                continue;
-            }
-            // A busy small group queues like a large one.
-            let threshold = threshold.max(MIN_PENDING);
-            let queued = {
-                let mut pending = group.pending.lock().map_err(|_| Error::WorkerFailed)?;
-                let needed = pending.len() + updates.local[index].len();
-                if needed > pending.capacity() {
-                    // Size the queue for its threshold rather than doubling it.
-                    let target = needed.max(threshold + threshold / 4);
-                    let additional = target - pending.len();
-                    pending.reserve_exact(additional);
-                }
-                pending.extend_from_slice(&updates.local[index]);
-                pending.len()
-            };
-            updates.local[index].clear();
-            if queued < threshold {
-                continue;
-            }
-            let mut tables = match group.tables.try_lock() {
-                Ok(tables) => tables,
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    if queued < threshold.saturating_mul(BACKLOG) {
-                        continue;
-                    }
-                    group.tables.lock().map_err(|_| Error::WorkerFailed)?
-                }
-                Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::WorkerFailed),
-            };
-            self.apply(group, &mut tables, updates)?;
+        }
+        for position in 0..updates.busy.len() {
+            let index = updates.busy[position];
+            self.submit_group(index, updates, true)?;
         }
         Ok(())
+    }
+
+    /// Hand this worker's updates for group `index` to it: applied at once to
+    /// a small group, queued (and applied once enough have collected) for a
+    /// large one. A small group that is busy is left alone, returning `false`,
+    /// unless `queue_if_busy`.
+    fn submit_group(
+        &self,
+        index: usize,
+        updates: &mut PackedUpdates,
+        queue_if_busy: bool,
+    ) -> Result<bool, Error> {
+        let group = &self.groups[index];
+        let threshold = group.threshold.load(Ordering::Relaxed);
+        if threshold == 0 {
+            match group.tables.try_lock() {
+                Ok(mut tables) => {
+                    // First anything queued while the group was busy, then
+                    // this worker's updates straight from its buffer.
+                    self.apply(group, &mut tables, updates)?;
+                    self.add_direct(&mut tables, &updates.local[index])?;
+                    updates.local[index].clear();
+                    group
+                        .threshold
+                        .store(pending_threshold(&tables), Ordering::Relaxed);
+                    return Ok(true);
+                }
+                Err(std::sync::TryLockError::WouldBlock) if !queue_if_busy => return Ok(false),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+                Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::WorkerFailed),
+            }
+        }
+        // A small group that stays busy queues like a large one.
+        let threshold = threshold.max(MIN_PENDING);
+        let queued = {
+            let mut pending = group.pending.lock().map_err(|_| Error::WorkerFailed)?;
+            let needed = pending.len() + updates.local[index].len();
+            if needed > pending.capacity() {
+                // Size the queue for its threshold rather than doubling it.
+                let target = needed.max(threshold + threshold / 4);
+                let additional = target - pending.len();
+                pending.reserve_exact(additional);
+            }
+            pending.extend_from_slice(&updates.local[index]);
+            pending.len()
+        };
+        updates.local[index].clear();
+        if queued < threshold {
+            return Ok(true);
+        }
+        let mut tables = match group.tables.try_lock() {
+            Ok(tables) => tables,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if queued < threshold.saturating_mul(BACKLOG).max(MIN_BACKLOG) {
+                    return Ok(true);
+                }
+                group.tables.lock().map_err(|_| Error::WorkerFailed)?
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::WorkerFailed),
+        };
+        self.apply(group, &mut tables, updates)?;
+        Ok(true)
     }
 
     /// Apply `entries` to a small group's tables in arrival order.

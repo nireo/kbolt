@@ -134,8 +134,9 @@ struct Buckets {
     len: usize,
 }
 
-/// Bucket counts from this size up are mapped directly (64 KiB).
-const MAPPED_BUCKETS: usize = 1024;
+/// Bucket counts from this size up are mapped directly (16 KiB). With
+/// thousands of tables, even outgrown tables of a few pages add up.
+const MAPPED_BUCKETS: usize = 256;
 
 // SAFETY: `Buckets` owns its allocation exclusively, like a `Vec<Bucket>`.
 unsafe impl Send for Buckets {}
@@ -225,13 +226,31 @@ impl std::ops::DerefMut for Buckets {
 }
 
 const SLOTS: usize = 8;
-/// Grow before more than three quarters of the slots are occupied.
-const LOAD_NUMERATOR: usize = 3;
-const LOAD_DENOMINATOR: usize = 4;
+/// How full a table may get before it grows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Load {
+    /// Three quarters, for tables updated one key at a time in arbitrary
+    /// order: each extra bucket probed is likely another cache miss.
+    Sparse,
+    /// Seven eighths, for tables that receive their updates in bursts while
+    /// they sit in cache, where longer probes cost little and memory matters.
+    Dense,
+}
+
+impl Load {
+    /// The limit in sixteenths of the slots.
+    const fn sixteenths(self) -> usize {
+        match self {
+            Self::Sparse => 12,
+            Self::Dense => 14,
+        }
+    }
+}
+
 /// Tables double until they reach this many buckets, then grow by half.
 /// Home buckets are a fastrange, so any bucket count works, and a smaller step
-/// leaves less of a large table empty: it is between half and three quarters
-/// full instead of between three eighths and three quarters.
+/// leaves less of a large table empty: its fill stays within two thirds of
+/// the limit instead of dropping to half of it.
 const STEADY_BUCKETS: usize = 1024;
 
 /// Byte-per-slot masks (0xff or 0x00) of slots equal to `key` after clearing
@@ -320,13 +339,14 @@ pub(crate) struct CompactTable {
     // sizes they would all grow at once and all be mostly empty together;
     // spread out, their total stays near the average at every moment.
     stagger: u16,
+    load: Load,
     // Exact counts for slots whose small count holds the marker.
     overflow: HashMap<u64, u64, foldhash::fast::RandomState>,
 }
 
 impl CompactTable {
     /// An empty table for partition `index` of `partitions`.
-    pub(crate) fn staggered(layout: Layout, index: usize, partitions: usize) -> Self {
+    pub(crate) fn staggered(layout: Layout, load: Load, index: usize, partitions: usize) -> Self {
         debug_assert!(index < partitions);
         Self {
             buckets: Buckets::new(),
@@ -334,6 +354,7 @@ impl CompactTable {
             grow_at: 0,
             layout,
             stagger: ((index as u128 * 65536) / partitions as u128) as u16,
+            load,
             overflow: HashMap::default(),
         }
     }
@@ -354,6 +375,26 @@ impl CompactTable {
         ((u128::from(aligned) * self.buckets.len() as u128) >> 64) as usize
     }
 
+    /// Number of 64-byte buckets.
+    pub(crate) fn buckets(&self) -> usize {
+        self.buckets.len()
+    }
+
+    /// Read the table into cache in address order ahead of `updates` updates,
+    /// when it is large enough to have left the cache since its last visit
+    /// and the updates will touch most of it anyway. A sequential read is
+    /// several times cheaper per line than the scattered misses it replaces.
+    pub(crate) fn warm(&self, updates: usize) {
+        const WARM_BUCKETS: usize = 512;
+        if self.buckets.len() >= WARM_BUCKETS && updates >= self.buckets.len() / 4 {
+            let touched = self
+                .buckets
+                .iter()
+                .fold(0_u64, |sum, bucket| sum.wrapping_add(bucket.0[0]));
+            std::hint::black_box(touched);
+        }
+    }
+
     /// Prefetch the home bucket of `remainder`, if the table is allocated.
     #[inline(always)]
     pub(crate) fn prefetch(&self, remainder: u64) {
@@ -372,9 +413,9 @@ impl CompactTable {
             return Ok(());
         }
         let slots = needed
-            .checked_mul(LOAD_DENOMINATOR)
+            .checked_mul(16)
             .ok_or(Error::ReserveFailed)?
-            .div_ceil(LOAD_NUMERATOR);
+            .div_ceil(self.load.sixteenths());
         self.resize(slots.div_ceil(SLOTS).max(2))
     }
 
@@ -404,7 +445,7 @@ impl CompactTable {
             .map_err(|_| Error::ReserveFailed)?;
         filled.resize(buckets, 0_u8);
         let old = std::mem::replace(&mut self.buckets, Buckets::zeroed(buckets)?);
-        self.grow_at = buckets * SLOTS / LOAD_DENOMINATOR * LOAD_NUMERATOR;
+        self.grow_at = buckets * SLOTS / 16 * self.load.sixteenths();
         // Old buckets are visited in order, so their new homes are nearly
         // sequential; buckets fill left to right, so stop at the first empty.
         // Keys are distinct, so each needs only the next free slot at or after
@@ -638,6 +679,7 @@ impl PackedCounts {
         k: usize,
         desired_partition_bits: u32,
         capacity: usize,
+        load: Load,
     ) -> Result<Self, Error> {
         let bits = key_bits(k);
         let partition_bits = partition_bits(bits, desired_partition_bits);
@@ -652,7 +694,7 @@ impl PackedCounts {
             .try_reserve_exact(partitions)
             .map_err(|_| Error::ReserveFailed)?;
         for index in 0..partitions {
-            let mut table = CompactTable::staggered(layout, index, partitions);
+            let mut table = CompactTable::staggered(layout, load, index, partitions);
             let share = capacity / partitions + usize::from(index < capacity % partitions);
             table.try_reserve(share)?;
             tables.push(table);
@@ -878,7 +920,8 @@ mod tests {
     #[test]
     fn tables_count_exactly_through_growth_and_large_counts() {
         for (k, partition_bits) in [(1, 10), (5, 3), (16, 10), (31, 10), (32, 10), (32, 0)] {
-            let mut counts = PackedCounts::with_capacity(k, partition_bits, 0).unwrap();
+            let mut counts =
+                PackedCounts::with_capacity(k, partition_bits, 0, Load::Sparse).unwrap();
             let marker = counts.layout().count_marker();
             let mut expected = HashMap::new();
             let mask = u64::MAX >> (64 - key_bits(k));
@@ -906,7 +949,7 @@ mod tests {
 
     #[test]
     fn overflow_rejects_or_saturates() {
-        let mut counts = PackedCounts::with_capacity(31, 10, 0).unwrap();
+        let mut counts = PackedCounts::with_capacity(31, 10, 0, Load::Sparse).unwrap();
         counts.add_key(5, u64::MAX - 1).unwrap();
         assert_eq!(counts.add_key(5, 2), Err(Error::CountOverflow));
         assert_eq!(counts.entries().collect::<Vec<_>>(), [(5, u64::MAX - 1)]);

@@ -87,8 +87,14 @@ For k ≤ 32, each k-mer is packed into 64 bits and passed through an invertible
 hash. The top hash bits choose a partition, and the rest are stored in a single
 64-bit slot alongside a small count. Rare large counts move to a side table, so
 every count stays exact. Slots sit in 64-byte buckets of eight, so a lookup
-touches one cache line, and updates are buffered so buckets can be prefetched
-ahead of time. Longer k-mers use ordinary hash maps.
+touches one cache line.
+
+With several threads there are thousands of small tables. Updates are queued
+per group of tables and applied in bulk, one table at a time, so each table is
+pulled into the CPU cache once and updated there instead of missing the cache
+on every k-mer. Tables grow in small steps and are returned to the OS when
+outgrown, which keeps memory close to what the k-mers need. Longer k-mers use
+ordinary hash maps.
 
 ## Development
 

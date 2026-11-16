@@ -179,6 +179,7 @@ impl Counter {
                     k,
                     PACKED_PARTITION_BITS,
                     capacity,
+                    table::Load::Sparse,
                 )?)
             } else if k <= 64 {
                 let mut counts = PackedCounts128::default();

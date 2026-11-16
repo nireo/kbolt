@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare kbolt with Jellyfish and FastK on identical exact-counting work.
+"""Compare kbolt with Jellyfish, FastK and KMC on identical exact-counting work.
 
 All tools count canonical 31-mers, keep k-mers seen once, and report exact
 counts; their dumped tables were checked against kbolt before timing (full
@@ -16,6 +16,13 @@ Jellyfish needs its hash size up front; it gets twice the true distinct count
 gzip, so it decompresses through its own `-g` generator (gzcat), whose CPU time
 it accumulates. FastK requires .fa/.fq names, so inputs are symlinks under
 target/compare/inputs, created on each run.
+
+KMC is not in Homebrew: unpack a release from
+https://github.com/refresh-bio/KMC/releases into target/compare/tools/kmc (or
+pass --kmc). It runs with -ci1 and -cs4294967295, because by default it drops
+k-mers seen once and caps counts at 255, and with its default 12 GB memory
+limit and disk bins under target/compare/tmp. Its -t is the total thread
+count, while kbolt's -t excludes its input reader, so compare CPU time too.
 """
 
 import argparse
@@ -48,6 +55,9 @@ DATASETS = {
 }
 
 
+TOOLS = ["kbolt", "kbolt-tsv", "jellyfish", "fastk", "kmc"]
+
+
 def digest(path):
     result = hashlib.sha256()
     with Path(path).open("rb") as source:
@@ -64,7 +74,7 @@ def bases(name):
     return SOURCES["sampled.fq"].stat().st_size // 307 * 150
 
 
-def count_command(tool, name, threads, kbolt):
+def count_command(tool, name, threads, kbolt, kmc):
     file, size = DATASETS[name]
     source = str(INPUTS / file)
     if tool == "kbolt":
@@ -83,16 +93,23 @@ def count_command(tool, name, threads, kbolt):
     if tool == "fastk":
         return ["FastK", "-k31", "-t1", f"-T{threads}", f"-P{TMP}", f"-N{OUT / (name + '_fk')}",
                 source]
+    if tool == "kmc":
+        kind = "-fm" if file.endswith(".fa") else "-fq"
+        return [kmc, "-k31", "-ci1", "-cs4294967295", kind, f"-t{threads}", "-hp",
+                source, str(OUT / f"{name}_kmc"), str(TMP)]
     raise ValueError(tool)
 
 
-def dump_command(tool, name, kbolt):
+def dump_command(tool, name, kbolt, kmc):
     if tool == "kbolt":
         return [kbolt, "dump", str(OUT / f"{name}.kbolt")]
     if tool == "jellyfish":
         return ["jellyfish", "dump", "-c", "-t", str(OUT / f"{name}.jf")]
     if tool == "fastk":
         return ["Tabex", "-A", str(OUT / f"{name}_fk.ktab")]
+    if tool == "kmc":
+        tools = str(Path(kmc).with_name("kmc_tools"))
+        return [tools, "-t1", "-hp", "transform", str(OUT / f"{name}_kmc"), "dump", "/dev/null"]
     raise ValueError(tool)
 
 
@@ -127,39 +144,48 @@ def main():
     parser.add_argument("--kbolt", type=Path, default=ROOT / "target/release/kbolt")
     parser.add_argument("--datasets", nargs="+", default=list(DATASETS), choices=list(DATASETS))
     parser.add_argument("--threads", nargs="+", type=positive, default=[1, 4, 8])
-    parser.add_argument("--tools", nargs="+", default=["kbolt", "kbolt-tsv", "jellyfish", "fastk"])
+    parser.add_argument("--kmc", type=Path, default=WORK / "tools/kmc/bin/kmc")
+    parser.add_argument("--tools", nargs="+", default=TOOLS, choices=TOOLS)
     parser.add_argument("--runs", type=positive, default=3)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--output", type=Path, default=WORK / "results.json")
     args = parser.parse_args()
     setup()
     kbolt = str(args.kbolt.resolve())
+    kmc = str(args.kmc.resolve())
     versions = {
         "kbolt": {"path": kbolt, "sha256": digest(kbolt),
                   "git": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()},
-        "jellyfish": subprocess.check_output(["jellyfish", "--version"], text=True).strip(),
-        "fastk": subprocess.check_output(["brew", "list", "--versions", "fastk"], text=True).strip(),
     }
+    if "jellyfish" in args.tools:
+        versions["jellyfish"] = subprocess.check_output(["jellyfish", "--version"], text=True).strip()
+    if "fastk" in args.tools:
+        versions["fastk"] = subprocess.check_output(["brew", "list", "--versions", "fastk"], text=True).strip()
+    if "kmc" in args.tools:
+        # Without arguments KMC prints its usage, starting with the version line.
+        usage = subprocess.run([kmc], capture_output=True, text=True).stdout
+        versions["kmc"] = {"version": usage.splitlines()[0].strip(), "sha256": digest(kmc)}
     report = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "platform": platform.platform(),
         "versions": versions,
         "method": "warm cache; fresh processes; rotated rounds; native tables written to "
-                  "target/compare/out; text to /dev/null; Jellyfish -s = 2x distinct",
+                  "target/compare/out; text to /dev/null; Jellyfish -s = 2x distinct; "
+                  "KMC -ci1 -cs4294967295 with default memory and disk bins",
         "count": {},
         "dump": {},
     }
     for name in args.datasets:
         size = bases(name)
         print(f"== {name} ({size:,} bases)", flush=True)
-        cases = [(f"{tool}/t{threads}", count_command(tool, name, threads, kbolt))
+        cases = [(f"{tool}/t{threads}", count_command(tool, name, threads, kbolt, kmc))
                  for threads in args.threads for tool in args.tools]
         results = run_cases(cases, args.runs, args.warmup)
         report["count"][name] = {
             label: {"command": command, "runs": results[label], "summary": summarize(results[label], size)}
             for label, command in cases
         }
-        dumps = [(tool, dump_command(tool, name, kbolt))
+        dumps = [(tool, dump_command(tool, name, kbolt, kmc))
                  for tool in args.tools if tool != "kbolt-tsv"]
         results = run_cases(dumps, args.runs, args.warmup)
         report["dump"][name] = {

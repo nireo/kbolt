@@ -123,27 +123,116 @@ pub(crate) fn partition_bits(bits: u32, desired: u32) -> u32 {
 #[derive(Clone, Copy)]
 struct Bucket([u64; 8]);
 
-/// Allocate `count` empty buckets. Zeroed allocation lets large tables take
-/// fresh zero pages from the OS instead of writing every byte up front.
-fn zeroed_buckets(count: usize) -> Result<Vec<Bucket>, Error> {
-    if count == 0 {
-        return Ok(Vec::new());
-    }
-    let layout = std::alloc::Layout::array::<Bucket>(count).map_err(|_| Error::ReserveFailed)?;
-    // SAFETY: the layout has nonzero size. An all-zero `Bucket` is valid (and
-    // empty), and the allocation matches the layout `Vec<Bucket>` frees with.
-    unsafe {
-        let pointer = std::alloc::alloc_zeroed(layout).cast::<Bucket>();
-        if pointer.is_null() {
-            return Err(Error::ReserveFailed);
+/// Bucket storage that returns its memory to the OS as soon as it is dropped.
+///
+/// Tables are replaced each time they grow. The general allocator keeps freed
+/// blocks of that size for reuse, so every outgrown table would stay resident
+/// (and a reused block must be cleared by hand). Large tables are therefore
+/// mapped directly: fresh mappings are zero pages, and unmapping frees them.
+struct Buckets {
+    pointer: std::ptr::NonNull<Bucket>,
+    len: usize,
+}
+
+/// Bucket counts from this size up are mapped directly (64 KiB).
+const MAPPED_BUCKETS: usize = 1024;
+
+// SAFETY: `Buckets` owns its allocation exclusively, like a `Vec<Bucket>`.
+unsafe impl Send for Buckets {}
+// SAFETY: as above; shared access only reads.
+unsafe impl Sync for Buckets {}
+
+impl Buckets {
+    const fn new() -> Self {
+        Self {
+            pointer: std::ptr::NonNull::dangling(),
+            len: 0,
         }
-        Ok(Vec::from_raw_parts(pointer, count, count))
+    }
+
+    fn mapped(len: usize) -> bool {
+        cfg!(unix) && len >= MAPPED_BUCKETS
+    }
+
+    /// Allocate `len` empty (all-zero) buckets.
+    fn zeroed(len: usize) -> Result<Self, Error> {
+        if len == 0 {
+            return Ok(Self::new());
+        }
+        let layout = std::alloc::Layout::array::<Bucket>(len).map_err(|_| Error::ReserveFailed)?;
+        #[cfg(unix)]
+        if Self::mapped(len) {
+            // SAFETY: an anonymous private mapping of nonzero size; the result
+            // is checked. Mappings are page aligned, which satisfies `Bucket`.
+            let pointer = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    layout.size(),
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            if pointer == libc::MAP_FAILED {
+                return Err(Error::ReserveFailed);
+            }
+            let pointer = std::ptr::NonNull::new(pointer.cast()).ok_or(Error::ReserveFailed)?;
+            return Ok(Self { pointer, len });
+        }
+        // SAFETY: the layout has nonzero size, and an all-zero `Bucket` is
+        // valid (and empty).
+        let pointer = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<Bucket>();
+        let pointer = std::ptr::NonNull::new(pointer).ok_or(Error::ReserveFailed)?;
+        Ok(Self { pointer, len })
     }
 }
+
+impl Drop for Buckets {
+    fn drop(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        let layout = std::alloc::Layout::array::<Bucket>(self.len).expect("allocated layout");
+        #[cfg(unix)]
+        if Self::mapped(self.len) {
+            // SAFETY: this is exactly the mapping made in `zeroed`.
+            unsafe { libc::munmap(self.pointer.as_ptr().cast(), layout.size()) };
+            return;
+        }
+        // SAFETY: allocated in `zeroed` with this layout.
+        unsafe { std::alloc::dealloc(self.pointer.as_ptr().cast(), layout) };
+    }
+}
+
+impl std::ops::Deref for Buckets {
+    type Target = [Bucket];
+
+    #[inline(always)]
+    fn deref(&self) -> &[Bucket] {
+        // SAFETY: `pointer` is valid for `len` initialized buckets (or
+        // dangling and aligned when `len` is zero).
+        unsafe { std::slice::from_raw_parts(self.pointer.as_ptr(), self.len) }
+    }
+}
+
+impl std::ops::DerefMut for Buckets {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [Bucket] {
+        // SAFETY: as in `deref`, with exclusive access through `&mut self`.
+        unsafe { std::slice::from_raw_parts_mut(self.pointer.as_ptr(), self.len) }
+    }
+}
+
 const SLOTS: usize = 8;
 /// Grow before more than three quarters of the slots are occupied.
 const LOAD_NUMERATOR: usize = 3;
 const LOAD_DENOMINATOR: usize = 4;
+/// Tables double until they reach this many buckets, then grow by half.
+/// Home buckets are a fastrange, so any bucket count works, and a smaller step
+/// leaves less of a large table empty: it is between half and three quarters
+/// full instead of between three eighths and three quarters.
+const STEADY_BUCKETS: usize = 1024;
 
 /// Byte-per-slot masks (0xff or 0x00) of slots equal to `key` after clearing
 /// their count bits, and of empty slots.
@@ -222,21 +311,29 @@ pub(crate) enum Overflow {
 
 /// One partition's compact table.
 pub(crate) struct CompactTable {
-    buckets: Vec<Bucket>,
+    buckets: Buckets,
     len: usize,
     grow_at: usize,
     layout: Layout,
+    // Fraction (in 65536ths) of a growth step by which this table's sizes are
+    // offset. Partitions hold nearly equal numbers of keys, so with identical
+    // sizes they would all grow at once and all be mostly empty together;
+    // spread out, their total stays near the average at every moment.
+    stagger: u16,
     // Exact counts for slots whose small count holds the marker.
     overflow: HashMap<u64, u64, foldhash::fast::RandomState>,
 }
 
 impl CompactTable {
-    pub(crate) fn new(layout: Layout) -> Self {
+    /// An empty table for partition `index` of `partitions`.
+    pub(crate) fn staggered(layout: Layout, index: usize, partitions: usize) -> Self {
+        debug_assert!(index < partitions);
         Self {
-            buckets: Vec::new(),
+            buckets: Buckets::new(),
             len: 0,
             grow_at: 0,
             layout,
+            stagger: ((index as u128 * 65536) / partitions as u128) as u16,
             overflow: HashMap::default(),
         }
     }
@@ -284,12 +381,17 @@ impl CompactTable {
     #[cold]
     #[inline(never)]
     fn grow(&mut self) -> Result<(), Error> {
-        let buckets = self
-            .buckets
-            .len()
-            .checked_mul(2)
-            .ok_or(Error::ReserveFailed)?
-            .max(2);
+        let current = self.buckets.len();
+        let buckets = if current < STEADY_BUCKETS / 2 {
+            (current * 2).max(2)
+        } else if current < STEADY_BUCKETS {
+            // Enter the steady phase part of the way through a growth step.
+            STEADY_BUCKETS + (((STEADY_BUCKETS / 2) * usize::from(self.stagger)) >> 16)
+        } else {
+            current
+                .checked_add(current / 2)
+                .ok_or(Error::ReserveFailed)?
+        };
         self.resize(buckets)
     }
 
@@ -301,13 +403,13 @@ impl CompactTable {
             .try_reserve_exact(buckets)
             .map_err(|_| Error::ReserveFailed)?;
         filled.resize(buckets, 0_u8);
-        let old = std::mem::replace(&mut self.buckets, zeroed_buckets(buckets)?);
+        let old = std::mem::replace(&mut self.buckets, Buckets::zeroed(buckets)?);
         self.grow_at = buckets * SLOTS / LOAD_DENOMINATOR * LOAD_NUMERATOR;
         // Old buckets are visited in order, so their new homes are nearly
         // sequential; buckets fill left to right, so stop at the first empty.
         // Keys are distinct, so each needs only the next free slot at or after
         // its home, tracked per bucket (in `filled`) instead of searched for.
-        for bucket in &old {
+        for bucket in old.iter() {
             for &slot in bucket.0.iter().take_while(|&&slot| slot != 0) {
                 let mut index = self.home(slot >> self.layout.count_bits);
                 while filled[index] == SLOTS as u8 {
@@ -550,7 +652,7 @@ impl PackedCounts {
             .try_reserve_exact(partitions)
             .map_err(|_| Error::ReserveFailed)?;
         for index in 0..partitions {
-            let mut table = CompactTable::new(layout);
+            let mut table = CompactTable::staggered(layout, index, partitions);
             let share = capacity / partitions + usize::from(index < capacity % partitions);
             table.try_reserve(share)?;
             tables.push(table);

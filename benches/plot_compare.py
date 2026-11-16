@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TOOLS = [
     ("kbolt", "kbolt", "#1b9e77", "o"),
     ("fastk", "FastK 1.2", "#d95f02", "s"),
+    ("kmc", "KMC 3.2.4", "#e7298a", "D"),
     ("jellyfish", "Jellyfish 2.3.1", "#7570b3", "^"),
 ]
 PANELS = [
@@ -57,7 +58,7 @@ def main():
                frameon=True, framealpha=1, edgecolor="#cccccc")
     fig.suptitle("k-mer Counting Throughput, k = 31 (Higher is Better)", fontsize=16, y=0.985)
     fig.text(0.5, 0.01, "Median of 3 runs on an Apple M5 (4 performance + 6 efficiency cores). "
-             "All three tools report identical counts.", ha="center", fontsize=10, color="#555555")
+             "All four tools report identical counts.", ha="center", fontsize=10, color="#555555")
     fig.tight_layout(rect=(0, 0.04, 1, 0.9))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.output, dpi=200, facecolor="white")

@@ -4,9 +4,11 @@ use std::hash::{BuildHasher, Hash};
 use std::io::{self, Write};
 
 pub mod database;
+mod disk;
 mod parallel;
 mod table;
 
+pub use disk::{DiskCounter, DiskCounts};
 pub use parallel::{ParallelCounter, ParallelInput, ParallelStats};
 use table::PackedCounts;
 
@@ -47,6 +49,9 @@ pub enum Error {
     IncompatibleCounters,
     InvalidThreads,
     WorkerFailed,
+    /// Writing the temporary file of a [`DiskCounter`] failed; its `finish`
+    /// reports the underlying I/O error.
+    TemporaryFile,
 }
 
 impl fmt::Display for Error {
@@ -62,6 +67,7 @@ impl fmt::Display for Error {
                 f.write_str("worker count must be greater than zero and representable")
             }
             Self::WorkerFailed => f.write_str("unable to start or complete a counting worker"),
+            Self::TemporaryFile => f.write_str("unable to write the temporary bin file"),
         }
     }
 }

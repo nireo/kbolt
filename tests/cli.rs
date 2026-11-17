@@ -634,3 +634,75 @@ fn gzip_input_errors_are_reported_while_the_pipe_stays_open() {
         .unwrap();
     assert!(stderr.contains("line 2: invalid sequence byte"), "{stderr}");
 }
+
+#[test]
+fn memory_limit_counts_on_disk_with_the_same_results() {
+    let temp = TempDir::new();
+    let scratch = temp.0.join("scratch");
+    fs::create_dir(&scratch).unwrap();
+    let scratch = scratch.to_str().unwrap();
+    // Reads with repeats, an invalid base, and both orientations.
+    let mut reads = Vec::new();
+    for index in 0..400_u32 {
+        let read: Vec<u8> = (0..90)
+            .map(|base| b"ACGTN"[((index % 37 + 3) * (base + index % 5) % 11 % 5) as usize])
+            .collect();
+        reads.extend_from_slice(b">r\n");
+        reads.extend_from_slice(&read);
+        reads.push(b'\n');
+    }
+    let first = temp.file("first.fa", &reads);
+    let second = temp.file("second.fa.gz", &gzip(&reads[..reads.len() / 2]));
+    for k in ["5", "21", "32"] {
+        for strand in [&[][..], &["--forward"]] {
+            let common = [&["count", "-k", k, "-t", "3"], strand, &[&first, &second]].concat();
+            let expected = table(&run(&common, b""));
+            assert!(!expected.is_empty());
+            let disk = [&common[..], &["--memory", "64M", "--temp-dir", scratch]].concat();
+            assert_eq!(table(&run(&disk, b"")), expected, "k={k}");
+            let database = temp.0.join("counts.kbolt");
+            let binary = [
+                &disk[..],
+                &["--format", "binary", "-o", database.to_str().unwrap()],
+            ];
+            assert!(run(&binary.concat(), b"").status.success());
+            let dumped = run(&["dump", database.to_str().unwrap()], b"");
+            assert_eq!(table(&dumped), expected, "k={k} binary");
+        }
+    }
+    // Standard input and one worker also work; the temporary file is gone.
+    let stdin = run(
+        &["count", "-k", "7", "-m", "64M", "--temp-dir", scratch],
+        &reads,
+    );
+    assert_eq!(table(&stdin), table(&run(&["count", "-k", "7"], &reads)));
+    assert_eq!(fs::read_dir(scratch).unwrap().count(), 0);
+
+    for (arguments, message) in [
+        (&["count", "-k", "33", "-m", "64M"][..], "k from 1 to 32"),
+        (
+            &["count", "-k", "5", "-m", "64M", "--format", "binary"],
+            "needs an output file",
+        ),
+        (&["count", "-k", "5", "-m", "1M"], "at least 64M"),
+        (&["count", "-k", "5", "-m", "lots"], "such as 4G"),
+        (&["count", "-k", "5", "--temp-dir", scratch], "--memory"),
+        (
+            &[
+                "count",
+                "-k",
+                "5",
+                "-m",
+                "64M",
+                "--temp-dir",
+                "/nonexistent/kbolt",
+            ],
+            "/nonexistent/kbolt",
+        ),
+    ] {
+        let output = run(arguments, b">x\nACGTACGT\n");
+        assert!(!output.status.success(), "{arguments:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(message), "{arguments:?}: {stderr}");
+    }
+}

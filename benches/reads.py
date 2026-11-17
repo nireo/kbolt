@@ -16,6 +16,12 @@ compare.py; kbolt's -t excludes its two input readers, so compare CPU time too.
 
 --reads N counts only the first N reads of the first file, written once to
 target/compare/inputs as plain FASTQ, for quicker iteration.
+
+--memory G [G ...] gives every tool the same memory limit in GiB (kbolt
+--memory, KMC -m, FastK -M), which kbolt then counts on disk; 0 means each
+tool's default, where kbolt counts in memory. Compare peak RSS: the limits
+are targets, and each tool interprets its own differently. --idle P waits for
+the CPU to be P% idle before every timed run, for machines with other jobs.
 """
 
 import argparse
@@ -34,7 +40,7 @@ import time
 import urllib.request
 
 from compare import INPUTS, OUT, TMP, WORK, digest, run_cases
-from dataset import ROOT, positive, summarize
+from dataset import ROOT, nonnegative, positive, summarize, wait_idle
 
 DATA = ROOT / "data/celegans"
 ENA = "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR065/SRR065390/"
@@ -100,18 +106,23 @@ def subset(reads):
     return path
 
 
-def count_command(tool, inputs, name, threads, kbolt, kmc):
+def count_command(tool, inputs, name, threads, memory, kbolt, kmc):
+    """`memory` is a limit in GiB, or 0 for the tool's default."""
     files = [str(path) for path in inputs]
     if tool == "kbolt":
-        return [kbolt, "count", "-k", "31", "-t", str(threads), "--format", "binary",
-                *files, "-o", str(OUT / f"{name}.kbolt")]
+        limit = ["--memory", f"{memory}G", "--temp-dir", str(TMP)] if memory else []
+        return [kbolt, "count", "-k", "31", "-t", str(threads), "--format", "binary", "--timings",
+                *limit, *files, "-o", str(OUT / f"{name}.kbolt")]
     if tool == "kmc":
         listing = WORK / f"{name}.lst"
         listing.write_text("".join(f"{file}\n" for file in files))
-        return [kmc, "-k31", "-ci1", "-cs4294967295", "-fq", f"-t{threads}", "-hp",
+        limit = [f"-m{memory}"] if memory else []
+        return [kmc, "-k31", "-ci1", "-cs4294967295", "-fq", f"-t{threads}", "-hp", *limit,
                 f"@{listing}", str(OUT / f"{name}_kmc"), str(TMP)]
     if tool == "fastk":
-        return ["FastK", "-k31", "-t1", f"-T{threads}", f"-P{TMP}", f"-N{OUT / (name + '_fk')}", *files]
+        limit = [f"-M{memory}"] if memory else []
+        return ["FastK", "-k31", "-t1", f"-T{threads}", *limit, f"-P{TMP}",
+                f"-N{OUT / (name + '_fk')}", *files]
     raise ValueError(tool)
 
 
@@ -124,6 +135,10 @@ def main():
     parser.add_argument("--kmc", type=Path, default=WORK / "tools/kmc/bin/kmc")
     parser.add_argument("--tools", nargs="+", default=["kbolt", "kmc"], choices=TOOLS)
     parser.add_argument("--threads", nargs="+", type=positive, default=[8])
+    parser.add_argument("--memory", nargs="+", type=nonnegative, default=[0], metavar="G",
+                        help="memory limits in GiB to give every tool; 0 is its default")
+    parser.add_argument("--idle", type=positive, metavar="P",
+                        help="wait until the CPU is P%% idle before each timed run")
     parser.add_argument("--runs", type=positive, default=3)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--output", type=Path, default=WORK / "reads-results.json")
@@ -143,17 +158,20 @@ def main():
     else:
         name, inputs, bases = "celegans", [DATA / file for file in FILES], READS * READ_BASES
     kbolt, kmc = str(args.kbolt.resolve()), str(args.kmc.resolve())
-    cases = [(f"{tool}/t{threads}", count_command(tool, inputs, name, threads, kbolt, kmc))
-             for threads in args.threads for tool in args.tools]
+    cases = [(f"{tool}/t{threads}" + (f"/m{memory}" if memory else ""),
+              count_command(tool, inputs, name, threads, memory, kbolt, kmc))
+             for threads in args.threads for memory in args.memory for tool in args.tools]
     print(f"== {name} ({bases:,} bases)", flush=True)
-    results = run_cases(cases, args.runs, args.warmup)
+    results = run_cases(cases, args.runs, args.warmup,
+                        before=(lambda: wait_idle(args.idle)) if args.idle else None)
     report = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "platform": platform.platform(),
         "kbolt": {"path": kbolt, "sha256": digest(kbolt),
                   "git": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()},
         "method": "warm cache; fresh processes; rotated rounds; native tables written to "
-                  "target/compare/out; KMC -ci1 -cs4294967295 with default memory and disk bins",
+                  "target/compare/out; KMC -ci1 -cs4294967295 with disk bins; memory limits as "
+                  "in each command",
         "dataset": name,
         "bases": bases,
         "count": {label: {"command": command, "runs": results[label],

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use flate2::bufread::MultiGzDecoder;
 use kbolt::database::DatabaseReader;
-use kbolt::{Counter, ParallelCounter, ParallelInput, StrandMode};
+use kbolt::{Counter, DiskCounter, ParallelCounter, ParallelInput, StrandMode};
 
 const BUFFER_SIZE: usize = 64 * 1024;
 /// Input read buffer. Larger reads mean fewer syscalls and fewer FASTQ
@@ -64,6 +64,13 @@ struct CountArgs {
     /// Concurrent input-file readers when threads > 1 (bounded by input count)
     #[arg(long, default_value_t = 2, value_parser = parse_threads)]
     readers: usize,
+    /// Count on disk within about this much memory, such as 4G or 500M
+    /// (k <= 32). Without it, all k-mers are counted in memory.
+    #[arg(short = 'm', long, value_name = "SIZE", value_parser = parse_size)]
+    memory: Option<u64>,
+    /// Directory for the temporary file of --memory [default: the system's]
+    #[arg(long, value_name = "DIR", requires = "memory")]
+    temp_dir: Option<PathBuf>,
     /// Print counting, merge, and output wall times on stderr
     #[arg(long)]
     timings: bool,
@@ -88,6 +95,28 @@ fn parse_threads(value: &str) -> Result<usize, String> {
         .filter(|&n| n > 0 && n <= usize::MAX / 2)
         .ok_or_else(|| "threads must be a positive, representable worker count".to_owned())
 }
+
+/// Parse a byte count with an optional K, M, G or T suffix (powers of 1024).
+fn parse_size(value: &str) -> Result<u64, String> {
+    let digits = value.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let shift = match value[digits.len()..].to_ascii_uppercase().as_str() {
+        "" | "B" => 0,
+        "K" | "KB" | "KIB" => 10,
+        "M" | "MB" | "MIB" => 20,
+        "G" | "GB" | "GIB" => 30,
+        "T" | "TB" | "TIB" => 40,
+        _ => return Err("expected a size such as 4G or 500M".to_owned()),
+    };
+    digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|size| size.checked_mul(1 << shift))
+        .filter(|&size| size >= MIN_MEMORY)
+        .ok_or_else(|| "expected a size of at least 64M, such as 4G or 500M".to_owned())
+}
+
+/// The smallest --memory accepted: below it, fixed buffers dominate.
+const MIN_MEMORY: u64 = 64 << 20;
 
 enum CountSink<'a> {
     Serial(&'a mut Counter),
@@ -264,8 +293,8 @@ fn concurrent_file(path: &Path) -> bool {
     !descriptor_alias(&resolved) && std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
-fn count_parallel_inputs(
-    counter: &ParallelCounter,
+fn count_parallel_inputs<'a>(
+    input: &(dyn Fn() -> ParallelInput<'a> + Sync),
     inputs: &[PathBuf],
     k: usize,
     readers: usize,
@@ -283,11 +312,8 @@ fn count_parallel_inputs(
                     .spawn_scoped(scope, move || {
                         let mut totals = (0, 0);
                         while let Some(path) = inputs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            let mut counting = Counting::with_sink(
-                                CountSink::Parallel(counter.input()),
-                                k,
-                                progress,
-                            );
+                            let mut counting =
+                                Counting::with_sink(CountSink::Parallel(input()), k, progress);
                             counting.source = Some(path.clone());
                             count_path(path, &mut counting)?;
                             let (records, bases) = counting.finish()?;
@@ -512,6 +538,8 @@ fn count_inputs(args: CountArgs) -> io::Result<()> {
         capacity,
         threads,
         readers,
+        memory,
+        temp_dir,
         timings,
         format,
         output,
@@ -529,6 +557,69 @@ fn count_inputs(args: CountArgs) -> io::Result<()> {
     // Open output only after all input has been read and validated.
     check_output(&inputs, &output)?;
     let started = Instant::now();
+    if let Some(memory) = memory {
+        // Bins on disk, counted one at a time; nothing is held as a `Counter`.
+        if !(1..=32).contains(&k) {
+            return Err(io::Error::other("--memory supports k from 1 to 32"));
+        }
+        let directory = temp_dir.unwrap_or_else(std::env::temp_dir);
+        let counter = DiskCounter::new(k, strand, threads, memory, &directory)?;
+        let (records, bases) =
+            if readers > 1 && inputs.len() > 1 && inputs.iter().all(|path| concurrent_file(path)) {
+                count_parallel_inputs(&|| counter.input(), &inputs, k, readers, progress)?
+            } else {
+                let mut counting =
+                    Counting::with_sink(CountSink::Parallel(counter.input()), k, progress);
+                for path in &inputs {
+                    count_path(path, &mut counting)?;
+                }
+                counting.finish()?
+            };
+        // The reader threads are done; give their cores to counting.
+        let bins = counter
+            .finish()?
+            .with_threads(threads + readers.min(inputs.len()));
+        let splitting = started.elapsed();
+        let (kmers, temporary) = (bins.kmers(), bins.temporary_bytes());
+        let distinct = match format {
+            OutputFormat::Tsv => {
+                let mut writer = output_writer(&output)?;
+                let distinct = bins.write_tsv(&mut writer)?;
+                writer.flush()?;
+                distinct
+            }
+            // The header is completed after the entries, which needs a file.
+            OutputFormat::Binary if output.as_os_str() == "-" => {
+                return Err(io::Error::other(
+                    "--memory with --format binary needs an output file (-o)",
+                ));
+            }
+            OutputFormat::Binary => {
+                let mut writer = BufWriter::with_capacity(BUFFER_SIZE, File::create(&output)?);
+                let distinct = bins.write_binary(&mut writer)?;
+                writer.flush()?;
+                distinct
+            }
+        };
+        if progress {
+            writeln!(
+                io::stderr().lock(),
+                "{records} records, {bases} bases, {distinct} distinct k-mers, {:.1}s elapsed",
+                started.elapsed().as_secs_f64()
+            )?;
+        }
+        if timings {
+            writeln!(
+                io::stderr().lock(),
+                "timings: splitting={:.6}s counting_and_output={:.6}s total={:.6}s \
+                 kmers={kmers} distinct={distinct} temporary_bytes={temporary}",
+                splitting.as_secs_f64(),
+                (started.elapsed() - splitting).as_secs_f64(),
+                started.elapsed().as_secs_f64()
+            )?;
+        }
+        return Ok(());
+    }
     let mut counter = Counter::with_capacity(k, strand, if threads == 1 { capacity } else { 0 })
         .map_err(io::Error::other)?;
     let mut parallel = if threads > 1 {
@@ -546,7 +637,7 @@ fn count_inputs(args: CountArgs) -> io::Result<()> {
         // when another file fails. Only regular files use concurrent readers.
         && inputs.iter().all(|path| concurrent_file(path))
     {
-        count_parallel_inputs(parallel, &inputs, k, readers, progress)?
+        count_parallel_inputs(&|| parallel.input(), &inputs, k, readers, progress)?
     } else {
         let mut counting = match &mut parallel {
             Some(parallel) => {

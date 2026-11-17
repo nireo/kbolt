@@ -97,11 +97,36 @@ def measure(command):
         "system_seconds": usage.ru_stime,
         "peak_rss_bytes": rss_bytes,
     }
-    match = re.search(r"timings: counting=([0-9.]+)s merging=([0-9.]+)s output=([0-9.]+)s", diagnostic)
+    match = re.search(r"^timings: (.*)$", diagnostic, re.MULTILINE)
     if match:
-        for name, value in zip(("counting_seconds", "merging_seconds", "output_seconds"), match.groups()):
-            result[name] = float(value)
+        # Phases are printed as name=seconds, such as counting=1.5s.
+        for name, value in re.findall(r"(\w+)=([0-9.]+)s\b", match.group(1)):
+            if name != "total":
+                result[f"{name}_seconds"] = float(value)
     return result
+
+
+def wait_idle(percent, samples=2):
+    """Block until the CPU has been at least `percent` idle for `samples`
+    consecutive seconds, so that other jobs do not distort a timing."""
+
+    def idle():
+        if sys.platform == "darwin":
+            # The second sample covers the interval; the first is since boot.
+            top = capture("top", "-l", "2", "-n", "0", "-s", "1")
+            return float(re.findall(r"([0-9.]+)% idle", top)[-1])
+        def ticks():
+            with open("/proc/stat") as stat:
+                fields = [int(field) for field in stat.readline().split()[1:]]
+            return fields[3] + fields[4], sum(fields)
+        (idle_before, total_before) = ticks()
+        time.sleep(1)
+        (idle_after, total_after) = ticks()
+        return 100 * (idle_after - idle_before) / max(1, total_after - total_before)
+
+    quiet = 0
+    while quiet < samples:
+        quiet = quiet + 1 if idle() >= percent else 0
 
 
 def summarize(runs, bases):
@@ -116,7 +141,7 @@ def summarize(runs, bases):
         "median_million_bases_per_second": bases / median / 1e6,
         "max_peak_rss_bytes": max(run["peak_rss_bytes"] for run in runs),
     }
-    for phase in ("counting", "merging", "output"):
+    for phase in ("counting", "merging", "output", "splitting", "counting_and_output"):
         key = f"{phase}_seconds"
         if all(key in run for run in runs):
             result[f"median_{key}"] = statistics.median(run[key] for run in runs)

@@ -609,12 +609,16 @@ impl CompactTable {
         Ok(true)
     }
 
-    /// Count one occurrence of each entry, whose low bits are a remainder of
-    /// this table, for a table that has left the cache since its last
-    /// burst whatever its size (see `crate::disk`). A burst that will touch
-    /// most of the table reads it into cache first; a sparser one prefetches
-    /// each bucket ahead of its update.
-    pub(crate) fn add_burst(&mut self, entries: &[u64]) -> Result<(), Error> {
+    /// Add `delta(entry)` for each entry, whose low bits are a remainder of
+    /// this table, for a table that has left the cache since its last burst
+    /// whatever its size (see `crate::disk`). A burst that will touch most of
+    /// the table reads it into cache first; a sparser one prefetches each
+    /// bucket ahead of its update.
+    pub(crate) fn add_burst(
+        &mut self,
+        entries: &[u64],
+        delta: impl Fn(u64) -> u64,
+    ) -> Result<(), Error> {
         /// Prefetch this far ahead within the burst.
         const AHEAD: usize = 16;
         let mask = self.layout.remainder_mask();
@@ -622,13 +626,14 @@ impl CompactTable {
             self.read();
             return entries
                 .iter()
-                .try_for_each(|&entry| self.add(entry & mask, 1, Overflow::Reject));
+                .try_for_each(|&entry| self.add(entry & mask, delta(entry), Overflow::Reject));
         }
         for index in 0..entries.len() {
             if let Some(&ahead) = entries.get(index + AHEAD) {
                 self.prefetch(ahead & mask);
             }
-            self.add(entries[index] & mask, 1, Overflow::Reject)?;
+            let entry = entries[index];
+            self.add(entry & mask, delta(entry), Overflow::Reject)?;
         }
         Ok(())
     }

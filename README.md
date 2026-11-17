@@ -119,7 +119,9 @@ them to one of 512 bins; every copy of a k-mer lands in the same bin. Bins
 stay in memory while the limit allows and go to a temporary file after that.
 The second pass counts one bin at a time with the same tables and writes its
 k-mers out before the next, so memory follows the bins being counted, not the
-input.
+input. Reads overlap, so most super-k-mers of a read set occur many times;
+equal ones are merged first and their k-mers counted once, with the number of
+copies.
 
 ## Development
 

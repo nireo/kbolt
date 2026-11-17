@@ -6,37 +6,40 @@ The counts are exact, not estimates. It reads FASTA and FASTQ, gzipped or not,
 and you can use it from the command line or as a Rust library.
 
 It's built to be fast on an ordinary machine. Everything stays in memory, so it
-works best when the distinct k-mers fit in RAM. Here's how it compares with
-FastK, KMC and Jellyfish, three widely used exact counters, on the same inputs:
+works best when the distinct k-mers fit in RAM. Here's how it compares with KMC
+and FastK, two widely used exact counters, on a real read set (C. elegans
+SRR065390: two gzipped FASTQ files, 6.76 Gbp, 488 million distinct 31-mers):
 
-![k-mer counting throughput of kbolt, FastK, KMC and Jellyfish at 1, 4 and 8 threads](docs/benchmark.png)
+![Wall time, CPU time and peak memory of kbolt, KMC and FastK counting 31-mers in 6.76 Gbp of C. elegans reads](docs/benchmark.png)
 
-Wall time to count canonical 31-mers (median of 3 runs, Apple M5):
-
-| Workload | Threads | kbolt | FastK | KMC | Jellyfish |
-|---|---:|---:|---:|---:|---:|
-| Arabidopsis genome, 120 Mbp | 1 | **2.47 s** | 6.57 s | 4.11 s | 29.7 s |
-|  | 8 | **0.73 s** | 1.86 s | 1.65 s | 6.81 s |
-| Reads, 134 Mbp FASTQ | 1 | **0.53 s** | 2.12 s | 4.90 s | 6.85 s |
-|  | 8 | **0.13 s** | 0.61 s | 1.56 s | 2.65 s |
-| Same reads, gzip | 1 | **0.56 s** | 2.38 s | 4.89 s | 6.98 s |
-|  | 8 | **0.22 s** | 0.80 s | 1.95 s | 2.26 s |
-
-kbolt is 2.6–4.7× faster than FastK, 1.7–12× faster than KMC and 9–20× faster
-than Jellyfish here, and all four report identical counts.
-
-Those inputs are small. On a real read set whose table is far larger than the
-CPU caches (C. elegans SRR065390: two gzipped FASTQ files, 6.76 Gbp, 488
-million distinct 31-mers), at 8 threads:
+Counting canonical 31-mers at 8 threads (median of 3 runs, Apple M5 with 24 GB
+of memory):
 
 | | Wall time | CPU time | Peak memory |
 |---|---:|---:|---:|
-| kbolt | **15.8 s** | 137 s | 6.3 GiB |
-| KMC | 37.0 s | 224 s | 11.1 GiB |
-| FastK | 46.8 s | 205 s | 9.7 GiB |
+| kbolt | **13.1 s** | 103 s | 6.5 GiB |
+| KMC | 33.4 s | 206 s | 11.2 GiB |
+| FastK | 45.0 s | 196 s | 11.4 GiB |
+
+kbolt is 2.5× faster than KMC and 3.4× faster than FastK, on about half the
+CPU time and under 60% of the memory. kbolt and KMC report identical counts.
 
 KMC and FastK split their input into bins on disk, so they can also count read
 sets whose k-mers do not fit in memory; kbolt cannot.
+
+On smaller inputs the margin is similar or larger, here with Jellyfish as
+well. Wall time (median of 3 runs):
+
+| Workload | Threads | kbolt | FastK | KMC | Jellyfish |
+|---|---:|---:|---:|---:|---:|
+| Arabidopsis genome, 120 Mbp | 1 | **2.73 s** | 6.52 s | 4.12 s | 29.4 s |
+|  | 8 | **0.76 s** | 2.02 s | 1.60 s | 6.61 s |
+| Synthetic reads, 134 Mbp FASTQ | 1 | **0.56 s** | 2.08 s | 4.87 s | 6.29 s |
+|  | 8 | **0.14 s** | 0.61 s | 1.63 s | 2.82 s |
+| Same reads, gzip | 1 | **0.56 s** | 2.38 s | 4.88 s | 6.64 s |
+|  | 8 | **0.23 s** | 0.81 s | 1.94 s | 2.42 s |
+
+All four tools report identical counts on these inputs.
 
 ## Usage
 
@@ -104,9 +107,10 @@ cargo clippy --all-targets -- -D warnings
 cargo bench
 ```
 
-`python3 benches/compare.py` reruns the comparison (FastK and Jellyfish from
-Homebrew, KMC from its GitHub releases, inputs from
-`benches/generate_inputs.py`). Redraw the chart with
-`uv run --no-project --with matplotlib python benches/plot_compare.py`.
-`python3 benches/reads.py` reruns the real-read comparison after
-`python3 benches/reads.py --fetch` has downloaded the reads (5 GB).
+`python3 benches/reads.py --tools kbolt kmc fastk` reruns the real-read
+comparison after `python3 benches/reads.py --fetch` has downloaded the reads
+(5 GB); FastK comes from Homebrew and KMC from its GitHub releases. Redraw the
+chart with `uv run --no-project --with matplotlib python benches/plot_reads.py`.
+`python3 benches/compare.py` reruns the small-input comparison (inputs from
+`benches/generate_inputs.py`), and `benches/plot_compare.py` plots its
+throughput against threads.

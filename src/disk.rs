@@ -18,12 +18,21 @@
 //! in the remaining budget, and a bin too large for the whole budget is
 //! counted in several passes, each taking a slice of its k-mers.
 //!
+//! Reads overlap, so at any depth of coverage most super-k-mers occur many
+//! times over. As a bin is read, equal records are merged in a hash table:
+//! each distinct record is expanded once, and its k-mers counted with the
+//! number of copies. Input without such repeats, a genome for instance,
+//! shows it in the first bin, and most later bins skip the merging.
+//!
 //! A super-k-mer record is one header byte, `skip << 6 | (kmers - 1)`, then
 //! `ceil((skip + kmers + k - 1) / 4)` bytes of bases, the first base in the
 //! top two bits of each byte. The first `skip` bases are padding: records are
-//! copied byte-aligned out of the packed read.
+//! copied byte-aligned out of the packed read. Merging first shifts the
+//! padding out and clears the unused bits, so that equal super-k-mers become
+//! equal bytes.
 
 use std::fs::File;
+use std::hash::BuildHasher;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -51,6 +60,12 @@ const LOCAL: usize = 4 * 1024;
 const PARTITION_BITS: u32 = 10;
 /// Updates collected per table of a group before the group is applied.
 const BURST: usize = if cfg!(test) { 8 } else { 512 };
+/// Slots of a counting thread's table of repeated records: within an eighth
+/// of the memory limit between the threads.
+const MAX_REPEATS: usize = 1 << 20;
+/// Bins a thread counts without merging after one with few repeats.
+const UNMERGED: usize = if cfg!(test) { 1 } else { 7 };
+const MIN_REPEATS: usize = if cfg!(test) { 16 } else { 1 << 10 };
 /// Table bytes assumed per distinct k-mer when admitting a bin: 64-byte
 /// buckets of eight slots at most 7/8 full, plus room left by growth steps.
 const KEY_BYTES: u64 = 12;
@@ -357,62 +372,94 @@ impl Bins {
 /// The low bit of every two-bit base.
 const ODD_BITS: u64 = 0x5555_5555_5555_5555;
 
-/// Visit the k-mers of every super-k-mer record in `block`.
+/// The record at the start of `block`, header included.
+#[inline(always)]
+fn first_record(block: &[u8], k: usize) -> io::Result<&[u8]> {
+    let (skip, kmers) = (usize::from(block[0] >> 6), usize::from(block[0] & 63) + 1);
+    block
+        .get(..1 + (skip + kmers + k - 1).div_ceil(4))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated record in the temporary bin file",
+            )
+        })
+}
+
+/// A record without padding: its header is `kmers - 1`, its bases start at
+/// the first byte, and every bit after the last base is zero.
+#[inline(always)]
+fn unpadded(record: &[u8], k: usize) -> [u8; RECORD] {
+    let (skip, kmers) = (u32::from(record[0] >> 6), usize::from(record[0] & 63) + 1);
+    let mut bytes = [0_u8; 32];
+    bytes[..record.len() - 1].copy_from_slice(&record[1..]);
+    let word =
+        |index: usize| u64::from_be_bytes(bytes[8 * index..8 * index + 8].try_into().unwrap());
+    let mut unpadded = [0; RECORD];
+    unpadded[0] = (kmers - 1) as u8;
+    // Bits of bases still to keep, from the most significant on.
+    let mut bits = 2 * (kmers + k - 1);
+    for index in 0..3 {
+        let shifted = match 2 * skip {
+            0 => word(index),
+            shift => (word(index) << shift) | (word(index + 1) >> (64 - shift)),
+        };
+        let kept = bits.min(64);
+        let cleared = if kept == 0 {
+            0
+        } else {
+            shifted & (u64::MAX << (64 - kept))
+        };
+        unpadded[1 + 8 * index..9 + 8 * index].copy_from_slice(&cleared.to_be_bytes());
+        bits -= kept;
+    }
+    unpadded
+}
+
+/// Visit the k-mers of one super-k-mer record, padded or not.
 #[inline(always)]
 fn expand(
-    block: &[u8],
+    record: &[u8],
     k: usize,
     canonical: bool,
     mut emit: impl FnMut(u64) -> Result<(), Error>,
-) -> io::Result<()> {
+) -> Result<(), Error> {
     let mask = u64::MAX >> (64 - 2 * k);
     let high = 2 * (k - 1);
-    let mut rest = block;
-    while let Some((&header, data)) = rest.split_first() {
-        let skip = usize::from(header >> 6);
-        let kmers = usize::from(header & 63) + 1;
-        let Some((data, after)) = data.split_at_checked((skip + kmers + k - 1).div_ceil(4)) else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "truncated record in the temporary bin file",
-            ));
-        };
-        // The first k-mer is read whole: its 2k bits start `skip` bases into
-        // the record, within the first 9 bytes.
-        let mut head = [0_u8; 16];
-        let whole = data.len().min(16);
-        head[..whole].copy_from_slice(&data[..whole]);
-        let mut forward = (u128::from_be_bytes(head) >> (128 - 2 * (skip + k))) as u64 & mask;
-        // Its reverse complement: complement every base, then reverse the
-        // order of the two-bit bases.
-        let flipped = (!forward).reverse_bits();
-        let mut reverse =
-            (((flipped >> 1) & ODD_BITS) | ((flipped & ODD_BITS) << 1)) >> (64 - 2 * k);
-        let mut index = skip + k;
-        loop {
-            emit(if canonical {
-                forward.min(reverse)
-            } else {
-                forward
-            })
-            .map_err(io::Error::other)?;
-            if index == skip + k - 1 + kmers {
-                break;
-            }
-            let code = u64::from(data[index / 4] >> (6 - 2 * (index % 4))) & 3;
-            forward = ((forward << 2) | code) & mask;
-            reverse = (reverse >> 2) | ((code ^ 3) << high);
-            index += 1;
-        }
-        rest = after;
+    let (skip, kmers) = (usize::from(record[0] >> 6), usize::from(record[0] & 63) + 1);
+    let data = &record[1..];
+    // The first k-mer is read whole: its 2k bits start `skip` bases into the
+    // record, within the first 9 bytes.
+    let mut head = [0_u8; 16];
+    let whole = data.len().min(16);
+    head[..whole].copy_from_slice(&data[..whole]);
+    let mut forward = (u128::from_be_bytes(head) >> (128 - 2 * (skip + k))) as u64 & mask;
+    // Its reverse complement: complement every base, then reverse the order
+    // of the two-bit bases.
+    let flipped = (!forward).reverse_bits();
+    let mut reverse = (((flipped >> 1) & ODD_BITS) | ((flipped & ODD_BITS) << 1)) >> (64 - 2 * k);
+    for index in skip + k..skip + k - 1 + kmers {
+        emit(if canonical {
+            forward.min(reverse)
+        } else {
+            forward
+        })?;
+        let code = u64::from(data[index / 4] >> (6 - 2 * (index % 4))) & 3;
+        forward = ((forward << 2) | code) & mask;
+        reverse = (reverse >> 2) | ((code ^ 3) << high);
     }
-    Ok(())
+    emit(if canonical {
+        forward.min(reverse)
+    } else {
+        forward
+    })
 }
 
 /// One bin's count tables, with the updates collected for them.
 ///
-/// A k-mer is not counted when it is expanded. Its mixed key joins the
-/// updates of its group of tables; a full group is split by table, and each
+/// A k-mer is not counted when it is expanded. Its mixed key, with the
+/// number of occurrences to add above it, joins the updates of its group of
+/// tables; a full group is split by table, and each
 /// table then receives its updates in one burst while it sits in cache.
 /// Going through groups keeps every step to a few dozen sequential streams:
 /// scattering straight to a thousand tables would miss the cache on nearly
@@ -452,19 +499,31 @@ impl Tables {
         })
     }
 
-    /// Count one occurrence of the k-mer whose mixed key is `mixed`.
+    /// Count `weight` (at least one) occurrences of the k-mer whose mixed
+    /// key is `mixed`.
     #[inline(always)]
-    fn push(&mut self, mixed: u64) -> Result<(), Error> {
+    fn push(&mut self, mixed: u64, mut weight: u64) -> Result<(), Error> {
         let capacity = self.grouped * BURST;
-        // A key of at most 64 bits with no group bits has a shift of 64.
-        let group = mixed.checked_shr(self.group_shift).unwrap_or(0) as usize;
-        let filled = self.filled[group];
-        self.pending[group * capacity + filled] = mixed;
-        self.filled[group] = filled + 1;
-        if filled + 1 == capacity {
-            self.apply(group)?;
+        // The group index leaves at least two bits above the rest of the key
+        // (a 64-bit key always has group bits), which hold the weight.
+        let group = (mixed >> self.group_shift) as usize;
+        let (low, heaviest) = (
+            mixed ^ ((group as u64) << self.group_shift),
+            u64::MAX >> self.group_shift,
+        );
+        loop {
+            let part = weight.min(heaviest);
+            let filled = self.filled[group];
+            self.pending[group * capacity + filled] = (part << self.group_shift) | low;
+            self.filled[group] = filled + 1;
+            if filled + 1 == capacity {
+                self.apply(group)?;
+            }
+            weight -= part;
+            if weight == 0 {
+                return Ok(());
+            }
         }
-        Ok(())
     }
 
     #[inline(never)]
@@ -477,7 +536,7 @@ impl Tables {
             &self.pending[group * capacity..group * capacity + filled],
             &mut self.split,
             &mut self.ends,
-            |table, updates| table.add_burst(updates),
+            |table, updates| table.add_burst(updates, |update| update >> self.group_shift),
         )
     }
 
@@ -682,8 +741,9 @@ impl DiskCounts {
         writer: &mut dyn Write,
         encode: impl Fn(&PackedCounts, &mut dyn Write) -> io::Result<()> + Sync,
     ) -> io::Result<u64> {
-        // Three eighths for tables; bins held in memory take up to half, and
-        // the rest is left for update and output buffers.
+        // Three eighths for tables, and up to an eighth for merging repeats
+        // (see `count_bins`). Bins held in memory take up to half until they
+        // are counted; update and output buffers come on top.
         let total = (self.memory / 8 * 3).max(1);
         let budget = Budget {
             total,
@@ -731,6 +791,16 @@ impl DiskCounts {
         recycled: &crossbeam_channel::Receiver<Vec<u8>>,
     ) -> io::Result<()> {
         let mut tables = Tables::new(self.k).map_err(io::Error::other)?;
+        // An eighth of the memory, between the threads, merges equal records.
+        let slots = usize::try_from(self.memory / 8).unwrap_or(usize::MAX)
+            / self.threads
+            / std::mem::size_of::<Repeat>();
+        let slots = (slots / 2 + 1)
+            .next_power_of_two()
+            .clamp(MIN_REPEATS, MAX_REPEATS);
+        let mut repeats = Repeats::new(slots);
+        // Bins this thread still counts without merging; see below.
+        let mut unmerged = 0;
         let mut block = Vec::new();
         while let Some(bin) = self.bins.get(progress.next.fetch_add(1, Ordering::Relaxed)) {
             // Taking the bin frees its blocks once it has been counted.
@@ -750,23 +820,35 @@ impl DiskCounts {
             let _held = budget.take(needed.max(tables.counts.bytes() as u64));
             let mixer = tables.mixer;
             for pass in 0..passes {
-                let mut count = |block: &[u8]| {
-                    let push = |key: u64| {
-                        let mixed = mixer.mix(key);
-                        if passes == 1 || mixed % passes == pass {
-                            tables.push(mixed)?;
-                        }
-                        Ok(())
-                    };
-                    expand(block, self.k, self.strand == StrandMode::Canonical, push)
+                let mut count = |record: &[u8], copies: u64| {
+                    expand(
+                        record,
+                        self.k,
+                        self.strand == StrandMode::Canonical,
+                        |key| {
+                            let mixed = mixer.mix(key);
+                            if passes == 1 || mixed % passes == pass {
+                                tables.push(mixed, copies)?;
+                            }
+                            Ok(())
+                        },
+                    )
                 };
-                bin.held.iter().try_for_each(|block| count(block))?;
-                count(&bin.open)?;
+                let mut read = |block: &[u8]| match unmerged {
+                    0 => repeats.add(block, self.k, &mut count),
+                    _ => Repeats::pass(block, self.k, &mut count),
+                };
+                for block in bin.held.iter().chain(std::iter::once(&bin.open)) {
+                    read(block)?;
+                }
                 for &(offset, len) in &bin.written {
                     block.resize(len as usize, 0);
                     self.spill.read(&mut block, offset)?;
-                    count(&block)?;
+                    read(&block)?;
                 }
+                repeats
+                    .drain(self.k, &mut count)
+                    .map_err(io::Error::other)?;
                 tables.finish().map_err(io::Error::other)?;
                 let mut sink = ChunkSink {
                     buffer: recycled.try_recv().unwrap_or_default(),
@@ -781,7 +863,156 @@ impl DiskCounts {
                 tables.counts.clear();
             }
             progress.kmers.fetch_add(bin.kmers, Ordering::Relaxed);
+            // Bins are alike: where under a quarter of a bin's records were
+            // copies, merging costs more than it saves, so the next bins go
+            // without it until one is tried again.
+            if unmerged > 0 {
+                unmerged -= 1;
+            } else if repeats.copies * 4 < repeats.added {
+                unmerged = UNMERGED;
+            }
+            (repeats.added, repeats.copies) = (0, 0);
         }
+        Ok(())
+    }
+}
+
+/// One distinct super-k-mer record and how many copies of it were seen.
+#[derive(Clone, Copy)]
+#[repr(C, align(32))]
+struct Repeat {
+    /// Zero marks an empty slot.
+    copies: u32,
+    /// The unpadded record, header included, followed by zeros.
+    record: [u8; RECORD],
+}
+
+/// Room for the longest unpadded record: a header, and `MAX_RUN` k-mers of
+/// 32 bases in three 64-bit words.
+const RECORD: usize = 28;
+const _: () = assert!(2 * (MAX_RUN + 31) <= 3 * 64);
+
+/// A hash table that merges equal records before their k-mers are counted.
+///
+/// Records are added as they are read. When the table is three quarters
+/// full, and at the end of a bin, every distinct record is visited once with
+/// its number of copies, and the table starts again empty; copies on either
+/// side of that are merely counted separately.
+struct Repeats {
+    slots: Vec<Repeat>,
+    filled: usize,
+    hasher: foldhash::fast::FixedState,
+    /// Records added, and those that were copies, since last reset.
+    added: u64,
+    copies: u64,
+}
+
+impl Repeats {
+    /// A table of `slots` slots, a power of two.
+    fn new(slots: usize) -> Self {
+        Self {
+            slots: vec![
+                Repeat {
+                    copies: 0,
+                    record: [0; RECORD],
+                };
+                slots
+            ],
+            filled: 0,
+            hasher: foldhash::fast::FixedState::default(),
+            added: 0,
+            copies: 0,
+        }
+    }
+
+    /// Visit every record of `block` as it comes, without merging.
+    fn pass(
+        block: &[u8],
+        k: usize,
+        mut visit: impl FnMut(&[u8], u64) -> Result<(), Error>,
+    ) -> io::Result<()> {
+        let mut rest = block;
+        while !rest.is_empty() {
+            let record = first_record(rest, k)?;
+            rest = &rest[record.len()..];
+            visit(record, 1).map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+
+    /// Add every record of `block`.
+    fn add(
+        &mut self,
+        block: &[u8],
+        k: usize,
+        mut visit: impl FnMut(&[u8], u64) -> Result<(), Error>,
+    ) -> io::Result<()> {
+        /// Records hashed, and their slots fetched, before any is looked up.
+        const AHEAD: usize = 16;
+        let mask = self.slots.len() - 1;
+        let mut batch = [([0_u8; RECORD], 0_usize); AHEAD];
+        let mut rest = block;
+        while !rest.is_empty() {
+            let mut records = 0;
+            while records < AHEAD && !rest.is_empty() {
+                let record = first_record(rest, k)?;
+                rest = &rest[record.len()..];
+                let record = unpadded(record, k);
+                let slot = self.hasher.hash_one(record) as usize & mask;
+                crate::table::prefetch(&raw const self.slots[slot]);
+                batch[records] = (record, slot);
+                records += 1;
+            }
+            self.added += records as u64;
+            for &(record, mut slot) in &batch[..records] {
+                loop {
+                    let repeat = &mut self.slots[slot];
+                    if repeat.copies == 0 {
+                        *repeat = Repeat { copies: 1, record };
+                        self.filled += 1;
+                        // Keep a quarter of the slots empty, so that every
+                        // search ends.
+                        if self.filled * 4 >= self.slots.len() * 3 {
+                            self.drain(k, &mut visit).map_err(io::Error::other)?;
+                        }
+                        break;
+                    }
+                    if repeat.record == record {
+                        if repeat.copies == u32::MAX {
+                            // Count this many now and start again.
+                            let length = 1 + (usize::from(record[0]) + k).div_ceil(4);
+                            visit(&record[..length], u64::from(u32::MAX))
+                                .map_err(io::Error::other)?;
+                            repeat.copies = 0;
+                        }
+                        repeat.copies += 1;
+                        self.copies += 1;
+                        break;
+                    }
+                    slot = (slot + 1) & mask;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Visit each distinct record with its copies, and empty the table.
+    fn drain(
+        &mut self,
+        k: usize,
+        mut visit: impl FnMut(&[u8], u64) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if self.filled == 0 {
+            return Ok(());
+        }
+        for repeat in &mut self.slots {
+            if repeat.copies != 0 {
+                let length = 1 + (usize::from(repeat.record[0]) + k).div_ceil(4);
+                visit(&repeat.record[..length], u64::from(repeat.copies))?;
+                repeat.copies = 0;
+            }
+        }
+        self.filled = 0;
         Ok(())
     }
 }
@@ -922,6 +1153,71 @@ mod tests {
         assert_eq!((empty.kmers(), empty.temporary_bytes()), (0, 0));
         assert_eq!(empty.write_tsv(&mut tsv).unwrap(), 0);
         assert!(tsv.is_empty());
+    }
+
+    #[test]
+    fn repeated_reads_are_merged_and_counted_with_their_copies() {
+        // Hundreds of copies of a few reads, in both orientations and cut at
+        // different places: more copies than one update can carry.
+        let reads: Vec<_> = (0..4).map(|seed| sequence(120, 900 + seed)).collect();
+        let complement = |read: &[u8]| -> Vec<u8> {
+            let bases = read.iter().rev();
+            bases
+                .map(|&base| {
+                    b"TGCAN"[b"ACGTN"
+                        .iter()
+                        .position(|&b| b == base.to_ascii_uppercase())
+                        .unwrap()]
+                })
+                .collect()
+        };
+        let mut records = Vec::new();
+        for copy in 0..300 {
+            let read = &reads[copy % reads.len()];
+            records.push(read[copy % 7..].to_vec());
+            records.push(complement(&read[..read.len() - copy % 5]));
+        }
+        for k in [9, 31, 32] {
+            let expected = serial(&records, k, StrandMode::Canonical);
+            assert!(expected.values().any(|&count| count > 127));
+            for memory in [1 << 30, 4096] {
+                let mut tsv = Vec::new();
+                on_disk(&records, k, StrandMode::Canonical, memory)
+                    .write_tsv(&mut tsv)
+                    .unwrap();
+                assert_eq!(rows(&tsv), expected, "k={k} memory={memory}");
+            }
+        }
+    }
+
+    #[test]
+    fn unpadding_makes_equal_runs_equal_records() {
+        // The same 40 bases packed from each of the four alignments.
+        let bases: Vec<u8> = (0..43).map(|index| (index * 7 % 4) as u8).collect();
+        let pack = |skip: usize| {
+            let mut record = vec![(skip << 6 | (10 - 1)) as u8];
+            // Stray bases before and after the run must not matter.
+            let run = (0..skip)
+                .map(|_| 3)
+                .chain(bases[..40].iter().copied())
+                .chain([1, 2, 3]);
+            let run: Vec<u8> = run.collect();
+            for four in run.chunks(4) {
+                let byte = four
+                    .iter()
+                    .enumerate()
+                    .fold(0, |byte, (at, &base)| byte | base << (6 - 2 * at));
+                record.push(byte);
+            }
+            record.truncate(1 + (skip + 40).div_ceil(4));
+            record
+        };
+        let expected = unpadded(&pack(0), 31);
+        assert_eq!(expected[0], 9);
+        assert_eq!(&expected[11..], &[0; RECORD - 11]);
+        for skip in 1..4 {
+            assert_eq!(unpadded(&pack(skip), 31), expected, "skip={skip}");
+        }
     }
 
     #[test]

@@ -172,13 +172,7 @@ impl Counter {
     /// Write a version-1 database with exact counts and no per-entry allocation.
     /// Output is unsorted. Does not flush; write failures may leave partial output.
     pub fn write_binary(&self, mut writer: impl Write) -> io::Result<()> {
-        let mut header = [0; 32];
-        header[..8].copy_from_slice(MAGIC);
-        header[8..10].copy_from_slice(&VERSION.to_le_bytes());
-        header[10] = u8::from(self.strand == StrandMode::Canonical);
-        header[16..24].copy_from_slice(&(self.k as u64).to_le_bytes());
-        header[24..32].copy_from_slice(&(self.len() as u64).to_le_bytes());
-        writer.write_all(&header)?;
+        writer.write_all(&header(self.k, self.strand, self.len() as u64))?;
         if self.is_empty() {
             return Ok(());
         }
@@ -256,7 +250,18 @@ impl Counter {
     }
 }
 
-fn write_packed_binary<const WIDTH: usize>(
+/// The 32-byte header of a database with `entries` records.
+pub(crate) fn header(k: usize, strand: StrandMode, entries: u64) -> [u8; 32] {
+    let mut header = [0; 32];
+    header[..8].copy_from_slice(MAGIC);
+    header[8..10].copy_from_slice(&VERSION.to_le_bytes());
+    header[10] = u8::from(strand == StrandMode::Canonical);
+    header[16..24].copy_from_slice(&(k as u64).to_le_bytes());
+    header[24..32].copy_from_slice(&entries.to_le_bytes());
+    header
+}
+
+pub(crate) fn write_packed_binary<const WIDTH: usize>(
     entries: impl Iterator<Item = ([u8; WIDTH], u64)>,
     key_bytes: usize,
     writer: &mut (impl Write + ?Sized),

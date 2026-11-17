@@ -387,12 +387,17 @@ impl CompactTable {
     pub(crate) fn warm(&self, updates: usize) {
         const WARM_BUCKETS: usize = 512;
         if self.buckets.len() >= WARM_BUCKETS && updates >= self.buckets.len() / 4 {
-            let touched = self
-                .buckets
-                .iter()
-                .fold(0_u64, |sum, bucket| sum.wrapping_add(bucket.0[0]));
-            std::hint::black_box(touched);
+            self.read();
         }
+    }
+
+    /// Read every bucket into cache, in address order.
+    fn read(&self) {
+        let touched = self
+            .buckets
+            .iter()
+            .fold(0_u64, |sum, bucket| sum.wrapping_add(bucket.0[0]));
+        std::hint::black_box(touched);
     }
 
     /// Prefetch the home bucket of `remainder`, if the table is allocated.
@@ -604,6 +609,37 @@ impl CompactTable {
         Ok(true)
     }
 
+    /// Count one occurrence of each entry, whose low bits are a remainder of
+    /// this table, for a table that has left the cache since its last
+    /// burst whatever its size (see `crate::disk`). A burst that will touch
+    /// most of the table reads it into cache first; a sparser one prefetches
+    /// each bucket ahead of its update.
+    pub(crate) fn add_burst(&mut self, entries: &[u64]) -> Result<(), Error> {
+        /// Prefetch this far ahead within the burst.
+        const AHEAD: usize = 16;
+        let mask = self.layout.remainder_mask();
+        if entries.len() >= self.buckets.len() / 4 {
+            self.read();
+            return entries
+                .iter()
+                .try_for_each(|&entry| self.add(entry & mask, 1, Overflow::Reject));
+        }
+        for index in 0..entries.len() {
+            if let Some(&ahead) = entries.get(index + AHEAD) {
+                self.prefetch(ahead & mask);
+            }
+            self.add(entries[index] & mask, 1, Overflow::Reject)?;
+        }
+        Ok(())
+    }
+
+    /// Remove every key, keeping the allocated buckets for reuse.
+    pub(crate) fn clear(&mut self) {
+        self.buckets.fill(Bucket([0; SLOTS]));
+        self.overflow.clear();
+        self.len = 0;
+    }
+
     /// Iterate over `(remainder, count)` pairs in bucket order.
     pub(crate) fn iter(&self) -> Entries<'_> {
         Entries {
@@ -732,11 +768,6 @@ impl PackedCounts {
         &self.tables
     }
 
-    #[cfg(test)]
-    pub(crate) fn tables_mut(&mut self) -> &mut [CompactTable] {
-        &mut self.tables
-    }
-
     pub(crate) fn len(&self) -> usize {
         self.tables.iter().map(CompactTable::len).sum()
     }
@@ -784,6 +815,23 @@ impl PackedCounts {
     /// Iterate over every `(key, count)` pair.
     pub(crate) fn entries(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         (0..self.tables.len()).flat_map(|partition| self.partition_entries(partition))
+    }
+
+    /// Remove every key, keeping the tables' allocations for reuse.
+    pub(crate) fn clear(&mut self) {
+        self.tables.iter_mut().for_each(CompactTable::clear);
+    }
+
+    pub(crate) fn tables_mut(&mut self) -> &mut [CompactTable] {
+        &mut self.tables
+    }
+
+    /// Bytes of bucket storage currently allocated.
+    pub(crate) fn bytes(&self) -> usize {
+        self.tables
+            .iter()
+            .map(|table| table.buckets() * std::mem::size_of::<Bucket>())
+            .sum()
     }
 
     /// Start counting a sequence of keys in order; see [`OrderedAdder`].
@@ -869,6 +917,51 @@ impl Drop for OrderedAdder<'_> {
         // Return the buffer for reuse; unapplied keys are discarded.
         self.counts.scratch = std::mem::take(&mut self.pending);
     }
+}
+
+/// Apply `input` to `tables` (a power-of-two number of them), one table at a
+/// time.
+///
+/// An entry's table is given by the bits above its remainder, modulo the
+/// number of tables. The entries are first split by table, a sequential
+/// pass, so that `apply` then gives each table all of its updates in one
+/// burst while it is cached.
+pub(crate) fn add_split(
+    tables: &mut [CompactTable],
+    layout: Layout,
+    input: &[u64],
+    split: &mut Vec<u64>,
+    ends: &mut Vec<usize>,
+    apply: impl Fn(&mut CompactTable, &[u64]) -> Result<(), Error>,
+) -> Result<(), Error> {
+    if tables.len() == 1 {
+        return apply(&mut tables[0], input);
+    }
+    let table_of = |entry: u64| (entry >> layout.remainder_bits) as usize & (tables.len() - 1);
+    // A counting sort by table: count, turn counts into start offsets, then
+    // scatter (advancing each start to its end).
+    ends.clear();
+    ends.resize(tables.len(), 0);
+    for &entry in input {
+        ends[table_of(entry)] += 1;
+    }
+    let mut start = 0;
+    for end in ends.iter_mut() {
+        start += std::mem::replace(end, start);
+    }
+    split.clear();
+    split.resize(input.len(), 0);
+    for &entry in input {
+        let cursor = &mut ends[table_of(entry)];
+        split[*cursor] = entry;
+        *cursor += 1;
+    }
+    let mut start = 0;
+    for (table, &end) in tables.iter_mut().zip(ends.iter()) {
+        apply(table, &split[start..end])?;
+        start = end;
+    }
+    Ok(())
 }
 
 #[inline(always)]

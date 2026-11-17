@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::disk::{BinBuffers, Bins};
 use crate::table::{self, CompactTable, Layout, Load, Mixer, Overflow, PackedCounts};
 use crate::{
     Counter, Counts, Error, StrandMode, add_delta, visit_bytes, visit_packed, visit_packed128,
@@ -356,10 +357,8 @@ impl PackedShared {
         Ok(())
     }
 
-    /// Apply `input` to a group's tables, one table at a time.
-    ///
-    /// The updates are first split by table, a sequential pass, so that each
-    /// table then receives all of its updates in one burst while it is cached.
+    /// Apply `input` to a group's tables, one table at a time; see
+    /// [`table::add_split`].
     fn add_split(
         &self,
         tables: &mut [CompactTable],
@@ -367,9 +366,8 @@ impl PackedShared {
         split: &mut Vec<u64>,
         ends: &mut Vec<usize>,
     ) -> Result<(), Error> {
-        let layout = self.layout;
-        let (mask, run_shift) = (layout.remainder_mask(), self.entry_bits);
-        let add_all = |table: &mut CompactTable, entries: &[u64]| -> Result<(), Error> {
+        let (mask, run_shift) = (self.layout.remainder_mask(), self.entry_bits);
+        table::add_split(tables, self.layout, input, split, ends, |table, entries| {
             table.warm(entries.len());
             for index in 0..entries.len() {
                 if let Some(&ahead) = entries.get(index + AHEAD) {
@@ -379,37 +377,7 @@ impl PackedShared {
                 table.add(entry & mask, entry >> run_shift, Overflow::Reject)?;
             }
             Ok(())
-        };
-        if tables.len() == 1 {
-            add_all(&mut tables[0], input)?;
-        } else {
-            let table_of =
-                |entry: u64| (entry >> layout.remainder_bits) as usize & (tables.len() - 1);
-            // A counting sort by table: count, turn counts into start
-            // offsets, then scatter (advancing each start to its end).
-            ends.clear();
-            ends.resize(tables.len(), 0);
-            for &entry in input.iter() {
-                ends[table_of(entry)] += 1;
-            }
-            let mut start = 0;
-            for end in ends.iter_mut() {
-                start += std::mem::replace(end, start);
-            }
-            split.clear();
-            split.resize(input.len(), 0);
-            for &entry in input.iter() {
-                let cursor = &mut ends[table_of(entry)];
-                split[*cursor] = entry;
-                *cursor += 1;
-            }
-            let mut start = 0;
-            for (table, &end) in tables.iter_mut().zip(ends.iter()) {
-                add_all(table, &split[start..end])?;
-                start = end;
-            }
-        }
-        Ok(())
+        })
     }
 
     /// Apply whatever is still queued, on `threads` threads, and return the
@@ -565,12 +533,15 @@ enum SharedCounts {
     Packed(PackedShared),
     Packed128(Partitioned<(u64, u64), foldhash::fast::RandomState>),
     Bytes(Partitioned<Vec<u8>, std::collections::hash_map::RandomState>),
+    /// Nothing is counted: input is split into bins on disk; see `crate::disk`.
+    Bins(Bins),
 }
 
 enum Buffers {
     Packed(PackedUpdates),
     Packed128(Updates<(u64, u64)>),
     Bytes(Updates<Vec<u8>>),
+    Bins(BinBuffers),
 }
 
 impl SharedCounts {
@@ -589,6 +560,16 @@ impl SharedCounts {
             Self::Packed(table) => Buffers::Packed(table.updates()),
             Self::Packed128(table) => Buffers::Packed128(Updates::new(table.shards.len())),
             Self::Bytes(table) => Buffers::Bytes(Updates::new(table.shards.len())),
+            Self::Bins(bins) => Buffers::Bins(bins.buffers()),
+        }
+    }
+
+    /// Hand over whatever a finishing worker still holds in `buffers`.
+    fn flush(&self, buffers: &mut Buffers) -> Result<(), Error> {
+        match (self, buffers) {
+            (Self::Bins(bins), Buffers::Bins(buffers)) => bins.flush(buffers),
+            // Counting workers submit their updates after every batch.
+            _ => Ok(()),
         }
     }
 
@@ -634,6 +615,9 @@ impl SharedCounts {
                 }
                 table.apply(buffers, offset)
             }
+            (Self::Bins(bins), Buffers::Bins(buffers)) => batch
+                .records()
+                .try_for_each(|record| bins.split(record, buffers)),
             _ => unreachable!("worker buffers match the shared key representation"),
         }
     }
@@ -650,6 +634,7 @@ impl SharedCounts {
             }
             Self::Packed128(table) => table.into_counts(Counts::Packed128)?,
             Self::Bytes(table) => table.into_counts(Counts::Bytes)?,
+            Self::Bins(_) => unreachable!("bins are finished by `DiskCounter`"),
         };
         Ok(Counter::from_partitions(
             k, strand, partitions, hash, threads,
@@ -707,18 +692,42 @@ impl ParallelCounter {
         threads: usize,
         capacity: usize,
     ) -> Result<Self, Error> {
-        let started = Instant::now();
         if k == 0 {
             return Err(Error::InvalidK);
         }
+        // Partitions for wider keys (k > 32). Enough that workers rarely find a
+        // partition busy, few enough to keep per-worker buffers cache friendly.
+        let partitions = (threads.min(32) * 32).next_power_of_two().clamp(16, 1024);
+        Self::start(
+            k,
+            strand,
+            threads,
+            SharedCounts::new(k, partitions, capacity)?,
+        )
+    }
+
+    /// Start workers that split input into `bins` instead of counting it.
+    pub(crate) fn with_bins(
+        k: usize,
+        strand: StrandMode,
+        threads: usize,
+        bins: Bins,
+    ) -> Result<Self, Error> {
+        Self::start(k, strand, threads, SharedCounts::Bins(bins))
+    }
+
+    fn start(
+        k: usize,
+        strand: StrandMode,
+        threads: usize,
+        shared: SharedCounts,
+    ) -> Result<Self, Error> {
+        let started = Instant::now();
         let queued = threads
             .checked_mul(2)
             .filter(|&n| n > 0)
             .ok_or(Error::InvalidThreads)?;
-        // Partitions for wider keys (k > 32). Enough that workers rarely find a
-        // partition busy, few enough to keep per-worker buffers cache friendly.
-        let partitions = (threads.min(32) * 32).next_power_of_two().clamp(16, 1024);
-        let shared = Arc::new(SharedCounts::new(k, partitions, capacity)?);
+        let shared = Arc::new(shared);
         let mut workers = Vec::new();
         workers
             .try_reserve(threads)
@@ -770,7 +779,7 @@ impl ParallelCounter {
                                 break;
                             }
                         }
-                        Ok(())
+                        shared.flush(&mut buffers)
                     }))
                     .unwrap_or(Err(Error::WorkerFailed));
                     if let Err(error) = result {
@@ -826,17 +835,34 @@ impl ParallelCounter {
         self.finish_with_stats().map(|(counter, _)| counter)
     }
 
-    /// Finish counting and report counting/finalization durations.
-    pub fn finish_with_stats(mut self) -> Result<(Counter, ParallelStats), Error> {
+    /// K-mer length, strand mode and worker count.
+    pub(crate) fn shape(&self) -> (usize, StrandMode, usize) {
+        (self.k, self.strand, self.threads)
+    }
+
+    /// Submit remaining input, wait for the workers, and take the shared state.
+    fn join(&mut self) -> Result<SharedCounts, Error> {
         self.input.submit()?;
         self.input.sender.take();
         while let Some(worker) = self.workers.pop() {
             worker.join().map_err(|_| Error::WorkerFailed)??;
         }
+        Arc::try_unwrap(self.shared.take().unwrap()).map_err(|_| Error::WorkerFailed)
+    }
+
+    /// Wait for the workers of a counter started by `with_bins`.
+    pub(crate) fn into_bins(mut self) -> Result<Bins, Error> {
+        match self.join()? {
+            SharedCounts::Bins(bins) => Ok(bins),
+            _ => unreachable!("only `with_bins` counters are finished as bins"),
+        }
+    }
+
+    /// Finish counting and report counting/finalization durations.
+    pub fn finish_with_stats(mut self) -> Result<(Counter, ParallelStats), Error> {
+        let shared = self.join()?;
         let counting = self.started.elapsed();
         let merging = Instant::now();
-        let shared =
-            Arc::try_unwrap(self.shared.take().unwrap()).map_err(|_| Error::WorkerFailed)?;
         let counter = shared.finish(self.k, self.strand, self.threads)?;
         Ok((
             counter,

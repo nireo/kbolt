@@ -123,9 +123,10 @@ def setup():
         path.symlink_to(target)
 
 
-def run_cases(cases, rounds, warmup):
+def run_cases(cases, rounds, warmup, before=None):
     """Run each (label, command) case `warmup` times untimed, then `rounds`
-    times in rotated order. Returns {label: [measurement, ...]}."""
+    times in rotated order, calling `before` (if given) ahead of every timed
+    run. Returns {label: [measurement, ...]}."""
     for _ in range(warmup):
         for _, command in cases:
             measure(command)
@@ -133,6 +134,8 @@ def run_cases(cases, rounds, warmup):
     for round_index in range(rounds):
         shift = round_index % len(cases)
         for label, command in cases[shift:] + cases[:shift]:
+            if before:
+                before()
             results[label].append(measure(command))
             print(f"  {label}: {results[label][-1]['wall_seconds']:.3f}s", flush=True)
     return results

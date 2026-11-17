@@ -24,8 +24,17 @@ of memory):
 kbolt is 2.5× faster than KMC and 3.4× faster than FastK, on about half the
 CPU time and under 60% of the memory. kbolt and KMC report identical counts.
 
-KMC and FastK split their input into bins on disk, so they can also count read
-sets whose k-mers do not fit in memory; kbolt cannot.
+Read sets whose k-mers do not fit in memory can be counted on disk with
+`--memory`, as KMC and FastK do. The same reads with every tool limited to
+2 GiB (kbolt `--memory 2G`, KMC `-m2`, FastK `-M2`), median of 3 runs:
+
+| | Wall time | CPU time | Peak memory |
+|---|---:|---:|---:|
+| kbolt | **16.6 s** | 115 s | 1.4 GiB |
+| KMC | 35.3 s | 200 s | 1.9 GiB |
+| FastK | 44.5 s | 195 s | 4.2 GiB |
+
+The result is identical to counting in memory.
 
 On smaller inputs the margin is similar or larger, here with Jellyfish as
 well. Wall time (median of 3 runs):
@@ -49,6 +58,7 @@ cargo install --path .
 kbolt count -k 31 reads.fastq.gz > counts.tsv
 kbolt count -k 31 -t 8 sample_R1.fastq.gz sample_R2.fastq.gz -o counts.tsv
 kbolt count -k 31 -t 8 --format binary reads.fastq.gz -o counts.kbolt
+kbolt count -k 31 -t 8 --memory 4G reads.fastq.gz -o counts.tsv
 kbolt dump counts.kbolt > counts.tsv
 ```
 
@@ -59,7 +69,10 @@ kbolt dump counts.kbolt > counts.tsv
   kbolt reads stdin.
 - `-t N` sets the number of counting threads. `--progress` and `--timings`
   report on stderr.
-- Every distinct k-mer is held in RAM; there is no disk spill.
+- By default every distinct k-mer is held in RAM. `--memory SIZE` (k ≤ 32)
+  counts within about that much memory instead: the input is first split
+  into bins, kept in memory up to half the limit and otherwise in a temporary
+  file under `--temp-dir` (a little under a byte per input base).
 
 See `kbolt count --help` for all options.
 
@@ -82,7 +95,8 @@ fn main() -> Result<(), kbolt::Error> {
 
 For many short reads, `add_records` is faster than repeated `add_record`
 calls. `ParallelCounter` counts on several threads and `finish()` returns a
-normal `Counter`.
+normal `Counter`. `DiskCounter` takes input the same way but counts on disk
+within a memory limit and writes its result straight to a file.
 
 ## How it works
 
@@ -99,6 +113,14 @@ on every k-mer. Tables grow in small steps and are returned to the OS when
 outgrown, which keeps memory close to what the k-mers need. Longer k-mers use
 ordinary hash maps.
 
+With `--memory`, counting takes two passes. The first cuts each read into
+super-k-mers, runs of neighbouring k-mers that share a minimizer, and appends
+them to one of 512 bins; every copy of a k-mer lands in the same bin. Bins
+stay in memory while the limit allows and go to a temporary file after that.
+The second pass counts one bin at a time with the same tables and writes its
+k-mers out before the next, so memory follows the bins being counted, not the
+input.
+
 ## Development
 
 ```sh
@@ -109,7 +131,8 @@ cargo bench
 
 `python3 benches/reads.py --tools kbolt kmc fastk` reruns the real-read
 comparison after `python3 benches/reads.py --fetch` has downloaded the reads
-(5 GB); FastK comes from Homebrew and KMC from its GitHub releases. Redraw the
+(5 GB); FastK comes from Homebrew and KMC from its GitHub releases. Add
+`--memory 0 2` to also run every tool with a 2 GiB limit. Redraw the
 chart with `uv run --no-project --with matplotlib python benches/plot_reads.py`.
 `python3 benches/compare.py` reruns the small-input comparison (inputs from
 `benches/generate_inputs.py`), and `benches/plot_compare.py` plots its

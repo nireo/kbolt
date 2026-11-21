@@ -253,8 +253,22 @@ impl Load {
 /// the limit instead of dropping to half of it.
 const STEADY_BUCKETS: usize = 1024;
 
-/// Byte-per-slot masks (0xff or 0x00) of slots equal to `key` after clearing
+/// Bits per slot in the masks of `bucket_masks`: slot `i` owns bits
+/// `i * MASK_BITS..(i + 1) * MASK_BITS`, all of them set or all clear. NEON
+/// narrows each comparison to a byte; x86 extracts one bit per slot.
+#[cfg(target_arch = "x86_64")]
+const MASK_BITS: u32 = 1;
+#[cfg(not(target_arch = "x86_64"))]
+const MASK_BITS: u32 = 8;
+
+/// Per-slot masks (see `MASK_BITS`) of slots equal to `key` after clearing
 /// their count bits, and of empty slots.
+///
+/// On x86-64 the widest instruction set enabled for the build is used:
+/// AVX-512 compares a whole bucket at once, AVX2 half of it, and the SSE2
+/// baseline a quarter. Build with `-C target-cpu=native` (or `x86-64-v3`,
+/// `x86-64-v4`) to select the wider ones; the choice is made at compile time
+/// so that the comparison stays inlined in every update loop.
 #[inline(always)]
 fn bucket_masks(bucket: &Bucket, key: u64, key_mask: u64) -> (u64, u64) {
     #[cfg(target_arch = "aarch64")]
@@ -286,7 +300,70 @@ fn bucket_masks(bucket: &Bucket, key: u64, key_mask: u64) -> (u64, u64) {
             ),
         )
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    // SAFETY: AVX-512F is enabled for this build, and the bucket is 64 bytes
+    // aligned to 64.
+    unsafe {
+        use core::arch::x86_64::*;
+        let slots = _mm512_load_si512(bucket.0.as_ptr().cast());
+        let matches = _mm512_cmpeq_epi64_mask(
+            _mm512_and_si512(slots, _mm512_set1_epi64(key_mask as i64)),
+            _mm512_set1_epi64(key as i64),
+        );
+        let empty = _mm512_testn_epi64_mask(slots, slots);
+        (u64::from(matches), u64::from(empty))
+    }
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        not(target_feature = "avx512f")
+    ))]
+    // SAFETY: AVX2 is enabled for this build, and the bucket holds two
+    // aligned 256-bit halves.
+    unsafe {
+        use core::arch::x86_64::*;
+        let pointer = bucket.0.as_ptr().cast::<__m256i>();
+        let (low, high) = (
+            _mm256_load_si256(pointer),
+            _mm256_load_si256(pointer.add(1)),
+        );
+        let key = _mm256_set1_epi64x(key as i64);
+        let key_mask = _mm256_set1_epi64x(key_mask as i64);
+        let zero = _mm256_setzero_si256();
+        // One bit per 64-bit lane.
+        let bits = |equal| _mm256_movemask_pd(_mm256_castsi256_pd(equal)) as u32 as u64;
+        let matches = |slots| bits(_mm256_cmpeq_epi64(_mm256_and_si256(slots, key_mask), key));
+        let empty = |slots| bits(_mm256_cmpeq_epi64(slots, zero));
+        (
+            matches(low) | (matches(high) << 4),
+            empty(low) | (empty(high) << 4),
+        )
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+    // SAFETY: SSE2 is part of the x86-64 baseline, and the bucket holds four
+    // aligned 128-bit quarters.
+    unsafe {
+        use core::arch::x86_64::*;
+        let pointer = bucket.0.as_ptr().cast::<__m128i>();
+        let key = _mm_set1_epi64x(key as i64);
+        let key_mask = _mm_set1_epi64x(key_mask as i64);
+        let zero = _mm_setzero_si128();
+        // SSE2 compares 32-bit lanes: a slot is equal when both of its halves
+        // are. One bit per 64-bit lane.
+        let equal = |a, b| {
+            let halves = _mm_cmpeq_epi32(a, b);
+            let both = _mm_and_si128(halves, _mm_shuffle_epi32::<0b1011_0001>(halves));
+            _mm_movemask_pd(_mm_castsi128_pd(both)) as u32 as u64
+        };
+        let (mut matches, mut empty) = (0, 0);
+        for quarter in 0..4 {
+            let slots = _mm_load_si128(pointer.add(quarter));
+            matches |= equal(_mm_and_si128(slots, key_mask), key) << (2 * quarter);
+            empty |= equal(slots, zero) << (2 * quarter);
+        }
+        (matches, empty)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         let (mut matches, mut empty) = (0, 0);
         for (index, &slot) in bucket.0.iter().enumerate() {
@@ -489,13 +566,13 @@ impl CompactTable {
             if matches != 0 {
                 return (
                     true,
-                    bucket * SLOTS + (matches.trailing_zeros() / 8) as usize,
+                    bucket * SLOTS + (matches.trailing_zeros() / MASK_BITS) as usize,
                 );
             }
             if empty != 0 {
                 return (
                     false,
-                    bucket * SLOTS + (empty.trailing_zeros() / 8) as usize,
+                    bucket * SLOTS + (empty.trailing_zeros() / MASK_BITS) as usize,
                 );
             }
             bucket += 1;
@@ -1012,6 +1089,60 @@ mod tests {
                 seen[mixer.mix(key) as usize] = true;
             }
             assert!(seen.into_iter().all(|seen| seen));
+        }
+    }
+
+    #[test]
+    fn bucket_masks_match_a_scalar_search() {
+        let mut state = 11_u64;
+        let mut random = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // All bits of one slot's part of a mask.
+        let slot_mask = u64::MAX >> (64 - MASK_BITS);
+        for count_bits in [10_u32, 12, 15, 32, 59] {
+            let key_mask = u64::MAX << count_bits;
+            for _ in 0..4000 {
+                let key = random() & key_mask;
+                let mut bucket = Bucket([0; SLOTS]);
+                for slot in &mut bucket.0 {
+                    *slot = match random() % 4 {
+                        0 => 0,
+                        // The key with an arbitrary count.
+                        1 => key | (random() & !key_mask),
+                        // Another key.
+                        2 => (random() & key_mask) | 1,
+                        // The key with a single bit changed, in either half
+                        // of the word.
+                        _ => {
+                            (key ^ (1 << (count_bits + (random() % 64) as u32 % (64 - count_bits))))
+                                | 1
+                        }
+                    };
+                }
+                let (matches, empty) = bucket_masks(&bucket, key, key_mask);
+                for (index, &slot) in bucket.0.iter().enumerate() {
+                    let shift = index as u32 * MASK_BITS;
+                    let expected = |set: bool| if set { slot_mask } else { 0 };
+                    assert_eq!(
+                        (matches >> shift) & slot_mask,
+                        expected(slot & key_mask == key),
+                        "match in slot {index}, count_bits={count_bits}"
+                    );
+                    assert_eq!(
+                        (empty >> shift) & slot_mask,
+                        expected(slot == 0),
+                        "empty in slot {index}, count_bits={count_bits}"
+                    );
+                }
+                // Nothing beyond the eight slots.
+                let beyond = SLOTS as u32 * MASK_BITS;
+                assert_eq!(matches.checked_shr(beyond).unwrap_or(0), 0);
+                assert_eq!(empty.checked_shr(beyond).unwrap_or(0), 0);
+            }
         }
     }
 

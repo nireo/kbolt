@@ -131,6 +131,12 @@ cargo clippy --all-targets -- -D warnings
 cargo bench
 ```
 
+On x86-64, the table lookup uses the widest vector instructions the build
+enables: SSE2 by default, AVX2 or AVX-512 with
+`RUSTFLAGS="-C target-cpu=native" cargo build --release` (or
+`-C target-cpu=x86-64-v3`). A binary built that way only runs on processors
+with those instructions.
+
 `python3 benches/reads.py --tools kbolt kmc fastk` reruns the real-read
 comparison after `python3 benches/reads.py --fetch` has downloaded the reads
 (5 GB); FastK comes from Homebrew and KMC from its GitHub releases. Add

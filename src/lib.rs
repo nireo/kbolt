@@ -634,7 +634,42 @@ fn decode_packed32(key: u64, k: usize) -> [u8; 32] {
         vst1q_u8(dna.as_mut_ptr().add(16), expand(HIGH));
         dna
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE2 is part of the x86-64 baseline; the stores are in bounds.
+    unsafe {
+        use core::arch::x86_64::*;
+        // Byte i holds bases 4i..4i + 4, the first in its top two bits.
+        let bytes = _mm_cvtsi64_si128(aligned.swap_bytes() as i64);
+        let two_bits = _mm_set1_epi8(3);
+        // The four bases of every byte, as codes. A 16-bit shift moves bits
+        // between neighbouring bytes, but never into the two bits kept.
+        let first = _mm_and_si128(_mm_srli_epi16::<6>(bytes), two_bits);
+        let second = _mm_and_si128(_mm_srli_epi16::<4>(bytes), two_bits);
+        let third = _mm_and_si128(_mm_srli_epi16::<2>(bytes), two_bits);
+        let fourth = _mm_and_si128(bytes, two_bits);
+        // Interleave them back into base order.
+        let leading = _mm_unpacklo_epi8(first, second);
+        let trailing = _mm_unpacklo_epi8(third, fourth);
+        // A, C, G and T are 65, 67, 71 and 84: 65 + 2 * code, plus 2 from G
+        // on, plus 11 more for T.
+        let letters = |codes| {
+            let from_g = _mm_and_si128(_mm_cmpgt_epi8(codes, _mm_set1_epi8(1)), _mm_set1_epi8(2));
+            let only_t = _mm_and_si128(_mm_cmpeq_epi8(codes, two_bits), _mm_set1_epi8(11));
+            let ascii = _mm_add_epi8(_mm_set1_epi8(b'A' as i8), _mm_add_epi8(codes, codes));
+            _mm_add_epi8(ascii, _mm_add_epi8(from_g, only_t))
+        };
+        let mut dna = [0; 32];
+        _mm_storeu_si128(
+            dna.as_mut_ptr().cast(),
+            letters(_mm_unpacklo_epi16(leading, trailing)),
+        );
+        _mm_storeu_si128(
+            dna.as_mut_ptr().add(16).cast(),
+            letters(_mm_unpackhi_epi16(leading, trailing)),
+        );
+        dna
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         let mut dna = [0; 32];
         decode_packed_into(aligned, &mut dna);

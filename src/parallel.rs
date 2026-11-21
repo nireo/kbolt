@@ -111,6 +111,8 @@ const GROUP_BITS: u32 = 6;
 /// take an eighth of the tables' memory. These bounds apply to that threshold,
 /// in updates: the lower one keeps small tables from being visited for a
 /// handful of updates, the upper one caps queued memory at 32 MiB per group.
+// Two updates per bucket took 8% less time on uncompressed reads for 12% more
+// memory, but no less on gzip input, where decompression sets the pace.
 // Tests shrink the thresholds so that small inputs reach every path.
 const MIN_PENDING: usize = if cfg!(test) { 64 } else { 4 * 1024 };
 const MAX_PENDING: usize = 4 * 1024 * 1024;
@@ -162,6 +164,8 @@ struct PackedUpdates {
     ends: Vec<usize>,
     /// Small groups found busy during a pass, to revisit at its end.
     busy: Vec<usize>,
+    /// The mixed key this worker buffered last.
+    previous: u64,
 }
 
 /// The queue length at which a group with these tables is applied, or zero
@@ -217,17 +221,23 @@ impl PackedShared {
         let entry_mask = u64::MAX >> (64 - self.entry_bits);
         let entry = mixed & entry_mask;
         let run = 1_u64 << self.entry_bits;
+        // Run aggregation handles hot keys and short motifs cheaply. A repeat
+        // is the same mixed key as the one before, a comparison of two
+        // registers; only then is the last entry of its buffer read back. That
+        // entry is the earlier occurrence unless the buffer has been handed
+        // on since, which the checks below cover.
+        let repeated = mixed == updates.previous;
+        updates.previous = mixed;
         let buffer = &mut updates.local[(mixed >> self.entry_bits) as usize];
-        // Run aggregation handles hot keys and short motifs cheaply.
-        match buffer.last_mut() {
-            Some(last)
-                if *last & entry_mask == entry
-                    && *last >> self.entry_bits < !entry_mask >> self.entry_bits =>
-            {
-                *last += run;
-            }
-            _ => buffer.push(run | entry),
+        if repeated
+            && let Some(last) = buffer.last_mut()
+            && *last & entry_mask == entry
+            && *last >> self.entry_bits < !entry_mask >> self.entry_bits
+        {
+            *last += run;
+            return;
         }
+        buffer.push(run | entry);
     }
 
     /// Hand this worker's buffered updates to their groups.

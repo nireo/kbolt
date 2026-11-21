@@ -17,12 +17,12 @@ of memory):
 
 | | Wall time | CPU time | Peak memory |
 |---|---:|---:|---:|
-| kbolt | **13.1 s** | 103 s | 6.5 GiB |
-| KMC | 33.4 s | 206 s | 11.2 GiB |
-| FastK | 45.0 s | 196 s | 11.4 GiB |
+| kbolt | **13.0 s** | 99 s | 6.5 GiB |
+| KMC | 33.6 s | 210 s | 11.0 GiB |
+| FastK | 44.1 s | 197 s | 9.9 GiB |
 
-kbolt is 2.5× faster than KMC and 3.4× faster than FastK, on about half the
-CPU time and under 60% of the memory. kbolt and KMC report identical counts.
+kbolt is 2.6× faster than KMC and 3.4× faster than FastK, on about half the
+CPU time and two thirds of the memory or less. kbolt and KMC report identical counts.
 
 Read sets whose k-mers do not fit in memory can be counted on disk with
 `--memory`, as KMC and FastK do. The same reads with every tool limited to
@@ -30,9 +30,9 @@ Read sets whose k-mers do not fit in memory can be counted on disk with
 
 | | Wall time | CPU time | Peak memory |
 |---|---:|---:|---:|
-| kbolt | **16.6 s** | 115 s | 1.4 GiB |
-| KMC | 35.3 s | 200 s | 1.9 GiB |
-| FastK | 44.5 s | 195 s | 4.2 GiB |
+| kbolt | **14.4 s** | 93 s | 1.6 GiB |
+| KMC | 34.4 s | 198 s | 1.9 GiB |
+| FastK | 43.9 s | 192 s | 4.2 GiB |
 
 The result is identical to counting in memory.
 

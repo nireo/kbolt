@@ -72,8 +72,8 @@ struct CountArgs {
     #[arg(long, value_name = "DIR", requires = "memory")]
     temp_dir: Option<PathBuf>,
     /// Write k-mers in alphabetical order. Sorting takes one more pass over
-    /// the distinct k-mers: a second copy of them in memory, or with
-    /// --memory a second temporary file of 16 bytes each
+    /// the distinct k-mers, and with --memory a second temporary file of 8
+    /// bytes each
     #[arg(long)]
     sorted: bool,
     /// Print counting, merge, and output wall times on stderr

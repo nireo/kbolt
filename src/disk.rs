@@ -697,7 +697,7 @@ impl DiskCounts {
     }
 
     /// Write k-mers in ascending order (A < C < G < T) instead of bin by
-    /// bin. This takes another temporary file, of 16 bytes per distinct
+    /// bin. This takes another temporary file, of 8 bytes per distinct
     /// k-mer, and one more pass over them.
     pub fn sorted(mut self, sorted: bool) -> Self {
         self.sorted = sorted;
@@ -762,12 +762,12 @@ impl DiskCounts {
     /// `encode` makes of its records, after `begin` has written what comes
     /// before them, given the number of distinct k-mers.
     ///
-    /// The sorter's records wait in a second temporary file, 16 bytes per
+    /// The sorter's records wait in a second temporary file, 8 bytes per
     /// distinct k-mer; sorting them takes about half the memory limit.
     fn count_sorted(
         &self,
         writer: &mut dyn Write,
-        encode: impl Fn(&[sorted::Record], &mut dyn Write) -> io::Result<()> + Sync,
+        encode: impl Fn(sorted::Sorted<'_>, &mut dyn Write) -> io::Result<()> + Sync,
         begin: impl FnOnce(u64, &mut dyn Write) -> io::Result<()>,
     ) -> io::Result<u64> {
         // Every k-mer of the input may be a distinct one.

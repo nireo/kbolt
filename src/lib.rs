@@ -88,7 +88,7 @@ enum Counts {
 /// Output keys are uppercase ASCII DNA sequences; counts accumulate across records.
 /// Rolling 2-bit keys use 64 bits for k <= 32 and 128 bits for k <= 64.
 /// Larger k uses byte-string storage, with no maximum other than practical memory limits.
-/// For k <= 32, keys are stored in compact partitioned tables addressed by a seeded,
+/// For k <= 32, keys are stored in compact partitioned tables addressed by a fixed,
 /// invertible mixing function; wider keys use FoldHash. Neither is intended to resist
 /// adaptive collision attacks.
 pub struct Counter {
@@ -143,8 +143,9 @@ impl ChunkSink<'_> {
 /// One independently encodable piece of a counter's output.
 #[derive(Clone, Copy)]
 enum OutputTable<'a> {
-    /// One partition of compact packed tables.
-    Packed(&'a PackedCounts, usize),
+    /// Consecutive partitions of compact packed tables: the first, and how
+    /// many.
+    Packed(&'a PackedCounts, usize, usize),
     /// A whole map for wider keys.
     Map(&'a Counts),
 }
@@ -368,74 +369,35 @@ impl Counter {
         std::iter::once(&self.counts).chain(&self.partitions)
     }
 
-    /// Encode every table with `encode`, writing the bytes in table order.
-    ///
-    /// Partitioned results encode tables concurrently on up to
-    /// `output_threads` scoped threads. Each encoder streams bounded chunks
-    /// through its own small queue, and the calling thread writes them in
-    /// order, so buffered output stays proportional to the thread count
-    /// (about 17 MiB per encoder) rather than the table size.
+    /// Encode every table with `encode`, writing the bytes in table order;
+    /// see [`write_ordered`]. Packed tables are encoded `unit` at a time.
     fn write_tables(
         &self,
         writer: &mut dyn Write,
+        unit: usize,
         encode: impl Fn(OutputTable<'_>, &mut dyn Write) -> io::Result<()> + Sync,
     ) -> io::Result<()> {
         let tables: Vec<OutputTable<'_>> = match &self.counts {
             Counts::Packed(counts) => (0..counts.tables().len())
-                .map(|partition| OutputTable::Packed(counts, partition))
+                .step_by(unit)
+                .map(|first| OutputTable::Packed(counts, first, unit))
                 .collect(),
             _ => self.tables().map(OutputTable::Map).collect(),
         };
-        let threads = self.output_threads.min(tables.len());
-        if threads <= 1 {
-            return tables
-                .into_iter()
-                .try_for_each(|table| encode(table, &mut *writer));
-        }
-        std::thread::scope(|scope| {
-            let (recycle, recycled) = crossbeam_channel::unbounded::<Vec<u8>>();
-            let mut streams = Vec::with_capacity(threads);
-            for first in 0..threads {
-                // Each encoder may run this many chunks ahead of the writer;
-                // enough to buffer a typical partition while others are written.
-                let (sender, receiver) = crossbeam_channel::bounded(16);
-                streams.push(receiver);
-                let (tables, encode, recycled) = (&tables, &encode, recycled.clone());
-                std::thread::Builder::new()
-                    .name(format!("output-{first}"))
-                    .spawn_scoped(scope, move || {
-                        // Encoder `first` owns tables first, first + threads, ...
-                        for &table in tables.iter().skip(first).step_by(threads) {
-                            let mut sink = ChunkSink {
-                                buffer: recycled.try_recv().unwrap_or_default(),
-                                sender: &sender,
-                                recycled: &recycled,
-                            };
-                            if let Err(error) =
-                                encode(table, &mut sink).and_then(|()| sink.finish())
-                            {
-                                // Forward the encoder's own error; this fails
-                                // harmlessly if the writer already stopped.
-                                let _ = sender.send(Err(error));
-                                return;
-                            }
-                        }
-                    })?;
-            }
-            drop(recycled);
-            for index in 0..tables.len() {
-                // Returning early drops every receiver, releasing blocked encoders.
-                while let Some(mut chunk) = streams[index % threads]
-                    .recv()
-                    .map_err(|_| io::Error::other("output encoder failed"))??
-                {
-                    writer.write_all(&chunk)?;
-                    chunk.clear();
-                    let _ = recycle.send(chunk);
-                }
-            }
-            Ok(())
-        })
+        write_ordered(
+            self.output_threads,
+            tables.len(),
+            writer,
+            |index, writer| encode(tables[index], writer),
+        )
+    }
+
+    /// The partitions of packed tables that a serial counter would hold in
+    /// one: the unit in which a database is written, so that its bytes do
+    /// not depend on how many partitions (and threads) counted it.
+    fn serial_partition(&self, counts: &PackedCounts) -> usize {
+        let serial = table::partition_bits(table::key_bits(self.k), PACKED_PARTITION_BITS);
+        (counts.tables().len() >> serial).max(1)
     }
 
     fn partition_mut<K: Hash + ?Sized>(&mut self, key: &K) -> &mut Counts {
@@ -464,16 +426,24 @@ impl Counter {
         self.len() == 0
     }
 
-    /// Write headerless `KMER<TAB>COUNT` rows, in unspecified order.
+    /// Write headerless `KMER<TAB>COUNT` rows. For k <= 32 they come in the
+    /// order of the k-mers' hashes, the same in every run and for any number
+    /// of threads; otherwise in unspecified order.
     ///
     /// Reuses stack buffers for packed keys and decimal counts; larger keys are
     /// borrowed from the table. No per-row heap allocation is needed. Wrap files
     /// or stdout in a [`io::BufWriter`] to batch writes. This method does not flush
     /// the writer; write failures may leave partial output.
     pub fn write_tsv(&self, mut writer: impl Write) -> io::Result<()> {
-        self.write_tables(&mut writer, |table, writer| match table {
-            OutputTable::Packed(counts, partition) => {
-                write_packed64_tsv(counts.partition_entries(partition), self.k, writer)
+        self.write_tables(&mut writer, 1, |table, writer| match table {
+            OutputTable::Packed(counts, first, tables) => {
+                let mut slots = Vec::new();
+                (first..first + tables).try_for_each(|partition| {
+                    let entries = counts
+                        .sorted_partition(partition, &mut slots)
+                        .map(|(mixed, count)| (counts.unmix(mixed), count));
+                    write_packed64_tsv(entries, self.k, writer)
+                })
             }
             OutputTable::Map(Counts::Packed(_)) => unreachable!("packed tables are split"),
             OutputTable::Map(Counts::Packed128(counts)) => write_packed_tsv::<64, _>(
@@ -532,6 +502,67 @@ impl Counter {
                 )
         })
     }
+}
+
+/// Encode `items` pieces with `encode`, writing their bytes in order.
+///
+/// With more than one piece and thread, pieces are encoded concurrently on
+/// up to `threads` scoped threads. Each encoder streams bounded chunks
+/// through its own small queue, and the calling thread writes them in order,
+/// so buffered output stays proportional to the thread count (about 17 MiB
+/// per encoder) rather than the size of a piece.
+pub(crate) fn write_ordered(
+    threads: usize,
+    items: usize,
+    writer: &mut dyn Write,
+    encode: impl Fn(usize, &mut dyn Write) -> io::Result<()> + Sync,
+) -> io::Result<()> {
+    let threads = threads.min(items);
+    if threads <= 1 {
+        return (0..items).try_for_each(|item| encode(item, &mut *writer));
+    }
+    std::thread::scope(|scope| {
+        let (recycle, recycled) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let mut streams = Vec::with_capacity(threads);
+        for first in 0..threads {
+            // Each encoder may run this many chunks ahead of the writer;
+            // enough to buffer a typical piece while others are written.
+            let (sender, receiver) = crossbeam_channel::bounded(16);
+            streams.push(receiver);
+            let (encode, recycled) = (&encode, recycled.clone());
+            std::thread::Builder::new()
+                .name(format!("output-{first}"))
+                .spawn_scoped(scope, move || {
+                    // Encoder `first` owns pieces first, first + threads, ...
+                    for item in (first..items).step_by(threads) {
+                        let mut sink = ChunkSink {
+                            buffer: recycled.try_recv().unwrap_or_default(),
+                            sender: &sender,
+                            recycled: &recycled,
+                        };
+                        if let Err(error) = encode(item, &mut sink).and_then(|()| sink.finish()) {
+                            // Forward the encoder's own error; this fails
+                            // harmlessly if the writer already stopped.
+                            let _ = sender.send(Err(error));
+                            return;
+                        }
+                    }
+                })?;
+        }
+        drop(recycled);
+        for index in 0..items {
+            // Returning early drops every receiver, releasing blocked encoders.
+            while let Some(mut chunk) = streams[index % threads]
+                .recv()
+                .map_err(|_| io::Error::other("output encoder failed"))??
+            {
+                writer.write_all(&chunk)?;
+                chunk.clear();
+                let _ = recycle.send(chunk);
+            }
+        }
+        Ok(())
+    })
 }
 
 fn merge_counts<K: Eq + std::hash::Hash, S: std::hash::BuildHasher>(
@@ -1086,7 +1117,14 @@ mod tests {
                 }
                 let mut actual = Vec::new();
                 counter.write_tsv(&mut actual).unwrap();
-                assert_eq!(actual, expected, "k={k}, strand={strand:?}");
+                // The same rows; packed keys are written in hash order.
+                let rows = |tsv: &[u8]| {
+                    let mut rows: Vec<Vec<u8>> =
+                        tsv.split(|&b| b == b'\n').map(Vec::from).collect();
+                    rows.sort();
+                    rows
+                };
+                assert_eq!(rows(&actual), rows(&expected), "k={k}, strand={strand:?}");
             }
         }
     }

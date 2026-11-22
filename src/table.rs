@@ -790,6 +790,70 @@ impl CompactTable {
         self.len = 0;
     }
 
+    /// The remainder and count held by an occupied slot.
+    #[inline(always)]
+    fn entry(&self, slot: u64) -> (u64, u64) {
+        let remainder = slot >> self.layout.count_bits;
+        let small = slot & self.layout.count_marker();
+        let count = if small == self.layout.count_marker() {
+            self.overflow[&remainder]
+        } else {
+            small
+        };
+        (remainder, count)
+    }
+
+    /// Fill `slots` with the occupied slots in ascending order of their
+    /// remainders.
+    ///
+    /// The table is nearly in that order already: a key's home bucket rises
+    /// with its remainder, and a key sits in its home bucket or a little
+    /// after it. Each bucket is sorted by itself, without branches; what is
+    /// left out of place are the keys that spilled into a later bucket, a
+    /// few places from their own. Only keys that were turned away at the
+    /// end of the table are far from their place, at its start, and those
+    /// are set aside first.
+    pub(crate) fn sorted_slots(&self, slots: &mut Vec<u64>) {
+        slots.clear();
+        // Whole buckets are stored, of which only the occupied part counts.
+        slots.reserve(self.len + SLOTS);
+        let mut wrapped = Vec::new();
+        // A key that wrapped around passed only full buckets, so such keys
+        // are found before, or in, the first bucket with an empty slot.
+        let mut rest = self.buckets.iter().enumerate();
+        for (index, bucket) in rest.by_ref() {
+            for &slot in bucket.0.iter().take_while(|&&slot| slot != 0) {
+                if self.home(slot >> self.layout.count_bits) > index {
+                    wrapped.push(slot);
+                } else {
+                    slots.push(slot);
+                }
+            }
+            if bucket.0[SLOTS - 1] == 0 {
+                break;
+            }
+        }
+        let mut length = slots.len();
+        for (_, bucket) in rest {
+            // SAFETY: fewer than `self.len` slots have been stored, each an
+            // occupied one, and there is room for a bucket more than that.
+            // Empty slots are stored last and overwritten by the next
+            // bucket, or left beyond the final length.
+            unsafe {
+                let sorted = sort_bucket(&bucket.0);
+                slots
+                    .as_mut_ptr()
+                    .add(length)
+                    .cast::<[u64; SLOTS]>()
+                    .write_unaligned(sorted);
+                length += bucket.0.iter().filter(|&&slot| slot != 0).count();
+                slots.set_len(length);
+            }
+        }
+        slots.extend_from_slice(&wrapped);
+        sort_nearly_sorted(slots);
+    }
+
     /// Iterate over `(remainder, count)` pairs in bucket order.
     pub(crate) fn iter(&self) -> Entries<'_> {
         Entries {
@@ -815,6 +879,65 @@ impl CompactTable {
     }
 }
 
+/// A bucket's slots in ascending order, the empty (zero) ones last.
+///
+/// This is the smallest sorting network for eight values: nineteen
+/// exchanges, each a minimum and a maximum, with no branch on the data.
+#[inline(always)]
+fn sort_bucket(bucket: &[u64; SLOTS]) -> [u64; SLOTS] {
+    const EXCHANGES: [(usize, usize); 19] = [
+        (0, 1),
+        (2, 3),
+        (4, 5),
+        (6, 7),
+        (0, 2),
+        (1, 3),
+        (4, 6),
+        (5, 7),
+        (1, 2),
+        (5, 6),
+        (0, 4),
+        (3, 7),
+        (1, 5),
+        (2, 6),
+        (1, 4),
+        (3, 6),
+        (2, 4),
+        (3, 5),
+        (3, 4),
+    ];
+    // One less makes zero the largest value and keeps the order of the rest.
+    let mut values = bucket.map(|slot| slot.wrapping_sub(1));
+    for (low, high) in EXCHANGES {
+        let (a, b) = (values[low], values[high]);
+        values[low] = a.min(b);
+        values[high] = a.max(b);
+    }
+    values.map(|value| value.wrapping_add(1))
+}
+
+/// Sort values of which each is at most a few places from its own.
+///
+/// An insertion sort does that in time proportional to the distances moved.
+/// Should they add up to far more than expected, an ordinary sort finishes.
+fn sort_nearly_sorted(values: &mut [u64]) {
+    let mut allowance = 32 * values.len() + 1024;
+    for index in 1..values.len() {
+        let value = values[index];
+        let mut at = index;
+        while at > 0 && values[at - 1] > value {
+            values[at] = values[at - 1];
+            at -= 1;
+        }
+        values[at] = value;
+        let moved = index - at;
+        if moved > allowance {
+            return values.sort_unstable();
+        }
+        allowance -= moved;
+    }
+}
+
 /// Iterator over a table's `(remainder, count)` pairs in bucket order.
 pub(crate) struct Entries<'a> {
     buckets: std::slice::Iter<'a, Bucket>,
@@ -834,15 +957,7 @@ impl Iterator for Entries<'_> {
                 && slot != 0
             {
                 self.slots = rest;
-                let layout = self.table.layout;
-                let remainder = slot >> layout.count_bits;
-                let small = slot & layout.count_marker();
-                let count = if small == layout.count_marker() {
-                    self.table.overflow[&remainder]
-                } else {
-                    small
-                };
-                return Some((remainder, count));
+                return Some(self.table.entry(slot));
             }
             self.slots = &self.buckets.next()?.0;
         }
@@ -886,7 +1001,7 @@ impl PackedCounts {
             tables.push(table);
         }
         Ok(Self {
-            mixer: Mixer::new(bits, random_seed()),
+            mixer: Mixer::new(bits, SEED),
             layout,
             tables,
             scratch: Vec::new(),
@@ -960,6 +1075,29 @@ impl PackedCounts {
         self.tables[partition]
             .iter()
             .map(move |(remainder, count)| (self.key(partition, remainder), count))
+    }
+
+    /// One partition's `(mixed key, count)` pairs in ascending order of the
+    /// mixed key, which is also the order of partitions. `slots` is scratch
+    /// space.
+    pub(crate) fn sorted_partition<'a>(
+        &'a self,
+        partition: usize,
+        slots: &'a mut Vec<u64>,
+    ) -> impl Iterator<Item = (u64, u64)> + 'a {
+        let table = &self.tables[partition];
+        table.sorted_slots(slots);
+        let base = (partition as u64) << self.layout.remainder_bits;
+        slots.iter().map(move |&slot| {
+            let (remainder, count) = table.entry(slot);
+            (base | remainder, count)
+        })
+    }
+
+    /// Recover the key from its mixed key.
+    #[inline(always)]
+    pub(crate) fn unmix(&self, mixed: u64) -> u64 {
+        self.mixer.unmix(mixed)
     }
 
     /// Iterate over every `(key, count)` pair.
@@ -1123,11 +1261,10 @@ pub(crate) fn route(mixer: Mixer, layout: Layout, key: u64) -> (usize, u64) {
     )
 }
 
-/// A per-counter seed so table layouts are not predictable across runs.
-fn random_seed() -> u64 {
-    use std::hash::BuildHasher;
-    std::collections::hash_map::RandomState::new().hash_one(0x006b_626f_6c74_u64)
-}
+/// The seed of every counter's mixer. It is the same in every run, so that
+/// the order of mixed keys, in which tables are written out, is the same in
+/// every output of the same k-mers (see `crate::database`).
+pub(crate) const SEED: u64 = 0x6b62_6f6c_7420_7632;
 
 #[cfg(test)]
 mod tests {
@@ -1242,6 +1379,72 @@ mod tests {
             let actual: HashMap<_, _> = counts.entries().collect();
             assert_eq!(actual, expected, "k={k}");
         }
+    }
+
+    #[test]
+    fn sorted_partitions_ascend_through_growth_wrapping_and_large_counts() {
+        let mut state = 5_u64;
+        let mut random = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut slots = Vec::new();
+        for (k, partition_bits, keys) in [
+            (31, 10, 300_000),
+            (31, 2, 70_000),
+            (9, 3, 100_000),
+            (3, 1, 500),
+        ] {
+            let mut counts =
+                PackedCounts::with_capacity(k, partition_bits, 0, Load::Dense).unwrap();
+            let mask = u64::MAX >> (64 - key_bits(k));
+            let mut wrapped = 0;
+            for step in 0..keys {
+                // Counts beyond the slot's field now and then.
+                let delta = if step % 1000 == 0 { 1 << 20 } else { 1 };
+                counts.add_key(random() & mask, delta).unwrap();
+                // Small tables are checked at every size they pass through.
+                if step % 997 != 0 && step + 1 != keys {
+                    continue;
+                }
+                let mut expected: Vec<(u64, u64)> = counts
+                    .entries()
+                    .map(|(key, count)| (counts.mixer.mix(key), count))
+                    .collect();
+                expected.sort_unstable();
+                let mut actual = Vec::new();
+                for partition in 0..counts.tables.len() {
+                    let table = &counts.tables[partition];
+                    // Keys turned away at the table's end sit at its start.
+                    wrapped += table
+                        .iter()
+                        .take(8)
+                        .filter(|&(remainder, _)| table.home(remainder) + 1 == table.buckets())
+                        .count();
+                    actual.extend(counts.sorted_partition(partition, &mut slots));
+                }
+                assert!(actual == expected, "k={k} step={step}");
+            }
+            assert!(k == 3 || wrapped > 0, "k={k}: no table wrapped around");
+        }
+        // A bucket sorts whatever it holds, empty slots last.
+        for _ in 0..2000 {
+            let filled = (random() % 9) as usize;
+            let mut bucket = [0; SLOTS];
+            for slot in &mut bucket[..filled] {
+                *slot = random() | 1;
+            }
+            let mut expected = bucket[..filled].to_vec();
+            expected.sort_unstable();
+            expected.resize(SLOTS, 0);
+            assert_eq!(sort_bucket(&bucket).as_slice(), expected);
+        }
+        // Values far from their places still end up sorted.
+        let mut reversed: Vec<u64> = (0..5000).rev().collect();
+        sort_nearly_sorted(&mut reversed);
+        assert!(reversed.is_sorted());
     }
 
     #[test]

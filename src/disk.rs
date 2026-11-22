@@ -38,9 +38,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
+use crate::database::{self, KeyOrder};
 use crate::parallel::{ParallelCounter, ParallelInput};
 use crate::table::{Layout, Load, Mixer, PackedCounts};
-use crate::{ChunkSink, DNA_BASES, EncodedChunk, Error, StrandMode, database};
+use crate::{ChunkSink, DNA_BASES, EncodedChunk, Error, StrandMode};
 
 /// Bins the input is split into; a power of two.
 const BINS: usize = 512;
@@ -710,20 +711,21 @@ impl DiskCounts {
     }
 
     /// Count every bin and write a version-2 database (see
-    /// [`crate::database`]). The entry count is known only once every bin has
-    /// been counted, so the header is completed last and the writer must
-    /// seek. Returns the number of distinct k-mers. Does not flush; failures
+    /// [`crate::database`]), each bin in hash order. The entry count is
+    /// known only once every bin has been counted, so the header is
+    /// completed last and the writer must seek. Returns the number of distinct k-mers. Does not flush; failures
     /// may leave partial output.
     pub fn write_binary(self, mut writer: impl Write + Seek) -> io::Result<u64> {
         let (k, strand) = (self.k, self.strand);
         let start = writer.stream_position()?;
-        writer.write_all(&database::header(k, strand, 0))?;
+        let header = |entries| database::header(k, strand, KeyOrder::Hash, false, entries);
+        writer.write_all(&header(0))?;
         let distinct = self.count(&mut writer, |counts, writer| {
-            database::write_packed_sections(counts.entries(), k.div_ceil(4), writer)
+            database::write_hash_sections(counts, 0, counts.tables().len(), writer)
         })?;
         let end = writer.stream_position()?;
         writer.seek(SeekFrom::Start(start))?;
-        writer.write_all(&database::header(k, strand, distinct))?;
+        writer.write_all(&header(distinct))?;
         writer.seek(SeekFrom::Start(end))?;
         Ok(distinct)
     }

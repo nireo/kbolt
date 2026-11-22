@@ -1,21 +1,44 @@
 //! kbolt database format, version 2. All integers are little-endian.
 //!
 //! The 40-byte header is: magic `KBOLTDB\0` (8 bytes), version (u16, 2),
-//! flags (u8: bit 0 = canonical), key order (u8, 0 = none), reserved zeros
-//! (4 bytes), k (u64), the number of distinct entries (u64), and a reserved
-//! zero (u64). Unknown versions, flags, orders, or reserved bytes are
-//! rejected.
+//! flags (u8: bit 0 = canonical, bit 1 = sections ascend), key order (u8, see
+//! below), reserved zeros (4 bytes), k (u64), the number of distinct entries
+//! (u64), and the seed of the hash (u64, zero unless keys are in hash order).
+//! Unknown versions, flags, orders, or reserved bytes are rejected.
 //!
-//! Records follow in sections, in unspecified order, with no index. A section
-//! is its number of records (u32, at least one), the number of bytes they
-//! take (u32), and the records. A reader can take a section whole, or skip
-//! it, without decoding it; a writer closes a section after about 32 KiB.
+//! Records follow in sections, with no index. A section is its number of
+//! records (u32, at least one), the number of bytes they take (u32), and the
+//! records. A reader can take a section whole, or skip it, without decoding
+//! it; a writer closes a section after about 32 KiB.
 //!
-//! Each record contains ceil(k/4) key bytes and a count. The key is a
-//! little-endian base-4 integer: A=0, C=1, G=2, T=3, with the first DNA base
-//! most significant and unused high bits zero. The count is positive and
-//! stored as a varint, in one byte when below 128, as nearly all counts of a
-//! read set are.
+//! A record is a key and a count. The count is positive and stored as a
+//! varint, in one byte when below 128, as nearly all counts of a read set
+//! are. How the key is stored depends on the key order:
+//!
+//! - **0, none**: ceil(k/4) key bytes, in unspecified order. The key is a
+//!   little-endian base-4 integer: A=0, C=1, G=2, T=3, with the first DNA
+//!   base most significant and unused high bits zero. Used for k > 32.
+//! - **1, hash** (k <= 32): the records of a section ascend by the hash of
+//!   their key, and each stores, as a varint, its hash less that of the
+//!   record before it (the first of a section, its hash). The hash is a
+//!   permutation of the 2k-bit keys, so the key is recovered from it and
+//!   never stored; consecutive hashes of many keys differ by little, which
+//!   takes about five bytes where a key takes eight.
+//!
+//! With `sections ascend` set, every section also continues where the one
+//! before it ended, so that the whole database is in key order. kbolt writes
+//! its in-memory counts so, split at fixed hash boundaries: the same k-mers
+//! then always give the same bytes, whatever the number of threads. A
+//! database counted on disk (see `crate::disk`) holds one run of ascending
+//! sections per part of its input, without the flag.
+//!
+//! The hash of a key of `b = 2k` bits, with `s = ceil(b / 2)` and all
+//! arithmetic modulo 2^b, is:
+//!
+//! ```text
+//! x = key ^ seed;  x ^= x >> s;  x *= 0xbf58476d1ce4e5b9;
+//! x ^= x >> s;     x *= 0x94d049bb133111eb;  hash = x ^ (x >> s)
+//! ```
 //!
 //! A varint of `n` bytes, up to eight, holds a value below 2^(7n): the value
 //! is shifted left by `n` bits, bit `n - 1` is set and the bits below it are
@@ -29,7 +52,8 @@
 //! every bit flip.
 //!
 //! Version 1 is still read. Its header is the first 32 bytes of the above,
-//! and its records follow without sections, each with its count as a u64.
+//! and its records follow without sections, each with its key bytes and its
+//! count as a u64.
 //!
 //! [`DatabaseReader`] streams entries with reusable buffers. It validates the
 //! header, records, and end of stream, but does not track duplicate keys.
@@ -39,6 +63,7 @@
 
 use std::io::{self, Read, Write};
 
+use crate::table::{self, Mixer, PackedCounts};
 use crate::{Counter, Counts, OutputTable, StrandMode, format_count};
 
 const MAGIC: &[u8; 8] = b"KBOLTDB\0";
@@ -110,6 +135,8 @@ pub(crate) struct SectionWriter<'a, W: Write + ?Sized> {
     /// The open section: room for its two counts, then its records.
     section: Vec<u8>,
     records: u32,
+    /// The value of the section's last record, if records hold differences.
+    previous: u64,
 }
 
 impl<'a, W: Write + ?Sized> SectionWriter<'a, W> {
@@ -118,7 +145,19 @@ impl<'a, W: Write + ?Sized> SectionWriter<'a, W> {
             writer,
             section: vec![0; 8],
             records: 0,
+            previous: 0,
         }
+    }
+
+    /// Add a record whose key is given by `value`, greater than that of the
+    /// record before it, and stored as the difference.
+    #[inline(always)]
+    pub(crate) fn ascending(&mut self, value: u64, count: u64) -> io::Result<()> {
+        debug_assert!(self.records == 0 || value > self.previous);
+        put_varint(&mut self.section, value - self.previous);
+        self.previous = value;
+        put_varint(&mut self.section, count);
+        self.added()
     }
 
     /// Add a record with its key as stored bytes.
@@ -149,7 +188,7 @@ impl<'a, W: Write + ?Sized> SectionWriter<'a, W> {
         self.section[4..8].copy_from_slice(&bytes.to_le_bytes());
         self.writer.write_all(&self.section)?;
         self.section.truncate(8);
-        self.records = 0;
+        (self.records, self.previous) = (0, 0);
         Ok(())
     }
 
@@ -159,17 +198,32 @@ impl<'a, W: Write + ?Sized> SectionWriter<'a, W> {
     }
 }
 
-/// Write the entries of packed keys (k <= 32) as sections.
-pub(crate) fn write_packed_sections(
-    entries: impl Iterator<Item = (u64, u64)>,
-    key_bytes: usize,
+/// Write `tables` consecutive partitions of packed keys (k <= 32), from
+/// `first` on, as sections in hash order.
+pub(crate) fn write_hash_sections(
+    counts: &PackedCounts,
+    first: usize,
+    tables: usize,
     writer: &mut (impl Write + ?Sized),
 ) -> io::Result<()> {
     let mut sections = SectionWriter::new(writer);
-    for (key, count) in entries {
-        sections.raw(&key.to_le_bytes()[..key_bytes], count)?;
+    let mut slots = Vec::new();
+    for partition in first..first + tables {
+        for (mixed, count) in counts.sorted_partition(partition, &mut slots) {
+            sections.ascending(mixed, count)?;
+        }
     }
     sections.finish()
+}
+
+/// How the records of a database are ordered, and with that how their keys
+/// are stored; see the [module documentation](self).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyOrder {
+    /// No order; keys are stored whole.
+    Unordered,
+    /// Within a section, by the hash of the key (k <= 32).
+    Hash,
 }
 
 /// Metadata describing a kbolt count database.
@@ -178,6 +232,11 @@ pub struct DatabaseHeader {
     pub k: usize,
     pub strand: StrandMode,
     pub entries: u64,
+    /// The order of records within a section.
+    pub order: KeyOrder,
+    /// Whether the sections follow each other in that order too, so that
+    /// the whole database is sorted.
+    pub ascending: bool,
 }
 
 /// A streaming database reader. Memory use is proportional to k, not entry count.
@@ -192,6 +251,11 @@ pub struct DatabaseReader<R> {
     section: Vec<u8>,
     position: usize,
     section_records: u32,
+    /// For keys in hash order: the hash, and the last hash read (of the
+    /// section, then of the section before it).
+    mixer: Mixer,
+    previous: u64,
+    last: Option<u64>,
     sequence: Vec<u8>,
     finished: bool,
 }
@@ -211,7 +275,17 @@ impl<R: Read> DatabaseReader<R> {
         if version > 1 {
             reader.read_exact(&mut bytes[HEADER_BYTES_V1..])?;
         }
-        if bytes[10] > 1 || bytes[11..16] != [0; 5] || bytes[HEADER_BYTES_V1..] != [0; 8] {
+        let order = match bytes[11] {
+            0 => KeyOrder::Unordered,
+            1 if version > 1 => KeyOrder::Hash,
+            _ => return Err(invalid("unsupported database key order")),
+        };
+        let seed = u64::from_le_bytes(bytes[HEADER_BYTES_V1..].try_into().unwrap());
+        let flags = if version == 1 { 1 } else { 3 };
+        if bytes[10] & !flags != 0
+            || bytes[12..16] != [0; 4]
+            || (order == KeyOrder::Unordered && (seed != 0 || bytes[10] & 2 != 0))
+        {
             return Err(invalid("unsupported database flags or reserved bytes"));
         }
         let k = usize::try_from(u64::from_le_bytes(bytes[16..24].try_into().unwrap()))
@@ -219,24 +293,35 @@ impl<R: Read> DatabaseReader<R> {
         if k == 0 {
             return Err(invalid("database k must be greater than zero"));
         }
+        if order == KeyOrder::Hash && k > 32 {
+            return Err(invalid("database keys in hash order need k <= 32"));
+        }
         let entries = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
         let key_bytes = k.div_ceil(4);
         let size = key_bytes
             .checked_add(8)
             .ok_or_else(|| invalid("database record size overflow"))?;
         // Check the declared payload size without reserving the entry count.
-        // (A version-2 record takes at least one byte beyond its key.)
+        // (A version-2 record takes at least one byte beyond its key, which
+        // takes at least one itself.)
+        let least = match (version, order) {
+            (1, _) => size,
+            (_, KeyOrder::Unordered) => key_bytes + 1,
+            (_, KeyOrder::Hash) => 2,
+        };
         entries
-            .checked_mul(if version == 1 { size } else { key_bytes + 1 } as u64)
+            .checked_mul(least as u64)
             .ok_or_else(|| invalid("database payload size overflow"))?;
         let header = DatabaseHeader {
             k,
-            strand: if bytes[10] == 1 {
+            strand: if bytes[10] & 1 == 1 {
                 StrandMode::Canonical
             } else {
                 StrandMode::Forward
             },
             entries,
+            order,
+            ascending: bytes[10] & 2 != 0,
         };
         Ok(Self {
             reader,
@@ -251,6 +336,10 @@ impl<R: Read> DatabaseReader<R> {
             section: Vec::new(),
             position: 0,
             section_records: 0,
+            // (Only used, and only meaningful, for keys in hash order.)
+            mixer: Mixer::new(table::key_bits(k.min(32)), seed),
+            previous: 0,
+            last: None,
             sequence: if entries == 0 { Vec::new() } else { buffer(k)? },
             finished: false,
         })
@@ -282,6 +371,38 @@ impl<R: Read> DatabaseReader<R> {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
         (self.position, self.section_records) = (0, records);
+        // A new section starts from zero; the last value of the section
+        // before it is kept to check that sections ascend.
+        let later = self.remaining < self.header.entries;
+        self.last = (self.header.ascending && later).then_some(self.previous);
+        self.previous = 0;
+        Ok(())
+    }
+
+    /// Read the key of the next record of a section in hash order into
+    /// `record`, as its key bytes.
+    fn next_hashed(&mut self, first: bool) -> io::Result<()> {
+        let difference = get_varint(&self.section, &mut self.position)
+            .ok_or_else(|| invalid("invalid key in database section"))?;
+        let mixed = self
+            .previous
+            .checked_add(difference)
+            .filter(|&mixed| mixed >> 1 >> (table::key_bits(self.header.k) - 1) == 0)
+            .ok_or_else(|| invalid("database key beyond its length"))?;
+        // Within a section every record ascends; across sections only if
+        // the header says so.
+        let ascends = match (first, self.last) {
+            (false, _) => difference > 0,
+            (true, Some(last)) => mixed > last,
+            (true, None) => true,
+        };
+        if !ascends {
+            return Err(invalid("database keys out of order"));
+        }
+        self.previous = mixed;
+        let key_bytes = self.record.len() - 8;
+        let key = self.mixer.unmix(mixed).to_le_bytes();
+        self.record[..key_bytes].copy_from_slice(&key[..key_bytes]);
         Ok(())
     }
 
@@ -311,16 +432,21 @@ impl<R: Read> DatabaseReader<R> {
             self.reader.read_exact(&mut self.record)?;
             u64::from_le_bytes(self.record[key_bytes..].try_into().unwrap())
         } else {
-            if self.section_records == 0 {
+            let first = self.section_records == 0;
+            if first {
                 self.next_section()?;
             }
             self.section_records -= 1;
-            let key = self
-                .section
-                .get(self.position..self.position + key_bytes)
-                .ok_or_else(|| invalid("database section shorter than its records"))?;
-            self.record[..key_bytes].copy_from_slice(key);
-            self.position += key_bytes;
+            if self.header.order == KeyOrder::Hash {
+                self.next_hashed(first)?;
+            } else {
+                let key = self
+                    .section
+                    .get(self.position..self.position + key_bytes)
+                    .ok_or_else(|| invalid("database section shorter than its records"))?;
+                self.record[..key_bytes].copy_from_slice(key);
+                self.position += key_bytes;
+            }
             get_varint(&self.section, &mut self.position)
                 .ok_or_else(|| invalid("invalid count in database section"))?
         };
@@ -364,17 +490,25 @@ impl<R: Read> DatabaseReader<R> {
 
 impl Counter {
     /// Write a version-2 database with exact counts and no per-entry allocation.
-    /// Output is unsorted. Does not flush; write failures may leave partial output.
+    /// For k <= 32 it is in hash order throughout, and the same k-mers and
+    /// counts always give the same bytes; otherwise it is unordered. Does not
+    /// flush; write failures may leave partial output.
     pub fn write_binary(&self, mut writer: impl Write) -> io::Result<()> {
-        writer.write_all(&header(self.k, self.strand, self.len() as u64))?;
+        let (order, unit) = match &self.counts {
+            Counts::Packed(counts) => (KeyOrder::Hash, self.serial_partition(counts)),
+            _ => (KeyOrder::Unordered, 1),
+        };
+        let ascending = order == KeyOrder::Hash;
+        let entries = self.len() as u64;
+        writer.write_all(&header(self.k, self.strand, order, ascending, entries))?;
         if self.is_empty() {
             return Ok(());
         }
         let key_bytes = self.k.div_ceil(4);
         // Partitions encode independently; see `Counter::write_tables`.
-        self.write_tables(&mut writer, |table, writer| match table {
-            OutputTable::Packed(counts, partition) => {
-                write_packed_sections(counts.partition_entries(partition), key_bytes, writer)
+        self.write_tables(&mut writer, unit, |table, writer| match table {
+            OutputTable::Packed(counts, first, tables) => {
+                write_hash_sections(counts, first, tables, writer)
             }
             OutputTable::Map(Counts::Packed(_)) => unreachable!("packed tables are split"),
             OutputTable::Map(Counts::Packed128(counts)) => {
@@ -440,14 +574,28 @@ impl Counter {
     }
 }
 
-/// The header of a database with `entries` records.
-pub(crate) fn header(k: usize, strand: StrandMode, entries: u64) -> [u8; HEADER_BYTES] {
+/// The header of a database with `entries` records in `order`, whose
+/// sections follow each other in that order too if `ascending`.
+pub(crate) fn header(
+    k: usize,
+    strand: StrandMode,
+    order: KeyOrder,
+    ascending: bool,
+    entries: u64,
+) -> [u8; HEADER_BYTES] {
     let mut header = [0; HEADER_BYTES];
     header[..8].copy_from_slice(MAGIC);
     header[8..10].copy_from_slice(&VERSION.to_le_bytes());
-    header[10] = u8::from(strand == StrandMode::Canonical);
+    header[10] = u8::from(strand == StrandMode::Canonical) | u8::from(ascending) << 1;
+    header[11] = match order {
+        KeyOrder::Unordered => 0,
+        KeyOrder::Hash => 1,
+    };
     header[16..24].copy_from_slice(&(k as u64).to_le_bytes());
     header[24..32].copy_from_slice(&entries.to_le_bytes());
+    if order == KeyOrder::Hash {
+        header[32..].copy_from_slice(&table::SEED.to_le_bytes());
+    }
     header
 }
 
@@ -466,11 +614,32 @@ mod tests {
         bytes
     }
 
-    /// The header of a version-2 database.
+    /// The header of a version-2 database with whole, unordered keys.
     fn header2(k: u64, entries: u64, canonical: bool) -> Vec<u8> {
         let mut bytes = fixture(k, entries, canonical);
         bytes[8] = 2;
         bytes.extend_from_slice(&[0; 8]);
+        bytes
+    }
+
+    /// The header kbolt writes for `k`: in hash order throughout for k <= 32.
+    fn written_header(k: u64, entries: u64, canonical: bool) -> Vec<u8> {
+        let mut bytes = header2(k, entries, canonical);
+        if k <= 32 {
+            bytes[10] |= 2;
+            bytes[11] = 1;
+            bytes[32..].copy_from_slice(&table::SEED.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// The hash of a packed key, as a varint.
+    fn hashed(k: usize, key: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        put_varint(
+            &mut bytes,
+            Mixer::new(table::key_bits(k), table::SEED).mix(key),
+        );
         bytes
     }
 
@@ -484,21 +653,179 @@ mod tests {
 
     #[test]
     fn matches_documented_wire_format() {
-        for (sequence, packed) in [
-            (b"ACG".as_slice(), vec![0x06]),
-            (b"TACGT".as_slice(), vec![0x1b, 0x03]),
-        ] {
-            let mut counter = Counter::new(sequence.len(), StrandMode::Forward).unwrap();
-            counter.add_record(sequence).unwrap();
-            let mut actual = Vec::new();
-            counter.write_binary(&mut actual).unwrap();
-            let mut expected = header2(sequence.len() as u64, 1, false);
-            // One record: the key, then a count of one as a one-byte varint.
-            let mut record = packed;
-            record.push(0b11);
-            expected.extend(section(1, &record));
-            assert_eq!(actual, expected);
+        // The hash of the documentation, written out for six bits.
+        let hash = |key: u64| {
+            let mut x = key ^ (table::SEED & 63);
+            x ^= x >> 3;
+            x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9) & 63;
+            x ^= x >> 3;
+            x = x.wrapping_mul(0x94d0_49bb_1331_11eb) & 63;
+            x ^ (x >> 3)
+        };
+        // ACG = 0b000110 and CGT = 0b011011, seen once and 300 times.
+        let mut counter = Counter::new(3, StrandMode::Forward).unwrap();
+        counter.add_record(b"ACG").unwrap();
+        for _ in 0..300 {
+            counter.add_record(b"CGT").unwrap();
         }
+        let mut actual = Vec::new();
+        counter.write_binary(&mut actual).unwrap();
+        let mut records = [
+            (hash(0b000110), vec![0b11]),
+            (hash(0b011011), vec![0xb2, 0x04]),
+        ];
+        records.sort();
+        let mut expected = written_header(3, 2, false);
+        // Each hash is below 64, so a one-byte varint: itself in its own
+        // section, as these keys fall in different partitions.
+        for (hash, count) in records {
+            let mut record = vec![(hash << 1 | 1) as u8];
+            record.extend(count);
+            expected.extend(section(1, &record));
+        }
+        assert_eq!(actual, expected);
+
+        // Longer keys are stored whole, the first base most significant.
+        let sequence = [b"T".as_slice(), &[b'A'; 32], b"CG"].concat();
+        let mut counter = Counter::new(35, StrandMode::Forward).unwrap();
+        counter.add_record(&sequence).unwrap();
+        let mut actual = Vec::new();
+        counter.write_binary(&mut actual).unwrap();
+        let mut expected = header2(35, 1, false);
+        expected.extend(section(1, &[0x06, 0, 0, 0, 0, 0, 0, 0, 0x30, 0b11]));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn packed_databases_are_in_hash_order_and_the_same_for_any_partitioning() {
+        let mut state = 7_u64;
+        let sequence: Vec<u8> = (0..60_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                b"ACGT"[(state & 3) as usize]
+            })
+            .collect();
+        for k in [1, 5, 16, 31, 32] {
+            for strand in [StrandMode::Forward, StrandMode::Canonical] {
+                let mut serial = Counter::new(k, strand).unwrap();
+                serial.add_record(&sequence).unwrap();
+                let mut expected = Vec::new();
+                serial.write_binary(&mut expected).unwrap();
+                // Hashes ascend from the first record to the last.
+                let mixer = Mixer::new(table::key_bits(k), table::SEED);
+                let mut reader = DatabaseReader::new(expected.as_slice()).unwrap();
+                let header = reader.header();
+                assert_eq!((header.order, header.ascending), (KeyOrder::Hash, true));
+                let mut previous = None;
+                while reader.next_entry().unwrap().is_some() {
+                    let size = k.div_ceil(4);
+                    let mut key = [0; 8];
+                    key[..size].copy_from_slice(&reader.record[..size]);
+                    let mixed = mixer.mix(u64::from_le_bytes(key));
+                    assert!(previous < Some(mixed), "k={k}");
+                    previous = Some(mixed);
+                }
+                // Counting on several threads partitions the keys more
+                // finely, which must not show in the output.
+                for threads in [2, 5] {
+                    let mut parallel = crate::ParallelCounter::new(k, strand, threads).unwrap();
+                    for part in sequence.chunks(7_001) {
+                        parallel.add_sequence(part).unwrap();
+                    }
+                    let parallel = parallel.finish().unwrap();
+                    let mut actual = Vec::new();
+                    parallel.write_binary(&mut actual).unwrap();
+                    assert!(actual == expected, "k={k} threads={threads}");
+                    let (mut serial_tsv, mut parallel_tsv) = (Vec::new(), Vec::new());
+                    serial.write_tsv(&mut serial_tsv).unwrap();
+                    parallel.write_tsv(&mut parallel_tsv).unwrap();
+                    assert!(serial_tsv == parallel_tsv, "k={k} threads={threads}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_hashed_keys_out_of_order_or_beyond_their_length() {
+        let read = |bytes: &[u8]| -> io::Result<usize> {
+            let mut reader = DatabaseReader::new(bytes)?;
+            let mut entries = 0;
+            while reader.next_entry()?.is_some() {
+                entries += 1;
+            }
+            Ok(entries)
+        };
+        // k = 3: hashes below 64. Records are (difference, count) varints.
+        let one = |value: u8| value << 1 | 1;
+        let with = |ascending: bool, sections: &[Vec<u8>], entries: u64| {
+            let mut bytes = written_header(3, entries, false);
+            bytes[10] = u8::from(ascending) << 1;
+            bytes.extend(sections.concat());
+            bytes
+        };
+        let valid = with(
+            true,
+            &[
+                section(2, &[one(5), one(1), one(4), one(1)]),
+                section(1, &[one(10), one(1)]),
+            ],
+            3,
+        );
+        assert_eq!(read(&valid).unwrap(), 3);
+        for (name, bytes) in [
+            (
+                "repeated key",
+                with(true, &[section(2, &[one(5), one(1), one(0), one(1)])], 2),
+            ),
+            (
+                "key of seven bits",
+                with(true, &[section(1, &[one(64), one(1)])], 1),
+            ),
+            (
+                "sum of seven bits",
+                with(true, &[section(2, &[one(60), one(1), one(4), one(1)])], 2),
+            ),
+            (
+                "second section starts below the first's end",
+                with(
+                    true,
+                    &[section(1, &[one(9), one(1)]), section(1, &[one(9), one(1)])],
+                    2,
+                ),
+            ),
+            ("hash order beyond k = 32", {
+                let mut bytes = with(false, &[section(1, &[one(9), one(1)])], 1);
+                bytes[16] = 33;
+                bytes
+            }),
+            ("hash order in version 1", {
+                let mut bytes = fixture(3, 1, false);
+                bytes[11] = 1;
+                bytes.extend_from_slice(&[6, 1, 0, 0, 0, 0, 0, 0, 0]);
+                bytes
+            }),
+        ] {
+            assert!(read(&bytes).is_err(), "{name}");
+        }
+        // Without the flag, sections need not follow each other in order.
+        let unordered = with(
+            false,
+            &[section(1, &[one(9), one(1)]), section(1, &[one(3), one(1)])],
+            2,
+        );
+        assert_eq!(read(&unordered).unwrap(), 2);
+        // A first hash of zero is a key like any other.
+        assert_eq!(
+            read(&with(
+                true,
+                &[section(2, &[one(0), one(1), one(1), one(1)])],
+                2
+            ))
+            .unwrap(),
+            2
+        );
     }
 
     #[test]
@@ -645,7 +972,13 @@ mod tests {
                     DatabaseHeader {
                         k,
                         strand,
-                        entries: counter.len() as u64
+                        entries: counter.len() as u64,
+                        order: if k <= 32 {
+                            KeyOrder::Hash
+                        } else {
+                            KeyOrder::Unordered
+                        },
+                        ascending: k <= 32,
                     }
                 );
                 let mut streamed = HashMap::new();
@@ -693,7 +1026,14 @@ mod tests {
                 }
                 let mut actual = Vec::new();
                 counter.write_tsv(&mut actual).unwrap();
-                assert_eq!(actual, expected);
+                // The same rows; packed keys are written in hash order.
+                let rows = |tsv: &[u8]| {
+                    let mut rows: Vec<Vec<u8>> =
+                        tsv.split(|&b| b == b'\n').map(Vec::from).collect();
+                    rows.sort();
+                    rows
+                };
+                assert_eq!(rows(&actual), rows(&expected));
                 let mut binary = Vec::new();
                 counter.write_binary(&mut binary).unwrap();
                 assert!(binary.len() > 2 * SECTION_BYTES);
@@ -702,7 +1042,7 @@ mod tests {
                     .unwrap()
                     .write_tsv(&mut dumped)
                     .unwrap();
-                assert_eq!(dumped, expected);
+                assert_eq!(dumped, actual);
                 let loaded = Counter::read_binary(binary.as_slice()).unwrap();
                 assert_eq!(
                     loaded.counts().collect::<HashMap<_, _>>(),
@@ -720,14 +1060,19 @@ mod tests {
             counter.counts.set_counts(u64::MAX);
             let mut bytes = Vec::new();
             counter.write_binary(&mut bytes).unwrap();
-            let mut record: Vec<u8> = std::iter::repeat_n(0xff, k / 4).collect();
-            if k % 4 != 0 {
-                record.push((1 << (2 * (k % 4))) - 1);
-            }
+            let mut record: Vec<u8> = if k <= 32 {
+                hashed(k, u64::MAX >> (64 - 2 * k))
+            } else {
+                let mut key: Vec<u8> = std::iter::repeat_n(0xff, k / 4).collect();
+                if k % 4 != 0 {
+                    key.push((1 << (2 * (k % 4))) - 1);
+                }
+                key
+            };
             // The largest count: a zero byte, then all eight of its bytes.
             record.push(0);
             record.extend_from_slice(&u64::MAX.to_le_bytes());
-            let mut expected = header2(k as u64, 1, false);
+            let mut expected = written_header(k as u64, 1, false);
             expected.extend(section(1, &record));
             assert_eq!(bytes, expected);
             let loaded = Counter::read_binary(bytes.as_slice()).unwrap();
@@ -744,7 +1089,7 @@ mod tests {
             let counter = Counter::new(k, StrandMode::Canonical).unwrap();
             let mut bytes = Vec::new();
             counter.write_binary(&mut bytes).unwrap();
-            assert_eq!(bytes, header2(k as u64, 0, true));
+            assert_eq!(bytes, written_header(k as u64, 0, true));
             assert!(Counter::read_binary(bytes.as_slice()).unwrap().is_empty());
         }
     }

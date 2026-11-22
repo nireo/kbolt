@@ -636,6 +636,75 @@ fn gzip_input_errors_are_reported_while_the_pipe_stays_open() {
     assert!(stderr.contains("line 2: invalid sequence byte"), "{stderr}");
 }
 
+/// The rows of a successful run, in the order they were written.
+fn rows(output: &Output) -> Vec<(String, u64)> {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout.clone())
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let (key, count) = line.split_once('\t').unwrap();
+            (key.to_owned(), count.parse().unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn sorted_output_is_alphabetical_in_memory_and_on_disk() {
+    let temp = TempDir::new();
+    let scratch = temp.0.join("scratch");
+    fs::create_dir(&scratch).unwrap();
+    let scratch = scratch.to_str().unwrap();
+    // Reads with repeats, invalid bases and lowercase.
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut reads = Vec::new();
+    for _ in 0..600 {
+        reads.extend_from_slice(b">r\n");
+        for _ in 0..120 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            reads.push(b"ACGTACGTacgtN"[(state % 13) as usize]);
+        }
+        reads.push(b'\n');
+    }
+    let input = temp.file("reads.fa", &reads);
+    let database = temp.0.join("sorted.kbolt");
+    let database = database.to_str().unwrap();
+    for k in ["1", "4", "13", "31", "32", "40", "70"] {
+        for strand in [&[][..], &["--forward"]] {
+            let common = [&["count", "-k", k], strand, &[&input]].concat();
+            // A map lists its keys in order: the rows expected, and theirs.
+            let expected: Vec<(String, u64)> = table(&run(&common, b"")).into_iter().collect();
+            assert!(!expected.is_empty());
+            let wide = k.parse::<usize>().unwrap() > 32;
+            for mode in [
+                &["-t", "1"][..],
+                &["-t", "3"],
+                &["-t", "3", "--memory", "64M", "--temp-dir", scratch],
+            ] {
+                // Counting on disk is for k <= 32.
+                if wide && mode.len() > 2 {
+                    continue;
+                }
+                let sorted = [&common[..], mode, &["--sorted"]].concat();
+                assert!(rows(&run(&sorted, b"")) == expected, "k={k} {mode:?}");
+                let binary = [&sorted[..], &["--format", "binary", "-o", database]].concat();
+                assert!(run(&binary, b"").status.success(), "k={k} {mode:?}");
+                assert!(
+                    rows(&run(&["dump", database], b"")) == expected,
+                    "k={k} {mode:?} binary"
+                );
+            }
+        }
+    }
+    assert_eq!(fs::read_dir(scratch).unwrap().count(), 0);
+}
+
 #[test]
 fn memory_limit_counts_on_disk_with_the_same_results() {
     let temp = TempDir::new();

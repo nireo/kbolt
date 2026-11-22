@@ -71,6 +71,11 @@ struct CountArgs {
     /// Directory for the temporary file of --memory [default: the system's]
     #[arg(long, value_name = "DIR", requires = "memory")]
     temp_dir: Option<PathBuf>,
+    /// Write k-mers in alphabetical order. Sorting takes one more pass over
+    /// the distinct k-mers: a second copy of them in memory, or with
+    /// --memory a second temporary file of 16 bytes each
+    #[arg(long)]
+    sorted: bool,
     /// Print counting, merge, and output wall times on stderr
     #[arg(long)]
     timings: bool,
@@ -539,6 +544,7 @@ fn count_inputs(args: CountArgs) -> io::Result<()> {
         readers,
         memory,
         temp_dir,
+        sorted,
         timings,
         format,
         output,
@@ -577,7 +583,8 @@ fn count_inputs(args: CountArgs) -> io::Result<()> {
         // The reader threads are done; give their cores to counting.
         let bins = counter
             .finish()?
-            .with_threads(threads + readers.min(inputs.len()));
+            .with_threads(threads + readers.min(inputs.len()))
+            .sorted(sorted);
         let splitting = started.elapsed();
         let (kmers, temporary) = (bins.kmers(), bins.temporary_bytes());
         let distinct = match format {
@@ -666,9 +673,11 @@ fn count_inputs(args: CountArgs) -> io::Result<()> {
     }
     let output_started = Instant::now();
     let mut writer = output_writer(&output)?;
-    match format {
-        OutputFormat::Tsv => counter.write_tsv(&mut writer)?,
-        OutputFormat::Binary => counter.write_binary(&mut writer)?,
+    match (format, sorted) {
+        (OutputFormat::Tsv, false) => counter.write_tsv(&mut writer)?,
+        (OutputFormat::Tsv, true) => counter.write_tsv_sorted(&mut writer)?,
+        (OutputFormat::Binary, false) => counter.write_binary(&mut writer)?,
+        (OutputFormat::Binary, true) => counter.write_binary_sorted(&mut writer)?,
     }
     writer.flush()?;
     if timings {

@@ -24,13 +24,18 @@
 //!   permutation of the 2k-bit keys, so the key is recovered from it and
 //!   never stored; consecutive hashes of many keys differ by little, which
 //!   takes about five bytes where a key takes eight.
+//! - **2, k-mer**: the records of a section ascend by k-mer (A < C < G < T),
+//!   which is the order of the keys as integers. For k <= 32 each stores, as
+//!   a varint, its key less that of the record before it (the first of a
+//!   section, its key); for longer k-mers, its key bytes as under order 0.
 //!
 //! With `sections ascend` set, every section also continues where the one
-//! before it ended, so that the whole database is in key order. kbolt writes
-//! its in-memory counts so, split at fixed hash boundaries: the same k-mers
-//! then always give the same bytes, whatever the number of threads. A
-//! database counted on disk (see `crate::disk`) holds one run of ascending
-//! sections per part of its input, without the flag.
+//! before it ended, so that the whole database is in order. kbolt writes its
+//! in-memory counts in hash order so, split at fixed hash boundaries: the
+//! same k-mers then always give the same bytes, whatever the number of
+//! threads. A database counted on disk (see `crate::disk`) holds one run of
+//! ascending sections per part of its input, without the flag. Databases in
+//! k-mer order (see `crate::sorted`) always have it.
 //!
 //! The hash of a key of `b = 2k` bits, with `s = ceil(b / 2)` and all
 //! arithmetic modulo 2^b, is:
@@ -219,6 +224,8 @@ pub enum KeyOrder {
     Unordered,
     /// Within a section, by the hash of the key (k <= 32).
     Hash,
+    /// Within a section, by k-mer: A < C < G < T.
+    Kmer,
 }
 
 /// Metadata describing a kbolt count database.
@@ -245,11 +252,16 @@ pub struct DatabaseReader<R> {
     section: Vec<u8>,
     position: usize,
     section_records: u32,
-    /// For keys in hash order: the hash, and the last hash read (of the
-    /// section, then of the section before it).
+    /// For keys stored as differences: the hash, if they are in hash order,
+    /// and the last value read (of the section, then of the section before
+    /// it).
     mixer: Mixer,
     previous: u64,
     last: Option<u64>,
+    /// For whole keys in k-mer order: the k-mer before the current one, if
+    /// the current one has to follow it.
+    before: Vec<u8>,
+    follows: bool,
     sequence: Vec<u8>,
     finished: bool,
 }
@@ -271,12 +283,14 @@ impl<R: Read> DatabaseReader<R> {
         let order = match bytes[11] {
             0 => KeyOrder::Unordered,
             1 => KeyOrder::Hash,
+            2 => KeyOrder::Kmer,
             _ => return Err(invalid("unsupported database key order")),
         };
         let seed = u64::from_le_bytes(bytes[32..].try_into().unwrap());
         if bytes[10] > 3
             || bytes[12..16] != [0; 4]
-            || (order == KeyOrder::Unordered && (seed != 0 || bytes[10] & 2 != 0))
+            || (order != KeyOrder::Hash && seed != 0)
+            || (order == KeyOrder::Unordered && bytes[10] & 2 != 0)
         {
             return Err(invalid("unsupported database flags or reserved bytes"));
         }
@@ -293,9 +307,10 @@ impl<R: Read> DatabaseReader<R> {
         // Check the declared payload size without reserving the entry count.
         // A count takes at least one byte, as does a key stored as a
         // difference.
-        let least = match order {
-            KeyOrder::Unordered => key_bytes + 1,
-            KeyOrder::Hash => 2,
+        let least = if order != KeyOrder::Unordered && k <= 32 {
+            2
+        } else {
+            key_bytes + 1
         };
         entries
             .checked_mul(least as u64)
@@ -327,6 +342,12 @@ impl<R: Read> DatabaseReader<R> {
             mixer: Mixer::new(table::key_bits(k.min(32)), seed),
             previous: 0,
             last: None,
+            before: if entries == 0 || order != KeyOrder::Kmer || k <= 32 {
+                Vec::new()
+            } else {
+                buffer(k)?
+            },
+            follows: false,
             sequence: if entries == 0 { Vec::new() } else { buffer(k)? },
             finished: false,
         })
@@ -366,30 +387,33 @@ impl<R: Read> DatabaseReader<R> {
         Ok(())
     }
 
-    /// Read the key of the next record of a section in hash order into
-    /// `record`, as its key bytes.
-    fn next_hashed(&mut self, first: bool) -> io::Result<()> {
+    /// Read the key of the next record of a section that stores keys as
+    /// differences into `record`, as its key bytes.
+    fn next_difference(&mut self, first: bool) -> io::Result<()> {
         let difference = get_varint(&self.section, &mut self.position)
             .ok_or_else(|| invalid("invalid key in database section"))?;
-        let mixed = self
+        let value = self
             .previous
             .checked_add(difference)
-            .filter(|&mixed| mixed >> 1 >> (table::key_bits(self.header.k) - 1) == 0)
+            .filter(|&value| value >> 1 >> (table::key_bits(self.header.k) - 1) == 0)
             .ok_or_else(|| invalid("database key beyond its length"))?;
         // Within a section every record ascends; across sections only if
         // the header says so.
         let ascends = match (first, self.last) {
             (false, _) => difference > 0,
-            (true, Some(last)) => mixed > last,
+            (true, Some(last)) => value > last,
             (true, None) => true,
         };
         if !ascends {
             return Err(invalid("database keys out of order"));
         }
-        self.previous = mixed;
+        self.previous = value;
+        let key = match self.header.order {
+            KeyOrder::Hash => self.mixer.unmix(value),
+            _ => value,
+        };
         let key_bytes = self.record.len();
-        let key = self.mixer.unmix(mixed).to_le_bytes();
-        self.record[..key_bytes].copy_from_slice(&key[..key_bytes]);
+        self.record.copy_from_slice(&key.to_le_bytes()[..key_bytes]);
         Ok(())
     }
 
@@ -420,8 +444,9 @@ impl<R: Read> DatabaseReader<R> {
             self.next_section()?;
         }
         self.section_records -= 1;
-        if self.header.order == KeyOrder::Hash {
-            self.next_hashed(first)?;
+        let whole = self.header.order == KeyOrder::Unordered || self.header.k > 32;
+        if !whole {
+            self.next_difference(first)?;
         } else {
             let key = self
                 .section
@@ -453,6 +478,16 @@ impl<R: Read> DatabaseReader<R> {
             if self.sequence.iter().copied().cmp(reverse).is_gt() {
                 return Err(invalid("noncanonical key in canonical database"));
             }
+        }
+        if !self.before.is_empty() {
+            // Whole keys in k-mer order: each after the one before it in its
+            // section, and after the last of the section before if sections
+            // ascend.
+            if (!first || (self.header.ascending && self.follows)) && self.sequence <= self.before {
+                return Err(invalid("database keys out of order"));
+            }
+            self.before.copy_from_slice(&self.sequence);
+            self.follows = true;
         }
         self.remaining -= 1;
         Ok(Some((&self.sequence, count)))
@@ -505,11 +540,7 @@ impl Counter {
                 let mut sections = SectionWriter::new(writer);
                 let mut packed = buffer(key_bytes)?;
                 for (key, &count) in counts {
-                    packed.fill(0);
-                    for (index, base) in key.iter().rev().enumerate() {
-                        let value = crate::DNA_BASES[*base as usize];
-                        packed[index / 4] |= value << (2 * (index % 4));
-                    }
+                    pack_bases(key, &mut packed);
                     sections.raw(&packed, count)?;
                 }
                 sections.finish()
@@ -556,6 +587,15 @@ impl Counter {
     }
 }
 
+/// Store the uppercase DNA `key` as the key bytes of a record.
+pub(crate) fn pack_bases(key: &[u8], packed: &mut [u8]) {
+    packed.fill(0);
+    for (index, base) in key.iter().rev().enumerate() {
+        let value = crate::DNA_BASES[*base as usize];
+        packed[index / 4] |= value << (2 * (index % 4));
+    }
+}
+
 /// The header of a database with `entries` records in `order`, whose
 /// sections follow each other in that order too if `ascending`.
 pub(crate) fn header(
@@ -572,6 +612,7 @@ pub(crate) fn header(
     header[11] = match order {
         KeyOrder::Unordered => 0,
         KeyOrder::Hash => 1,
+        KeyOrder::Kmer => 2,
     };
     header[16..24].copy_from_slice(&(k as u64).to_le_bytes());
     header[24..32].copy_from_slice(&entries.to_le_bytes());
@@ -1066,6 +1107,91 @@ mod tests {
             assert_eq!(bytes, written_header(k as u64, 0, true));
             assert!(Counter::read_binary(bytes.as_slice()).unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn rejects_keys_out_of_kmer_order() {
+        let read = |bytes: &[u8]| -> io::Result<Vec<Vec<u8>>> {
+            let mut reader = DatabaseReader::new(bytes)?;
+            let mut keys = Vec::new();
+            while let Some((key, _)) = reader.next_entry()? {
+                keys.push(key.to_vec());
+            }
+            Ok(keys)
+        };
+        let one = |value: u8| value << 1 | 1;
+        // k = 3, keys as differences: ACG (6), CGT (27), TTT (63).
+        let short = |sections: &[Vec<u8>], entries: u64| {
+            let mut bytes = header2(3, entries, false);
+            (bytes[10], bytes[11]) = (2, 2);
+            bytes.extend(sections.concat());
+            bytes
+        };
+        let valid = short(
+            &[
+                section(2, &[one(6), one(1), one(21), one(1)]),
+                section(1, &[one(63), one(1)]),
+            ],
+            3,
+        );
+        assert_eq!(read(&valid).unwrap(), [b"ACG", b"CGT", b"TTT"]);
+        for (name, bytes) in [
+            (
+                "repeated key",
+                short(&[section(2, &[one(6), one(1), one(0), one(1)])], 2),
+            ),
+            (
+                "key beyond three bases",
+                short(&[section(1, &[one(64), one(1)])], 1),
+            ),
+            (
+                "section before the last one's end",
+                short(
+                    &[
+                        section(1, &[one(27), one(1)]),
+                        section(1, &[one(6), one(1)]),
+                    ],
+                    2,
+                ),
+            ),
+            ("a seed", {
+                let mut bytes = valid.clone();
+                bytes[32] = 1;
+                bytes
+            }),
+        ] {
+            assert!(read(&bytes).is_err(), "{name}");
+        }
+        // k = 33, whole keys: the last base in the lowest bits.
+        let key = |last: u8| {
+            let mut bytes = vec![last];
+            bytes.extend_from_slice(&[0; 8]);
+            bytes.push(one(1));
+            bytes
+        };
+        let long = |ascending: bool, sections: &[Vec<u8>], entries: u64| {
+            let mut bytes = header2(33, entries, false);
+            (bytes[10], bytes[11]) = (u8::from(ascending) << 1, 2);
+            bytes.extend(sections.concat());
+            bytes
+        };
+        let two = |first: u8, second: u8| [key(first), key(second)].concat();
+        assert_eq!(
+            read(&long(
+                true,
+                &[section(2, &two(0, 1)), section(1, &key(3))],
+                3
+            ))
+            .unwrap()
+            .len(),
+            3
+        );
+        assert!(read(&long(true, &[section(2, &two(1, 1))], 2)).is_err());
+        assert!(read(&long(true, &[section(2, &two(2, 1))], 2)).is_err());
+        let apart = [section(1, &key(2)), section(1, &key(1))];
+        assert!(read(&long(true, &apart, 2)).is_err());
+        // Without the flag, only the records of a section are in order.
+        assert_eq!(read(&long(false, &apart, 2)).unwrap().len(), 2);
     }
 
     #[test]

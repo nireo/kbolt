@@ -6,6 +6,7 @@ use std::io::{self, Write};
 pub mod database;
 mod disk;
 mod parallel;
+mod sorted;
 mod table;
 
 pub use disk::{DiskCounter, DiskCounts};

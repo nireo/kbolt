@@ -40,7 +40,8 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use crate::database::{self, KeyOrder};
 use crate::parallel::{ParallelCounter, ParallelInput};
-use crate::table::{Layout, Load, Mixer, PackedCounts};
+use crate::sorted::{self, Sorter};
+use crate::table::{Layout, Load, Mixer, PackedCounts, key_bits};
 use crate::{ChunkSink, DNA_BASES, EncodedChunk, Error, StrandMode};
 
 /// Bins the input is split into; a power of two.
@@ -91,7 +92,7 @@ fn mix(mut x: u32) -> u32 {
 
 /// The temporary file shared by all bins. Blocks are appended at offsets
 /// reserved atomically, so writers never wait for each other.
-struct Spill {
+pub(crate) struct Spill {
     file: File,
     end: AtomicU64,
     // Positional I/O needs no lock on Unix.
@@ -102,7 +103,7 @@ struct Spill {
 }
 
 impl Spill {
-    fn create(directory: &Path) -> io::Result<Self> {
+    pub(crate) fn create(directory: &Path) -> io::Result<Self> {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
@@ -128,7 +129,7 @@ impl Spill {
         })
     }
 
-    fn append(&self, bytes: &[u8]) -> io::Result<u64> {
+    pub(crate) fn append(&self, bytes: &[u8]) -> io::Result<u64> {
         let offset = self.end.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         #[cfg(unix)]
         std::os::unix::fs::FileExt::write_all_at(&self.file, bytes, offset)?;
@@ -144,7 +145,7 @@ impl Spill {
         Ok(offset)
     }
 
-    fn read(&self, bytes: &mut [u8], offset: u64) -> io::Result<()> {
+    pub(crate) fn read(&self, bytes: &mut [u8], offset: u64) -> io::Result<()> {
         #[cfg(unix)]
         return std::os::unix::fs::FileExt::read_exact_at(&self.file, bytes, offset);
         #[cfg(not(unix))]
@@ -597,6 +598,7 @@ pub struct DiskCounter {
     parallel: ParallelCounter,
     failure: Failure,
     memory: u64,
+    directory: PathBuf,
 }
 
 impl DiskCounter {
@@ -638,6 +640,7 @@ impl DiskCounter {
                 .map_err(io::Error::other)?,
             failure,
             memory,
+            directory: directory.to_owned(),
         })
     }
 
@@ -655,6 +658,8 @@ impl DiskCounter {
                 strand,
                 threads,
                 memory: self.memory,
+                directory: self.directory,
+                sorted: false,
                 spill: bins.spill,
                 bins: bins.bins,
             }),
@@ -674,6 +679,10 @@ pub struct DiskCounts {
     strand: StrandMode,
     threads: usize,
     memory: u64,
+    /// Where temporary files go.
+    directory: PathBuf,
+    /// Whether to write k-mers in their own order; see `crate::sorted`.
+    sorted: bool,
     spill: Spill,
     /// Each bin is taken, leaving it empty, by the thread that counts it.
     bins: Vec<Mutex<Bin>>,
@@ -684,6 +693,14 @@ impl DiskCounts {
     /// the input; threads that were reading input are free by now.
     pub fn with_threads(mut self, threads: usize) -> Self {
         self.threads = threads.max(1);
+        self
+    }
+
+    /// Write k-mers in ascending order (A < C < G < T) instead of bin by
+    /// bin. This takes another temporary file, of 16 bytes per distinct
+    /// k-mer, and one more pass over them.
+    pub fn sorted(mut self, sorted: bool) -> Self {
+        self.sorted = sorted;
         self
     }
 
@@ -705,6 +722,9 @@ impl DiskCounts {
     /// flush; failures may leave partial output.
     pub fn write_tsv(self, mut writer: impl Write) -> io::Result<u64> {
         let k = self.k;
+        if self.sorted {
+            return self.count_sorted(&mut writer, sorted::tsv_rows(k), |_, _| Ok(()));
+        }
         self.count(&mut writer, |counts, writer| {
             crate::write_packed64_tsv(counts.entries(), k, writer)
         })
@@ -713,10 +733,18 @@ impl DiskCounts {
     /// Count every bin and write a version-2 database (see
     /// [`crate::database`]), each bin in hash order. The entry count is
     /// known only once every bin has been counted, so the header is
-    /// completed last and the writer must seek. Returns the number of distinct k-mers. Does not flush; failures
-    /// may leave partial output.
+    /// completed last and the writer must seek. Returns the number of
+    /// distinct k-mers. Does not flush; failures may leave partial output.
+    ///
+    /// After [`DiskCounts::sorted`] the database is in k-mer order
+    /// throughout instead.
     pub fn write_binary(self, mut writer: impl Write + Seek) -> io::Result<u64> {
         let (k, strand) = (self.k, self.strand);
+        if self.sorted {
+            return self.count_sorted(&mut writer, sorted::binary_sections, |distinct, writer| {
+                writer.write_all(&database::header(k, strand, KeyOrder::Kmer, true, distinct))
+            });
+        }
         let start = writer.stream_position()?;
         let header = |entries| database::header(k, strand, KeyOrder::Hash, false, entries);
         writer.write_all(&header(0))?;
@@ -727,6 +755,34 @@ impl DiskCounts {
         writer.seek(SeekFrom::Start(start))?;
         writer.write_all(&header(distinct))?;
         writer.seek(SeekFrom::Start(end))?;
+        Ok(distinct)
+    }
+
+    /// Count every bin into a sorter, then write its buckets, each as
+    /// `encode` makes of its records, after `begin` has written what comes
+    /// before them, given the number of distinct k-mers.
+    ///
+    /// The sorter's records wait in a second temporary file, 16 bytes per
+    /// distinct k-mer; sorting them takes about half the memory limit.
+    fn count_sorted(
+        &self,
+        writer: &mut dyn Write,
+        encode: impl Fn(&[sorted::Record], &mut dyn Write) -> io::Result<()> + Sync,
+        begin: impl FnOnce(u64, &mut dyn Write) -> io::Result<()>,
+    ) -> io::Result<u64> {
+        // Every k-mer of the input may be a distinct one.
+        let sorter = Sorter::on_disk(
+            key_bits(self.k),
+            self.kmers(),
+            self.memory,
+            self.threads,
+            &self.directory,
+        )?;
+        let distinct = self.count(writer, |counts, _| {
+            sorter.feed(counts, &mut sorted::Batch::default())
+        })?;
+        begin(distinct, writer)?;
+        sorter.write(self.threads, writer, encode)?;
         Ok(distinct)
     }
 
@@ -1117,6 +1173,57 @@ mod tests {
                     let distinct = counts.write_tsv(&mut tsv).unwrap();
                     assert_eq!(distinct, expected.len() as u64);
                     assert_eq!(rows(&tsv), expected, "k={k} {strand:?} memory={memory}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sorted_output_is_in_kmer_order_whatever_the_memory() {
+        let records: Vec<_> = (0..40)
+            .map(|seed| sequence(50 + 37 * seed, 7 + seed as u64))
+            .collect();
+        for k in [1, 5, 21, 31, 32] {
+            for strand in [StrandMode::Canonical, StrandMode::Forward] {
+                // A map lists its keys in order.
+                let expected: Vec<(Vec<u8>, u64)> =
+                    serial(&records, k, strand).into_iter().collect();
+                // Buckets in memory, mostly in the file, and (with a limit
+                // below any bucket) admitted one at a time.
+                for memory in [1 << 30, 80 << 10, 4096] {
+                    let mut tsv = Vec::new();
+                    let distinct = on_disk(&records, k, strand, memory)
+                        .sorted(true)
+                        .write_tsv(&mut tsv)
+                        .unwrap();
+                    assert_eq!(distinct, expected.len() as u64);
+                    let rows: Vec<(Vec<u8>, u64)> = tsv
+                        .split(|&byte| byte == b'\n')
+                        .filter(|row| !row.is_empty())
+                        .map(|row| {
+                            let tab = row.iter().position(|&byte| byte == b'\t').unwrap();
+                            let count = std::str::from_utf8(&row[tab + 1..]).unwrap();
+                            (row[..tab].to_vec(), count.parse().unwrap())
+                        })
+                        .collect();
+                    assert!(rows == expected, "k={k} {strand:?} memory={memory}");
+
+                    let mut database = io::Cursor::new(Vec::new());
+                    let distinct = on_disk(&records, k, strand, memory)
+                        .sorted(true)
+                        .write_binary(&mut database)
+                        .unwrap();
+                    assert_eq!(distinct, expected.len() as u64);
+                    let mut reader =
+                        database::DatabaseReader::new(database.get_ref().as_slice()).unwrap();
+                    let header = reader.header();
+                    assert_eq!((header.order, header.ascending), (KeyOrder::Kmer, true));
+                    assert_eq!(header.entries, distinct);
+                    let mut entries = Vec::new();
+                    while let Some((key, count)) = reader.next_entry().unwrap() {
+                        entries.push((key.to_vec(), count));
+                    }
+                    assert!(entries == expected, "k={k} {strand:?} memory={memory}");
                 }
             }
         }

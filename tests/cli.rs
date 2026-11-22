@@ -299,7 +299,7 @@ fn binary_output_and_streaming_dump_match_tsv_for_all_modes() {
     for input in [b"".as_slice(), b">empty\n", b">short\nAC\n", b">n\nNNNN\n"] {
         let binary = run(&["count", "-k", "31", "--format", "binary"], input);
         assert!(binary.status.success());
-        assert_eq!(binary.stdout.len(), 32);
+        assert_eq!(binary.stdout.len(), 40);
         assert!(table(&run(&["dump", "-"], &binary.stdout)).is_empty());
     }
 }
@@ -351,9 +351,10 @@ fn dump_rejects_invalid_databases_and_identifies_input() {
     let mut trailing = binary.clone();
     trailing.push(0);
     let mut version = binary.clone();
-    version[8] = 2;
+    version[8] = 3;
+    // The last byte is the count; this is the encoding of zero.
     let mut zero_count = binary.clone();
-    zero_count[33..].fill(0);
+    *zero_count.last_mut().unwrap() = 1;
     for input in [
         b"".to_vec(),
         b"not a database".to_vec(),

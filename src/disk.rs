@@ -709,7 +709,7 @@ impl DiskCounts {
         })
     }
 
-    /// Count every bin and write a version-1 database (see
+    /// Count every bin and write a version-2 database (see
     /// [`crate::database`]). The entry count is known only once every bin has
     /// been counted, so the header is completed last and the writer must
     /// seek. Returns the number of distinct k-mers. Does not flush; failures
@@ -719,13 +719,7 @@ impl DiskCounts {
         let start = writer.stream_position()?;
         writer.write_all(&database::header(k, strand, 0))?;
         let distinct = self.count(&mut writer, |counts, writer| {
-            database::write_packed_binary(
-                counts
-                    .entries()
-                    .map(|(key, count)| (key.to_le_bytes(), count)),
-                k.div_ceil(4),
-                writer,
-            )
+            database::write_packed_sections(counts.entries(), k.div_ceil(4), writer)
         })?;
         let end = writer.stream_position()?;
         writer.seek(SeekFrom::Start(start))?;

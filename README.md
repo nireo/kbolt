@@ -17,12 +17,12 @@ of memory):
 
 | | Wall time | CPU time | Peak memory |
 |---|---:|---:|---:|
-| kbolt | **13.0 s** | 99 s | 6.5 GiB |
+| kbolt | **10.5 s** | 93 s | 6.5 GiB |
 | KMC | 33.6 s | 210 s | 11.0 GiB |
 | FastK | 44.1 s | 197 s | 9.9 GiB |
 
-kbolt is 2.6× faster than KMC and 3.4× faster than FastK, on about half the
-CPU time and two thirds of the memory or less. kbolt and KMC report identical counts.
+kbolt is 3.2× faster than KMC and 4.2× faster than FastK, on less than half
+the CPU time and two thirds of the memory or less. kbolt and KMC report identical counts.
 
 Read sets whose k-mers do not fit in memory can be counted on disk with
 `--memory`, as KMC and FastK do. The same reads with every tool limited to
@@ -30,7 +30,7 @@ Read sets whose k-mers do not fit in memory can be counted on disk with
 
 | | Wall time | CPU time | Peak memory |
 |---|---:|---:|---:|
-| kbolt | **14.4 s** | 93 s | 1.6 GiB |
+| kbolt | **12.1 s** | 88 s | 1.6 GiB |
 | KMC | 34.4 s | 198 s | 1.9 GiB |
 | FastK | 43.9 s | 192 s | 4.2 GiB |
 
@@ -41,12 +41,12 @@ well. Wall time (median of 3 runs):
 
 | Workload | Threads | kbolt | FastK | KMC | Jellyfish |
 |---|---:|---:|---:|---:|---:|
-| Arabidopsis genome, 120 Mbp | 1 | **2.73 s** | 6.52 s | 4.12 s | 29.4 s |
-|  | 8 | **0.76 s** | 2.02 s | 1.60 s | 6.61 s |
-| Synthetic reads, 134 Mbp FASTQ | 1 | **0.56 s** | 2.08 s | 4.87 s | 6.29 s |
-|  | 8 | **0.14 s** | 0.61 s | 1.63 s | 2.82 s |
+| Arabidopsis genome, 120 Mbp | 1 | **2.87 s** | 6.52 s | 4.12 s | 29.4 s |
+|  | 8 | **0.61 s** | 2.02 s | 1.60 s | 6.61 s |
+| Synthetic reads, 134 Mbp FASTQ | 1 | **0.57 s** | 2.08 s | 4.87 s | 6.29 s |
+|  | 8 | **0.13 s** | 0.61 s | 1.63 s | 2.82 s |
 | Same reads, gzip | 1 | **0.56 s** | 2.38 s | 4.88 s | 6.64 s |
-|  | 8 | **0.23 s** | 0.81 s | 1.94 s | 2.42 s |
+|  | 8 | **0.20 s** | 0.81 s | 1.94 s | 2.42 s |
 
 All four tools report identical counts on these inputs.
 

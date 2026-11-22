@@ -373,6 +373,7 @@ name = "kbolt"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "crc32fast",
  "criterion",
  "crossbeam-channel",
  "flate2",

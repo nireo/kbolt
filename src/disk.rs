@@ -536,7 +536,7 @@ impl Tables {
             &self.pending[group * capacity..group * capacity + filled],
             &mut self.split,
             &mut self.ends,
-            |table, updates| table.add_burst(updates, |update| update >> self.group_shift),
+            |table, updates| table.add_burst(updates, self.group_shift),
         )
     }
 

@@ -376,17 +376,10 @@ impl PackedShared {
         split: &mut Vec<u64>,
         ends: &mut Vec<usize>,
     ) -> Result<(), Error> {
-        let (mask, run_shift) = (self.layout.remainder_mask(), self.entry_bits);
+        let run_shift = self.entry_bits;
         table::add_split(tables, self.layout, input, split, ends, |table, entries| {
             table.warm(entries.len());
-            for index in 0..entries.len() {
-                if let Some(&ahead) = entries.get(index + AHEAD) {
-                    table.prefetch(ahead & mask);
-                }
-                let entry = entries[index];
-                table.add(entry & mask, entry >> run_shift, Overflow::Reject)?;
-            }
-            Ok(())
+            table.add_entries(entries, run_shift)
         })
     }
 

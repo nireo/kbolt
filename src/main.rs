@@ -1,3 +1,4 @@
+mod gzip;
 mod input;
 
 use std::fs::File;
@@ -7,7 +8,6 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use flate2::bufread::MultiGzDecoder;
 use kbolt::database::DatabaseReader;
 use kbolt::{Counter, DiskCounter, ParallelCounter, ParallelInput, StrandMode};
 
@@ -354,32 +354,36 @@ fn count_reader<R: Read + Send + 'static>(
         }
     }
     let reader = io::Cursor::new(magic[..size].to_vec()).chain(reader);
-    let reader = BufReader::with_capacity(READ_BUFFER_SIZE, reader);
     if size == 2 && magic == [0x1f, 0x8b] {
-        decompress_concurrently(MultiGzDecoder::new(reader), |decoded| {
+        // The decoder buffers its own input.
+        decompress_concurrently(gzip::GzDecoder::new(reader), |decoded| {
             input::count(decoded, counting)
         })
     } else {
-        input::count(reader, counting)
+        input::count(BufReader::with_capacity(READ_BUFFER_SIZE, reader), counting)
     }
 }
 
 /// Decompressed bytes handed from the decoder thread to the parser at a time.
 const DECODED_CHUNK_SIZE: usize = 1024 * 1024;
+/// A decoded chunk's allocation: room for the decoder's window before the
+/// data and its slack after (see [`gzip`]).
+const DECODED_BUFFER_SIZE: usize = gzip::WINDOW + DECODED_CHUNK_SIZE + gzip::SLACK;
 
 /// Run `decoder` on its own thread while `parse` consumes its output.
 ///
 /// Inflating and parsing a single gzip stream are both sequential, but they
 /// need not share a thread. Bounded, recycled chunks keep memory constant.
 /// Decoder errors arrive after all bytes decoded before them, in stream order.
-/// Each decoded read is handed over immediately, so input arriving slowly
-/// (such as from a pipe) is parsed as soon as it can be decoded.
+/// Each chunk holds whatever the input read so far decodes to, so input
+/// arriving slowly (such as from a pipe) is parsed as soon as it can be
+/// decoded.
 ///
 /// The decoder thread owns its input. When parsing fails, this returns
 /// without waiting for it: a decoder blocked reading a slow pipe would
 /// otherwise delay the error. It exits at its next send (or with the process).
-fn decompress_concurrently<D: Read + Send + 'static>(
-    mut decoder: D,
+fn decompress_concurrently<R: Read + Send + 'static>(
+    mut decoder: gzip::GzDecoder<R>,
     parse: impl FnOnce(&mut DecodedChunks) -> io::Result<()>,
 ) -> io::Result<()> {
     let (sender, receiver) = crossbeam_channel::bounded::<io::Result<(Vec<u8>, usize)>>(4);
@@ -388,17 +392,12 @@ fn decompress_concurrently<D: Read + Send + 'static>(
         .name("decoder".into())
         .spawn(move || {
             loop {
-                // Buffers keep their full length; only the filled prefix is sent.
+                // Buffers keep their full length; the decoded bytes follow
+                // the first `gzip::WINDOW`.
                 let mut chunk = recycled
                     .try_recv()
-                    .unwrap_or_else(|_| vec![0; DECODED_CHUNK_SIZE]);
-                let read = loop {
-                    match decoder.read(&mut chunk) {
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                        result => break result,
-                    }
-                };
-                match read {
+                    .unwrap_or_else(|_| vec![0; DECODED_BUFFER_SIZE]);
+                match decoder.read_chunk(&mut chunk) {
                     Ok(0) => return, // End of stream: dropping the sender signals EOF.
                     Ok(len) => {
                         if sender.send(Ok((chunk, len))).is_err() {
@@ -458,9 +457,9 @@ impl BufRead for DecodedChunks {
                 Ok(chunk) => {
                     let (chunk, len) = chunk?;
                     let used = std::mem::replace(&mut self.chunk, chunk);
-                    (self.len, self.position) = (len, 0);
+                    (self.len, self.position) = (gzip::WINDOW + len, gzip::WINDOW);
                     // Only full-size buffers are reused for decoding.
-                    if used.len() == DECODED_CHUNK_SIZE {
+                    if used.len() == DECODED_BUFFER_SIZE {
                         let _ = self.recycle.try_send(used);
                     }
                 }

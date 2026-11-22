@@ -123,6 +123,12 @@ input. Reads overlap, so most super-k-mers of a read set occur many times;
 equal ones are merged first and their k-mers counted once, with the number of
 copies.
 
+Gzip input is inflated on one thread per file, which would otherwise set the
+pace on compressed reads, so kbolt has a streaming decoder of its own
+(`src/gzip.rs`). It is built like libdeflate's: a 64-bit bit buffer, one table
+lookup per symbol, and matches copied a word at a time. On the C. elegans
+reads it produces 1.3 GB/s on one thread, against 1.1 GB/s for zlib.
+
 ## Development
 
 ```sh

@@ -626,6 +626,91 @@ impl CompactTable {
         self.add_large(remainder, index, found, delta, overflow)
     }
 
+    /// Add `entry >> delta_shift` (at least 1) to the count of the remainder
+    /// in the low bits of each entry, in order, leaving a count unchanged
+    /// (and stopping) on overflow.
+    ///
+    /// This is `add` for a run of updates to a table that is in cache. The
+    /// table's fields stay in registers across the run, each key's bucket is
+    /// prefetched a few updates ahead, and finding a key and adding one take
+    /// the same instructions, so that a mix of the two does not mislead the
+    /// branch predictor.
+    #[inline(always)]
+    pub(crate) fn add_entries(&mut self, entries: &[u64], delta_shift: u32) -> Result<(), Error> {
+        let layout = self.layout;
+        let marker = layout.count_marker();
+        let (key_mask, remainder_mask) = (!marker, layout.remainder_mask());
+        let mut index = 0;
+        'run: while index < entries.len() {
+            if self.len >= self.grow_at {
+                self.grow()?;
+            }
+            // New keys the table takes before it must grow, and how many of
+            // them this run has added.
+            let room = self.grow_at - self.len;
+            let mut added = 0;
+            let (buckets, count) = (self.buckets.as_mut_ptr(), self.buckets.len());
+            let home = |key: u64| ((u128::from(key) * count as u128) >> 64) as usize;
+            while index < entries.len() && added < room {
+                if let Some(&ahead) = entries.get(index + AHEAD) {
+                    prefetch(
+                        buckets.wrapping_add(home((ahead & remainder_mask) << layout.count_bits)),
+                    );
+                }
+                let entry = entries[index];
+                index += 1;
+                let key = (entry & remainder_mask) << layout.count_bits;
+                let delta = entry >> delta_shift;
+                let mut bucket = home(key);
+                loop {
+                    // SAFETY: `home` is below the bucket count, and the wrap
+                    // below keeps `bucket` in bounds; the load factor
+                    // guarantees an empty slot.
+                    let slots = unsafe { &mut *buckets.add(bucket) };
+                    let (matches, empty) = bucket_masks(slots, key, key_mask);
+                    let matches = matches & !empty;
+                    // One test covers both ways a search ends, at the key or
+                    // at the first empty slot. Which of the two it was is
+                    // data here, not a branch: in a burst, whether a key is
+                    // new is as hard to predict as the input.
+                    let found = matches != 0;
+                    let ends = if found { matches } else { empty };
+                    if ends != 0 {
+                        let at = (ends.trailing_zeros() / MASK_BITS) as usize;
+                        // SAFETY: a mask has bits for eight slots only.
+                        let slot = unsafe { slots.0.get_unchecked_mut(at) };
+                        // An empty slot is zero, so one update serves a new
+                        // key and a present one: the key bits are set
+                        // (again) and the small count grows. A count at the
+                        // marker leaves no room for any delta.
+                        if delta < marker - (*slot & marker) {
+                            *slot = (*slot | key) + delta;
+                            added += usize::from(!found);
+                            break;
+                        }
+                        // A large count: the general path takes over, and
+                        // the run starts again after it.
+                        self.len += added;
+                        self.add_large(
+                            entry & remainder_mask,
+                            bucket * SLOTS + at,
+                            found,
+                            delta,
+                            Overflow::Reject,
+                        )?;
+                        continue 'run;
+                    }
+                    bucket += 1;
+                    if bucket == count {
+                        bucket = 0;
+                    }
+                }
+            }
+            self.len += added;
+        }
+        Ok(())
+    }
+
     // Counts at or above the small-count marker live in the overflow map.
     #[cold]
     #[inline(never)]
@@ -686,33 +771,16 @@ impl CompactTable {
         Ok(true)
     }
 
-    /// Add `delta(entry)` for each entry, whose low bits are a remainder of
-    /// this table, for a table that has left the cache since its last burst
-    /// whatever its size (see `crate::disk`). A burst that will touch most of
-    /// the table reads it into cache first; a sparser one prefetches each
-    /// bucket ahead of its update.
-    pub(crate) fn add_burst(
-        &mut self,
-        entries: &[u64],
-        delta: impl Fn(u64) -> u64,
-    ) -> Result<(), Error> {
-        /// Prefetch this far ahead within the burst.
-        const AHEAD: usize = 16;
-        let mask = self.layout.remainder_mask();
+    /// Add `entry >> delta_shift` for each entry, whose low bits are a
+    /// remainder of this table, for a table that has left the cache since
+    /// its last burst whatever its size (see `crate::disk`). A burst that
+    /// will touch most of the table reads it into cache first; a sparser one
+    /// relies on each bucket being prefetched ahead of its update.
+    pub(crate) fn add_burst(&mut self, entries: &[u64], delta_shift: u32) -> Result<(), Error> {
         if entries.len() >= self.buckets.len() / 4 {
             self.read();
-            return entries
-                .iter()
-                .try_for_each(|&entry| self.add(entry & mask, delta(entry), Overflow::Reject));
         }
-        for index in 0..entries.len() {
-            if let Some(&ahead) = entries.get(index + AHEAD) {
-                self.prefetch(ahead & mask);
-            }
-            let entry = entries[index];
-            self.add(entry & mask, delta(entry), Overflow::Reject)?;
-        }
-        Ok(())
+        self.add_entries(entries, delta_shift)
     }
 
     /// Remove every key, keeping the allocated buckets for reuse.

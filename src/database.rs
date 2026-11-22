@@ -51,10 +51,6 @@
 //! allowed. There is no checksum; structural validation does not detect
 //! every bit flip.
 //!
-//! Version 1 is still read. Its header is the first 32 bytes of the above,
-//! and its records follow without sections, each with its key bytes and its
-//! count as a u64.
-//!
 //! [`DatabaseReader`] streams entries with reusable buffers. It validates the
 //! header, records, and end of stream, but does not track duplicate keys.
 //! [`Counter::read_binary`] additionally rejects duplicates while loading.
@@ -67,11 +63,10 @@ use crate::table::{self, Mixer, PackedCounts};
 use crate::{Counter, Counts, OutputTable, StrandMode, format_count};
 
 const MAGIC: &[u8; 8] = b"KBOLTDB\0";
-/// The version written; version 1 is read as well.
+/// The only version read or written. Version 1, with whole keys and
+/// eight-byte counts, is no longer supported.
 const VERSION: u16 = 2;
-/// Bytes of the header from version 2 on, and of version 1's.
 const HEADER_BYTES: usize = 40;
-const HEADER_BYTES_V1: usize = 32;
 /// Bytes of records after which a writer closes a section.
 const SECTION_BYTES: usize = 32 * 1024;
 
@@ -243,9 +238,8 @@ pub struct DatabaseHeader {
 pub struct DatabaseReader<R> {
     reader: R,
     header: DatabaseHeader,
-    version: u16,
     remaining: u64,
-    /// The current record's key bytes (and, in version 1, its count).
+    /// The current record's key bytes.
     record: Vec<u8>,
     /// The current section's records, and what is left of them.
     section: Vec<u8>,
@@ -264,25 +258,23 @@ impl<R: Read> DatabaseReader<R> {
     /// Read and validate the header. No count table is allocated.
     pub fn new(mut reader: R) -> io::Result<Self> {
         let mut bytes = [0; HEADER_BYTES];
-        reader.read_exact(&mut bytes[..HEADER_BYTES_V1])?;
+        // The magic and version first, so that other files are named as such
+        // even when shorter than a header.
+        reader.read_exact(&mut bytes[..10])?;
         if &bytes[..8] != MAGIC {
             return Err(invalid("expected a kbolt binary database"));
         }
-        let version = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
-        if !(1..=VERSION).contains(&version) {
+        if u16::from_le_bytes(bytes[8..10].try_into().unwrap()) != VERSION {
             return Err(invalid("unsupported kbolt database version"));
         }
-        if version > 1 {
-            reader.read_exact(&mut bytes[HEADER_BYTES_V1..])?;
-        }
+        reader.read_exact(&mut bytes[10..])?;
         let order = match bytes[11] {
             0 => KeyOrder::Unordered,
-            1 if version > 1 => KeyOrder::Hash,
+            1 => KeyOrder::Hash,
             _ => return Err(invalid("unsupported database key order")),
         };
-        let seed = u64::from_le_bytes(bytes[HEADER_BYTES_V1..].try_into().unwrap());
-        let flags = if version == 1 { 1 } else { 3 };
-        if bytes[10] & !flags != 0
+        let seed = u64::from_le_bytes(bytes[32..].try_into().unwrap());
+        if bytes[10] > 3
             || bytes[12..16] != [0; 4]
             || (order == KeyOrder::Unordered && (seed != 0 || bytes[10] & 2 != 0))
         {
@@ -298,16 +290,12 @@ impl<R: Read> DatabaseReader<R> {
         }
         let entries = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
         let key_bytes = k.div_ceil(4);
-        let size = key_bytes
-            .checked_add(8)
-            .ok_or_else(|| invalid("database record size overflow"))?;
         // Check the declared payload size without reserving the entry count.
-        // (A version-2 record takes at least one byte beyond its key, which
-        // takes at least one itself.)
-        let least = match (version, order) {
-            (1, _) => size,
-            (_, KeyOrder::Unordered) => key_bytes + 1,
-            (_, KeyOrder::Hash) => 2,
+        // A count takes at least one byte, as does a key stored as a
+        // difference.
+        let least = match order {
+            KeyOrder::Unordered => key_bytes + 1,
+            KeyOrder::Hash => 2,
         };
         entries
             .checked_mul(least as u64)
@@ -326,12 +314,11 @@ impl<R: Read> DatabaseReader<R> {
         Ok(Self {
             reader,
             header,
-            version,
             remaining: entries,
             record: if entries == 0 {
                 Vec::new()
             } else {
-                buffer(size)?
+                buffer(key_bytes)?
             },
             section: Vec::new(),
             position: 0,
@@ -400,7 +387,7 @@ impl<R: Read> DatabaseReader<R> {
             return Err(invalid("database keys out of order"));
         }
         self.previous = mixed;
-        let key_bytes = self.record.len() - 8;
+        let key_bytes = self.record.len();
         let key = self.mixer.unmix(mixed).to_le_bytes();
         self.record[..key_bytes].copy_from_slice(&key[..key_bytes]);
         Ok(())
@@ -427,29 +414,24 @@ impl<R: Read> DatabaseReader<R> {
                 Ok(()) => return Err(invalid("trailing data after database entries")),
             }
         }
-        let key_bytes = self.record.len() - 8;
-        let count = if self.version == 1 {
-            self.reader.read_exact(&mut self.record)?;
-            u64::from_le_bytes(self.record[key_bytes..].try_into().unwrap())
+        let key_bytes = self.record.len();
+        let first = self.section_records == 0;
+        if first {
+            self.next_section()?;
+        }
+        self.section_records -= 1;
+        if self.header.order == KeyOrder::Hash {
+            self.next_hashed(first)?;
         } else {
-            let first = self.section_records == 0;
-            if first {
-                self.next_section()?;
-            }
-            self.section_records -= 1;
-            if self.header.order == KeyOrder::Hash {
-                self.next_hashed(first)?;
-            } else {
-                let key = self
-                    .section
-                    .get(self.position..self.position + key_bytes)
-                    .ok_or_else(|| invalid("database section shorter than its records"))?;
-                self.record[..key_bytes].copy_from_slice(key);
-                self.position += key_bytes;
-            }
-            get_varint(&self.section, &mut self.position)
-                .ok_or_else(|| invalid("invalid count in database section"))?
-        };
+            let key = self
+                .section
+                .get(self.position..self.position + key_bytes)
+                .ok_or_else(|| invalid("database section shorter than its records"))?;
+            self.record.copy_from_slice(key);
+            self.position += key_bytes;
+        }
+        let count = get_varint(&self.section, &mut self.position)
+            .ok_or_else(|| invalid("invalid count in database section"))?;
         let used = (self.header.k % 4) * 2;
         if used != 0 && self.record[key_bytes - 1] >> used != 0 {
             return Err(invalid("nonzero padding in database key"));
@@ -605,19 +587,12 @@ mod tests {
     use std::collections::HashMap;
     use std::io::{BufReader, Cursor};
 
-    /// The header of a version-1 database, whose records follow it directly.
-    fn fixture(k: u64, entries: u64, canonical: bool) -> Vec<u8> {
-        let mut bytes = b"KBOLTDB\0\x01\x00\x00\x00\x00\x00\x00\x00".to_vec();
+    /// The header of a database with whole, unordered keys.
+    fn header2(k: u64, entries: u64, canonical: bool) -> Vec<u8> {
+        let mut bytes = b"KBOLTDB\0\x02\x00\x00\x00\x00\x00\x00\x00".to_vec();
         bytes[10] = u8::from(canonical);
         bytes.extend_from_slice(&k.to_le_bytes());
         bytes.extend_from_slice(&entries.to_le_bytes());
-        bytes
-    }
-
-    /// The header of a version-2 database with whole, unordered keys.
-    fn header2(k: u64, entries: u64, canonical: bool) -> Vec<u8> {
-        let mut bytes = fixture(k, entries, canonical);
-        bytes[8] = 2;
         bytes.extend_from_slice(&[0; 8]);
         bytes
     }
@@ -800,10 +775,9 @@ mod tests {
                 bytes[16] = 33;
                 bytes
             }),
-            ("hash order in version 1", {
-                let mut bytes = fixture(3, 1, false);
-                bytes[11] = 1;
-                bytes.extend_from_slice(&[6, 1, 0, 0, 0, 0, 0, 0, 0]);
+            ("the seed without hash order", {
+                let mut bytes = with(false, &[section(1, &[6, one(1)])], 1);
+                bytes[11] = 0;
                 bytes
             }),
         ] {
@@ -1096,22 +1070,28 @@ mod tests {
 
     #[test]
     fn rejects_truncation_trailing_bytes_and_invalid_records() {
-        let mut valid = fixture(3, 1, false);
-        valid.extend_from_slice(&[6, 1, 0, 0, 0, 0, 0, 0, 0]);
+        // ACG once.
+        let mut valid = header2(3, 1, false);
+        valid.extend(section(1, &[6, 0b11]));
+        assert!(Counter::read_binary(valid.as_slice()).is_ok());
         for end in 0..valid.len() {
             assert!(Counter::read_binary(&valid[..end]).is_err(), "end={end}");
         }
         let mut corruptions = Vec::new();
         for (offset, value) in [
+            // Magic, version (the former one too), flags, order, reserved
+            // bytes, k of zero, key padding, and a count of zero.
             (0, b'X'),
-            (8, 2),
+            (8, 1),
+            (8, 3),
             (9, 1),
-            (10, 2),
-            (11, 1),
+            (10, 4),
+            (11, 2),
+            (12, 1),
             (15, 1),
             (16, 0),
-            (32, 0xc6),
-            (33, 0),
+            (48, 0xc6),
+            (49, 1),
         ] {
             let mut bytes = valid.clone();
             bytes[offset] = value;
@@ -1120,12 +1100,12 @@ mod tests {
         let mut trailing = valid.clone();
         trailing.push(0);
         corruptions.push(trailing);
-        let mut noncanonical = fixture(1, 1, true);
-        noncanonical.extend_from_slice(&[3, 1, 0, 0, 0, 0, 0, 0, 0]);
+        let mut noncanonical = header2(1, 1, true);
+        noncanonical.extend(section(1, &[3, 0b11]));
         corruptions.push(noncanonical);
-        corruptions.push(fixture(3, u64::MAX, false));
-        let mut impossible_allocation = fixture(u64::MAX, 1, false);
-        impossible_allocation.extend_from_slice(&[0; 9]);
+        corruptions.push(header2(3, u64::MAX, false));
+        let mut impossible_allocation = header2(u64::MAX, 1, false);
+        impossible_allocation.extend(section(1, &[0; 9]));
         corruptions.push(impossible_allocation);
         for bytes in corruptions {
             assert!(Counter::read_binary(bytes.as_slice()).is_err(), "{bytes:?}");
@@ -1134,9 +1114,8 @@ mod tests {
 
     #[test]
     fn loading_rejects_duplicate_keys() {
-        let mut bytes = fixture(3, 2, false);
-        bytes.extend_from_slice(&[6, 1, 0, 0, 0, 0, 0, 0, 0]);
-        bytes.extend_from_slice(&[6, 2, 0, 0, 0, 0, 0, 0, 0]);
+        let mut bytes = header2(3, 2, false);
+        bytes.extend(section(2, &[6, 0b11, 6, 0b101]));
         let error = Counter::read_binary(bytes.as_slice()).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("duplicate"));
@@ -1170,8 +1149,8 @@ mod tests {
                 Err(io::Error::other("injected read failure"))
             }
         }
-        let mut bytes = fixture(3, 1, false);
-        bytes.extend_from_slice(&[6, 1, 0, 0, 0, 0, 0, 0, 0]);
+        let mut bytes = header2(3, 1, false);
+        bytes.extend(section(1, &[6, 0b11]));
         let loaded = Counter::read_binary(InterruptedOnce {
             inner: ShortRead(bytes.as_slice()),
             interrupted: false,

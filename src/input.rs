@@ -1,12 +1,476 @@
-//! Bounded-memory FASTA/FASTQ parsing. Headers, sequence lines, and quality
-//! lines are consumed in buffer-sized fragments, never accumulated as records.
+//! Streaming FASTA/FASTQ input with automatic gzip detection and concurrent
+//! decompression.
 //!
-//! The parser accepts LF or CRLF, wrapped FASTA and FASTQ, and an unterminated
-//! final line. FASTQ quality lengths are validated without storing qualities.
+//! Headers, sequence lines, and quality lines are consumed in buffer-sized
+//! fragments, never accumulated as whole records. The parser accepts LF or
+//! CRLF, wrapped FASTA and FASTQ, and an unterminated final line. FASTQ
+//! quality lengths are validated without storing qualities.
 
-use std::io::{self, BufRead};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
-use crate::Counting;
+use crate::{Counter, ParallelInput, gzip};
+
+const BUFFER_SIZE: usize = 64 * 1024;
+/// Input read buffer. Larger reads mean fewer syscalls and fewer FASTQ
+/// records straddling a refill, which fall back to the line-by-line parser.
+const READ_BUFFER_SIZE: usize = 256 * 1024;
+/// Decompressed bytes handed from the decoder thread to the parser at a time.
+const DECODED_CHUNK_SIZE: usize = 1024 * 1024;
+/// A decoded chunk's allocation: room for the decoder's window before the
+/// data and its slack after (see `crate::gzip`).
+const DECODED_BUFFER_SIZE: usize = gzip::WINDOW + DECODED_CHUNK_SIZE + gzip::SLACK;
+
+/// Record and base counts reported after streaming FASTA/FASTQ input.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InputStats {
+    pub records: u64,
+    pub bases: u64,
+}
+
+/// Periodic progress update emitted while streaming input.
+#[derive(Debug, Clone, Copy)]
+pub struct Progress<'a> {
+    /// File currently being read when multiple files are read concurrently.
+    pub source: Option<&'a Path>,
+    pub records: u64,
+    pub bases: u64,
+    /// Distinct k-mers counted so far in single-threaded mode; `None` when
+    /// counting asynchronously on worker threads.
+    pub distinct: Option<usize>,
+    pub elapsed: Duration,
+}
+
+/// Callback invoked periodically with [`Progress`] updates while reading input.
+pub type ProgressCallback<'p> = &'p (dyn Fn(Progress<'_>) -> io::Result<()> + Sync);
+
+struct SerialBuffer<'a> {
+    counter: &'a mut Counter,
+    // Batch up to 64 KiB of new sequence bytes from one or more records, then
+    // count them together. `ends` closes each finished record in the batch;
+    // the current record starts at `record_start`. Each flush keeps the current
+    // record's last k-1 bytes so windows continue across flushes.
+    overlap: Vec<u8>,
+    ends: Vec<usize>,
+    record_start: usize,
+    pending: usize,
+    k: usize,
+}
+
+impl SerialBuffer<'_> {
+    fn start_record(&mut self) {
+        if self.overlap.len() > self.record_start {
+            self.ends.push(self.overlap.len());
+        }
+        self.record_start = self.overlap.len();
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.pending == 0 {
+            return Ok(());
+        }
+        let (bytes, mut start) = (&self.overlap, 0);
+        let records = self
+            .ends
+            .iter()
+            .copied()
+            .chain(std::iter::once(bytes.len()))
+            .map(|end| {
+                let record = &bytes[start..end];
+                start = end;
+                record
+            });
+        self.counter
+            .add_records(records)
+            .map_err(io::Error::other)?;
+        let keep = (self.k - 1).min(self.overlap.len() - self.record_start);
+        let start = self.overlap.len() - keep;
+        self.overlap.copy_within(start.., 0);
+        self.overlap.truncate(keep);
+        self.ends.clear();
+        self.record_start = 0;
+        self.pending = 0;
+        Ok(())
+    }
+
+    fn push(&mut self, mut remaining: &[u8]) -> io::Result<()> {
+        while !remaining.is_empty() {
+            let take = remaining.len().min(BUFFER_SIZE - self.pending);
+            self.overlap.extend_from_slice(&remaining[..take]);
+            self.pending += take;
+            remaining = &remaining[take..];
+            if self.pending == BUFFER_SIZE {
+                self.flush()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+enum CountSink<'a> {
+    Serial(SerialBuffer<'a>),
+    Parallel(ParallelInput<'a>),
+}
+
+/// Streams one or more FASTA/FASTQ readers or files into a serial [`Counter`]
+/// or a [`ParallelInput`] producer, with optional periodic progress callbacks.
+pub struct Stream<'a, 'p> {
+    counter: CountSink<'a>,
+    records: u64,
+    bases: u64,
+    on_progress: Option<ProgressCallback<'p>>,
+    started: Instant,
+    last_report: Instant,
+    source: Option<PathBuf>,
+}
+
+impl<'a, 'p> Stream<'a, 'p> {
+    /// Create a stream that batches and counts into `counter`.
+    pub fn serial(counter: &'a mut Counter) -> Self {
+        let k = counter.k();
+        Self::with_sink(CountSink::Serial(SerialBuffer {
+            counter,
+            overlap: Vec::new(),
+            ends: Vec::new(),
+            record_start: 0,
+            pending: 0,
+            k,
+        }))
+    }
+
+    /// Create a stream that feeds a [`ParallelInput`] producer.
+    pub fn parallel(input: ParallelInput<'a>) -> Self {
+        Self::with_sink(CountSink::Parallel(input))
+    }
+
+    fn with_sink(counter: CountSink<'a>) -> Self {
+        let now = Instant::now();
+        Self {
+            counter,
+            records: 0,
+            bases: 0,
+            on_progress: None,
+            started: now,
+            last_report: now,
+            source: None,
+        }
+    }
+
+    /// Call `on_progress` about once per second while reading input.
+    pub fn with_progress(mut self, on_progress: ProgressCallback<'p>) -> Self {
+        self.on_progress = Some(on_progress);
+        self
+    }
+
+    /// Attach a source path label reported in [`Progress::source`].
+    pub fn with_source(mut self, source: impl Into<PathBuf>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    /// Read FASTA or FASTQ input from `reader`, auto-detecting gzip from the
+    /// content rather than a file extension.
+    pub fn add_reader<R: Read + Send + 'static>(&mut self, reader: R) -> io::Result<()> {
+        count_reader(reader, self)
+    }
+
+    /// Open `path` and read FASTA or FASTQ input from it, auto-detecting gzip
+    /// from content. Errors are prefixed with `path`.
+    pub fn add_file(&mut self, path: impl AsRef<Path>) -> io::Result<()> {
+        let path = path.as_ref();
+        File::open(path)
+            .and_then(|file| count_reader(file, self))
+            .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
+    }
+
+    /// Flush buffered sequence data, finalize any parallel producer, and return
+    /// the total records and bases read.
+    pub fn finish(mut self) -> io::Result<InputStats> {
+        self.flush()?;
+        if let CountSink::Parallel(input) = self.counter {
+            input.finish().map_err(io::Error::other)?;
+        }
+        Ok(InputStats {
+            records: self.records,
+            bases: self.bases,
+        })
+    }
+
+    #[cfg(test)]
+    fn serial_buffer(&self) -> &SerialBuffer<'a> {
+        match &self.counter {
+            CountSink::Serial(serial) => serial,
+            CountSink::Parallel(_) => panic!("expected serial sink"),
+        }
+    }
+
+    fn start_record(&mut self) -> io::Result<()> {
+        match &mut self.counter {
+            CountSink::Parallel(counter) => counter.start_record(),
+            CountSink::Serial(serial) => serial.start_record(),
+        }
+        self.records += 1;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match &mut self.counter {
+            CountSink::Serial(serial) => serial.flush(),
+            CountSink::Parallel(_) => Ok(()),
+        }
+    }
+
+    fn sequence(&mut self, bytes: &[u8]) -> io::Result<()> {
+        match &mut self.counter {
+            CountSink::Parallel(counter) => counter.add_sequence(bytes).map_err(io::Error::other)?,
+            CountSink::Serial(serial) => serial.push(bytes)?,
+        }
+        self.bases += bytes.len() as u64;
+        if let Some(report) = self.on_progress
+            && self.last_report.elapsed() >= Duration::from_secs(1)
+        {
+            self.flush()?;
+            report(Progress {
+                source: self.source.as_deref(),
+                records: self.records,
+                bases: self.bases,
+                distinct: match &self.counter {
+                    CountSink::Serial(serial) => Some(serial.counter.len()),
+                    CountSink::Parallel(_) => None,
+                },
+                elapsed: self.started.elapsed(),
+            })?;
+            self.last_report = Instant::now();
+        }
+        Ok(())
+    }
+}
+
+fn concurrent_file(path: &Path) -> bool {
+    fn descriptor_alias(path: &Path) -> bool {
+        path == Path::new("/dev/stdin")
+            || path.starts_with("/dev/fd")
+            || path.starts_with("/proc/self/fd")
+            || path.starts_with("/proc/thread-self/fd")
+    }
+    if descriptor_alias(path) {
+        return false;
+    }
+    let Ok(resolved) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    // fdescfs can report a regular file while opening it duplicates a shared
+    // descriptor offset. Resolve symlinks so these aliases also stay ordered.
+    !descriptor_alias(&resolved) && std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+/// Count FASTA/FASTQ files into parallel producers created by `input`, using
+/// up to `readers` concurrent file-reading threads when every path is a regular
+/// file.
+///
+/// Non-regular files (such as FIFOs or descriptor aliases) are read
+/// sequentially on the calling thread so an error in one file cannot block on
+/// another open pipe.
+pub fn count_parallel_files<'a, P: AsRef<Path> + Sync>(
+    input: impl Fn() -> ParallelInput<'a> + Sync,
+    paths: &[P],
+    readers: usize,
+    on_progress: Option<ProgressCallback<'_>>,
+) -> io::Result<InputStats> {
+    if readers == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "reader count must be greater than zero",
+        ));
+    }
+    // Blocking devices/FIFOs (including stdin aliases) cannot be interrupted
+    // when another file fails. Only regular files use concurrent readers.
+    if readers <= 1
+        || paths.len() <= 1
+        || !paths.iter().all(|path| concurrent_file(path.as_ref()))
+    {
+        let mut stream = Stream::parallel(input());
+        if let Some(report) = on_progress {
+            stream = stream.with_progress(report);
+        }
+        for path in paths {
+            stream.add_file(path)?;
+        }
+        return stream.finish();
+    }
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for index in 0..readers.min(paths.len()) {
+            let next = &next;
+            let input = &input;
+            handles.push(
+                std::thread::Builder::new()
+                    .name(format!("reader-{index}"))
+                    .spawn_scoped(scope, move || {
+                        let mut totals = InputStats::default();
+                        while let Some(path) = paths.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            let path = path.as_ref();
+                            let mut stream = Stream::parallel(input()).with_source(path);
+                            if let Some(report) = on_progress {
+                                stream = stream.with_progress(report);
+                            }
+                            stream.add_file(path)?;
+                            let stats = stream.finish()?;
+                            totals.records += stats.records;
+                            totals.bases += stats.bases;
+                        }
+                        Ok::<_, io::Error>(totals)
+                    })?,
+            );
+        }
+        let mut totals = InputStats::default();
+        for handle in handles {
+            let stats = handle
+                .join()
+                .map_err(|_| io::Error::other("input reader failed"))??;
+            totals.records += stats.records;
+            totals.bases += stats.bases;
+        }
+        Ok(totals)
+    })
+}
+
+fn count_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    counting: &mut Stream<'_, '_>,
+) -> io::Result<()> {
+    // Inspect bytes rather than extensions, including for stdin. Loop to
+    // handle readers which return only one byte per read. Reading the magic
+    // directly (not through a second buffer) avoids copying all input twice.
+    let mut magic = [0; 2];
+    let mut size = 0;
+    while size < magic.len() {
+        match reader.read(&mut magic[size..]) {
+            Ok(0) => break,
+            Ok(n) => size += n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    let reader = io::Cursor::new(magic).take(size as u64).chain(reader);
+    if size == 2 && magic == [0x1f, 0x8b] {
+        // The decoder buffers its own input.
+        decompress_concurrently(gzip::GzDecoder::new(reader), |decoded| {
+            count(decoded, counting)
+        })
+    } else {
+        count(BufReader::with_capacity(READ_BUFFER_SIZE, reader), counting)
+    }
+}
+
+/// Run `decoder` on its own thread while `parse` consumes its output.
+///
+/// Inflating and parsing a single gzip stream are both sequential, but they
+/// need not share a thread. Bounded, recycled chunks keep memory constant.
+/// Decoder errors arrive after all bytes decoded before them, in stream order.
+/// Each chunk holds whatever the input read so far decodes to, so input
+/// arriving slowly (such as from a pipe) is parsed as soon as it can be
+/// decoded.
+///
+/// The decoder thread owns its input. When parsing fails, this returns
+/// without waiting for it: a decoder blocked reading a slow pipe would
+/// otherwise delay the error. It exits at its next send (or with the process).
+fn decompress_concurrently<R: Read + Send + 'static>(
+    mut decoder: gzip::GzDecoder<R>,
+    parse: impl FnOnce(&mut DecodedChunks) -> io::Result<()>,
+) -> io::Result<()> {
+    let (sender, receiver) = crossbeam_channel::bounded::<io::Result<(Vec<u8>, usize)>>(4);
+    let (recycle, recycled) = crossbeam_channel::bounded::<Vec<u8>>(8);
+    let decoding = std::thread::Builder::new()
+        .name("decoder".into())
+        .spawn(move || {
+            loop {
+                // Buffers keep their full length; the decoded bytes follow
+                // the first `gzip::WINDOW`.
+                let mut chunk = recycled
+                    .try_recv()
+                    .unwrap_or_else(|_| vec![0; DECODED_BUFFER_SIZE]);
+                match decoder.read_chunk(&mut chunk) {
+                    Ok(0) => return, // End of stream: dropping the sender signals EOF.
+                    Ok(len) => {
+                        if sender.send(Ok((chunk, len))).is_err() {
+                            return; // The parser stopped early.
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                        return;
+                    }
+                }
+            }
+        })?;
+    let mut chunks = DecodedChunks {
+        receiver,
+        recycle,
+        chunk: Vec::new(),
+        len: 0,
+        position: 0,
+    };
+    let result = parse(&mut chunks);
+    // Dropping the receiver releases a decoder blocked on a full queue.
+    drop(chunks);
+    result?;
+    // Parsing succeeded, so it read to the end of the stream and the decoder
+    // has finished. A panicking decoder also ends the stream early; report it
+    // rather than accepting truncated input.
+    decoding
+        .join()
+        .map_err(|_| io::Error::other("gzip decoder failed"))
+}
+
+/// A `BufRead` view over chunks produced by `decompress_concurrently`.
+struct DecodedChunks {
+    receiver: crossbeam_channel::Receiver<io::Result<(Vec<u8>, usize)>>,
+    recycle: crossbeam_channel::Sender<Vec<u8>>,
+    // The current chunk; bytes `position..len` are unread.
+    chunk: Vec<u8>,
+    len: usize,
+    position: usize,
+}
+
+impl Read for DecodedChunks {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let available = self.fill_buf()?;
+        let len = available.len().min(buffer.len());
+        buffer[..len].copy_from_slice(&available[..len]);
+        self.consume(len);
+        Ok(len)
+    }
+}
+
+impl BufRead for DecodedChunks {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        while self.position == self.len {
+            match self.receiver.recv() {
+                Ok(chunk) => {
+                    let (chunk, len) = chunk?;
+                    let used = std::mem::replace(&mut self.chunk, chunk);
+                    (self.len, self.position) = (gzip::WINDOW + len, gzip::WINDOW);
+                    // Only full-size buffers are reused for decoding.
+                    if used.len() == DECODED_BUFFER_SIZE {
+                        let _ = self.recycle.try_send(used);
+                    }
+                }
+                // The decoder finished (or failed after reporting its error).
+                Err(_) => return Ok(&[]),
+            }
+        }
+        Ok(&self.chunk[self.position..self.len])
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.position = (self.position + amount).min(self.len);
+    }
+}
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -86,7 +550,7 @@ impl<R: BufRead> Lines<R> {
         Ok(())
     }
 
-    fn sequence(&mut self, counting: &mut Counting<'_>) -> io::Result<u64> {
+    fn sequence(&mut self, counting: &mut Stream<'_, '_>) -> io::Result<u64> {
         self.line(|bytes| {
             if !valid_sequence(bytes) {
                 return Err(invalid(
@@ -105,7 +569,7 @@ impl<R: BufRead> Lines<R> {
     /// bytes, and matching sequence/quality lengths. A record that straddles
     /// the buffer end, wraps, or is invalid is left unconsumed, so the general
     /// parser handles it and reports any error with the same line number.
-    fn fastq_records(&mut self, counting: &mut Counting<'_>) -> io::Result<()> {
+    fn fastq_records(&mut self, counting: &mut Stream<'_, '_>) -> io::Result<()> {
         let buffer = self.reader.fill_buf()?;
         let mut consumed = 0;
         let mut records = 0;
@@ -185,7 +649,7 @@ fn split_fastq_record(bytes: &[u8]) -> Option<(usize, &[u8])> {
     accepted.then_some((quality_end + 1, sequence))
 }
 
-pub(super) fn count<R: BufRead>(reader: R, counting: &mut Counting<'_>) -> io::Result<()> {
+fn count<R: BufRead>(reader: R, counting: &mut Stream<'_, '_>) -> io::Result<()> {
     let mut lines = Lines { reader, number: 0 };
     let result = match lines.peek()? {
         None => Ok(()),
@@ -197,7 +661,7 @@ pub(super) fn count<R: BufRead>(reader: R, counting: &mut Counting<'_>) -> io::R
     counting.flush()
 }
 
-fn fasta<R: BufRead>(lines: &mut Lines<R>, counting: &mut Counting<'_>) -> io::Result<()> {
+fn fasta<R: BufRead>(lines: &mut Lines<R>, counting: &mut Stream<'_, '_>) -> io::Result<()> {
     while let Some(first) = lines.peek()? {
         if first == b'>' {
             lines.header()?;
@@ -209,7 +673,7 @@ fn fasta<R: BufRead>(lines: &mut Lines<R>, counting: &mut Counting<'_>) -> io::R
     Ok(())
 }
 
-fn fastq<R: BufRead>(lines: &mut Lines<R>, counting: &mut Counting<'_>) -> io::Result<()> {
+fn fastq<R: BufRead>(lines: &mut Lines<R>, counting: &mut Stream<'_, '_>) -> io::Result<()> {
     loop {
         lines.fastq_records(counting)?;
         let Some(first) = lines.peek()? else { break };
@@ -265,14 +729,26 @@ fn fastq<R: BufRead>(lines: &mut Lines<R>, counting: &mut Counting<'_>) -> io::R
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::io::{BufReader, Cursor};
+    use std::io::{BufReader, Cursor, Write};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    use kbolt::{Counter, StrandMode};
+    use crate::{Counter, DiskCounter, ParallelCounter, StrandMode};
 
     use super::*;
 
     fn counts(counter: &Counter) -> HashMap<Vec<u8>, u64> {
         counter.counts().collect()
+    }
+
+    fn temp_dir() -> PathBuf {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "kbolt-input-test-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        path
     }
 
     #[test]
@@ -319,12 +795,12 @@ mod tests {
                 for size in [1, 2, 3, 7, 32, 67, 1024] {
                     for fixture in [&fasta, &fastq] {
                         let mut counter = Counter::new(k, strand).unwrap();
-                        let mut counting = Counting::new(&mut counter, k, false);
+                        let mut counting = Stream::serial(&mut counter);
                         let reader = BufReader::with_capacity(size, Cursor::new(fixture));
                         count(reader, &mut counting).unwrap();
                         assert_eq!(counting.records, records.len() as u64);
                         assert_eq!(counting.bases, records.iter().map(|r| r.len() as u64).sum());
-                        assert!(counting.serial().overlap.len() < k);
+                        assert!(counting.serial_buffer().overlap.len() < k);
                         counting.finish().unwrap();
                         assert_eq!(counts(&counter), counts(&expected), "k={k}, buffer={size}");
                     }
@@ -353,7 +829,7 @@ mod tests {
         ] {
             for size in [1, 2, 64] {
                 let mut counter = Counter::new(3, StrandMode::Canonical).unwrap();
-                let mut counting = Counting::new(&mut counter, 3, false);
+                let mut counting = Stream::serial(&mut counter);
                 let error = count(BufReader::with_capacity(size, fixture), &mut counting)
                     .expect_err(&format!("fixture={fixture:?}"));
                 assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -368,7 +844,7 @@ mod tests {
         fasta.extend_from_slice(&header);
         fasta.extend_from_slice(b"\nACG\n");
         let mut counter = Counter::new(3, StrandMode::Forward).unwrap();
-        let mut counting = Counting::new(&mut counter, 3, false);
+        let mut counting = Stream::serial(&mut counter);
         count(
             BufReader::with_capacity(13, fasta.as_slice()),
             &mut counting,
@@ -382,10 +858,148 @@ mod tests {
     fn accepts_empty_input_and_empty_records() {
         for fixture in [b"".as_slice(), b">empty\n", b"@empty\n\n+\n\n"] {
             let mut counter = Counter::new(3, StrandMode::Canonical).unwrap();
-            let mut counting = Counting::new(&mut counter, 3, false);
+            let mut counting = Stream::serial(&mut counter);
             count(BufReader::new(fixture), &mut counting).unwrap();
             counting.finish().unwrap();
             assert!(counter.is_empty());
         }
+    }
+
+    #[test]
+    fn batched_wrapped_records_preserve_windows_and_reset_at_records() {
+        let mut sequence = b"ACGTTGCAGATTCGAC".repeat(10_000);
+        for index in [BUFFER_SIZE - 1, BUFFER_SIZE, 2 * BUFFER_SIZE + 5] {
+            sequence[index] = b'N';
+        }
+        let mut fasta = b">large\r\n".to_vec();
+        for part in sequence.chunks(77) {
+            fasta.extend_from_slice(part);
+            fasta.extend_from_slice(b"\r\n");
+        }
+        fasta.extend_from_slice(b">short\r\nAC\r\n>short2\r\nGT");
+        for k in [1, 31, 32, 33, 63, 64, 65, 128, 129] {
+            for strand in [StrandMode::Forward, StrandMode::Canonical] {
+                let mut expected = Counter::new(k, strand).unwrap();
+                for record in [sequence.as_slice(), b"AC", b"GT"] {
+                    expected.add_record(record).unwrap();
+                }
+                let mut actual = Counter::new(k, strand).unwrap();
+                let mut counting = Stream::serial(&mut actual);
+                count_reader(Cursor::new(fasta.clone()), &mut counting).unwrap();
+                assert_eq!(counting.serial_buffer().pending, 0);
+                assert!(counting.serial_buffer().overlap.len() < k);
+                assert!(counting.serial_buffer().overlap.capacity() <= 2 * (BUFFER_SIZE + k - 1));
+                assert_eq!(counting.records, 3);
+                assert_eq!(counting.bases, sequence.len() as u64 + 4);
+                counting.finish().unwrap();
+                assert_eq!(counts(&actual), counts(&expected), "k={k}, strand={strand:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn counts_generated_large_record_with_bounded_input_storage() {
+        let bases = 4 * 1024 * 1024;
+        let reader = Cursor::new(b">generated\n")
+            .chain(io::repeat(b'A').take(bases))
+            .chain(Cursor::new(b"\n"));
+        let mut counter = Counter::new(31, StrandMode::Canonical).unwrap();
+        let mut counting = Stream::serial(&mut counter);
+        count_reader(reader, &mut counting).unwrap();
+        assert_eq!(counting.records, 1);
+        assert_eq!(counting.bases, bases);
+        assert_eq!(counting.serial_buffer().overlap.len(), 30);
+        assert!(counting.serial_buffer().overlap.capacity() <= 2 * (BUFFER_SIZE + 30));
+        counting.finish().unwrap();
+        assert_eq!(
+            counter.counts().collect::<Vec<_>>(),
+            [(vec![b'A'; 31], bases - 30)]
+        );
+    }
+
+    #[test]
+    fn detects_compression_with_short_reads() {
+        struct SingleByte<R>(R);
+        impl<R: Read> Read for SingleByte<R> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let len = buffer.len().min(1);
+                self.0.read(&mut buffer[..len])
+            }
+        }
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(b">x\nACGT\n").unwrap();
+        let compressed = encoder.finish().unwrap();
+        for bytes in [b">x\nACGT\n".as_slice(), compressed.as_slice()] {
+            let mut counter = Counter::new(3, StrandMode::Canonical).unwrap();
+            let stats = counter
+                .add_reader(SingleByte(Cursor::new(bytes.to_vec())))
+                .unwrap();
+            assert_eq!(stats, InputStats { records: 1, bases: 4 });
+            assert_eq!(counter.counts().collect::<Vec<_>>(), [(b"ACG".to_vec(), 2)]);
+        }
+    }
+
+    #[test]
+    fn propagates_input_io_failures() {
+        struct FailingReader;
+        impl Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("injected read failure"))
+            }
+        }
+        let reader = Cursor::new(b">x\nACGT\n").chain(FailingReader);
+        let mut counter = Counter::new(3, StrandMode::Canonical).unwrap();
+        assert!(
+            counter
+                .add_reader(reader)
+                .unwrap_err()
+                .to_string()
+                .contains("injected read failure")
+        );
+    }
+
+    #[test]
+    fn file_helpers_work_across_counter_types_and_compression() {
+        let dir = temp_dir();
+        let plain = dir.join("a.fa");
+        let compressed = dir.join("b.fq.gz");
+        std::fs::write(&plain, b">r1\nACGTAC\n").unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(b"@r2\ncgtacg\n+\n!!!!!!\n").unwrap();
+        std::fs::write(&compressed, gz.finish().unwrap()).unwrap();
+
+        let files = [&plain, &compressed];
+
+        let mut serial = Counter::new(3, StrandMode::Canonical).unwrap();
+        let serial_stats = serial.add_files(files).unwrap();
+        assert_eq!(serial_stats, InputStats { records: 2, bases: 12 });
+
+        let parallel = ParallelCounter::new(3, StrandMode::Canonical, 2).unwrap();
+        let parallel_stats = parallel.add_files(&files, 2).unwrap();
+        assert_eq!(parallel_stats, serial_stats);
+        let parallel = parallel.finish().unwrap();
+        assert_eq!(counts(&parallel), counts(&serial));
+
+        let disk = DiskCounter::new(3, StrandMode::Canonical, 2, 64 << 20, &dir).unwrap();
+        let disk_stats = disk.add_files(&files, 2).unwrap();
+        assert_eq!(disk_stats, serial_stats);
+        let mut tsv = Vec::new();
+        disk.finish().unwrap().write_tsv(&mut tsv).unwrap();
+        let mut expected_tsv = Vec::new();
+        serial.write_tsv(&mut expected_tsv).unwrap();
+        let mut actual_lines: Vec<_> = tsv.split(|&b| b == b'\n').collect();
+        let mut expected_lines: Vec<_> = expected_tsv.split(|&b| b == b'\n').collect();
+        actual_lines.sort();
+        expected_lines.sort();
+        assert_eq!(actual_lines, expected_lines);
+
+        // Zero readers is rejected.
+        let parallel = ParallelCounter::new(3, StrandMode::Canonical, 2).unwrap();
+        assert_eq!(
+            parallel.add_files(&files, 0).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

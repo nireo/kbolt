@@ -657,6 +657,36 @@ impl DiskCounter {
         self.parallel.input()
     }
 
+    /// Stream FASTA or FASTQ records from `reader`, auto-detecting gzip
+    /// compression from content, and submit them for binning.
+    pub fn add_reader(
+        &self,
+        reader: impl io::Read + Send + 'static,
+    ) -> io::Result<crate::InputStats> {
+        let mut stream = crate::input::Stream::parallel(self.input());
+        stream.add_reader(reader)?;
+        stream.finish()
+    }
+
+    /// Stream FASTA or FASTQ records from the file at `path`, auto-detecting
+    /// gzip compression from content, and submit them for binning.
+    pub fn add_file(&self, path: impl AsRef<Path>) -> io::Result<crate::InputStats> {
+        let mut stream = crate::input::Stream::parallel(self.input());
+        stream.add_file(path)?;
+        stream.finish()
+    }
+
+    /// Stream FASTA or FASTQ records from `paths` using up to `readers`
+    /// concurrent file-reading threads (when all paths are regular files),
+    /// auto-detecting gzip compression from content.
+    pub fn add_files<P: AsRef<Path> + Sync>(
+        &self,
+        paths: &[P],
+        readers: usize,
+    ) -> io::Result<crate::InputStats> {
+        crate::input::count_parallel_files(|| self.input(), paths, readers, None)
+    }
+
     /// Wait for all submitted input to be split into bins.
     pub fn finish(self) -> io::Result<DiskCounts> {
         let (k, strand, threads) = self.parallel.shape();

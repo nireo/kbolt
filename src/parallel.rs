@@ -1107,6 +1107,37 @@ impl ParallelCounter {
         }
     }
 
+    /// Stream FASTA or FASTQ records from `reader`, auto-detecting gzip
+    /// compression from content, and submit them to this counter's workers.
+    pub fn add_reader(
+        &self,
+        reader: impl std::io::Read + Send + 'static,
+    ) -> std::io::Result<crate::InputStats> {
+        let mut stream = crate::input::Stream::parallel(self.input());
+        stream.add_reader(reader)?;
+        stream.finish()
+    }
+
+    /// Stream FASTA or FASTQ records from the file at `path`, auto-detecting
+    /// gzip compression from content, and submit them to this counter's
+    /// workers.
+    pub fn add_file(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<crate::InputStats> {
+        let mut stream = crate::input::Stream::parallel(self.input());
+        stream.add_file(path)?;
+        stream.finish()
+    }
+
+    /// Stream FASTA or FASTQ records from `paths` using up to `readers`
+    /// concurrent file-reading threads (when all paths are regular files),
+    /// auto-detecting gzip compression from content.
+    pub fn add_files<P: AsRef<std::path::Path> + Sync>(
+        &self,
+        paths: &[P],
+        readers: usize,
+    ) -> std::io::Result<crate::InputStats> {
+        crate::input::count_parallel_files(|| self.input(), paths, readers, None)
+    }
+
     /// Wait for counting and retain the final key partitions without reinsertion.
     pub fn finish(self) -> Result<Counter, Error> {
         self.finish_with_stats().map(|(counter, _)| counter)

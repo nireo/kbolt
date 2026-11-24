@@ -1,16 +1,20 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::path::Path;
 
 pub mod database;
 mod disk;
+mod gzip;
+pub mod input;
 mod parallel;
 mod sorted;
 mod table;
 mod table_wide;
 
 pub use disk::{DiskCounter, DiskCounts};
+pub use input::InputStats;
 pub use parallel::{ParallelCounter, ParallelInput, ParallelStats};
 use table::PackedCounts;
 use table_wide::{HighKey, PackedCountsWide};
@@ -576,6 +580,16 @@ impl Counter {
         (counts.tables().len() >> serial).max(1)
     }
 
+    /// Return the k-mer length of this counter.
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    /// Return the strand mode of this counter.
+    pub fn strand(&self) -> StrandMode {
+        self.strand
+    }
+
     /// Return the number of distinct k-mers counted so far.
     pub fn len(&self) -> usize {
         match &self.counts {
@@ -588,6 +602,36 @@ impl Counter {
     /// Return whether no valid k-mers have been counted.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Stream FASTA or FASTQ records from `reader`, auto-detecting gzip
+    /// compression from content, and add their k-mers to this counter.
+    pub fn add_reader(&mut self, reader: impl Read + Send + 'static) -> io::Result<InputStats> {
+        let mut stream = input::Stream::serial(self);
+        stream.add_reader(reader)?;
+        stream.finish()
+    }
+
+    /// Stream FASTA or FASTQ records from the file at `path`, auto-detecting
+    /// gzip compression from content, and add their k-mers to this counter.
+    pub fn add_file(&mut self, path: impl AsRef<Path>) -> io::Result<InputStats> {
+        let mut stream = input::Stream::serial(self);
+        stream.add_file(path)?;
+        stream.finish()
+    }
+
+    /// Stream FASTA or FASTQ records from each file in `paths` in order,
+    /// auto-detecting gzip compression from content, and add their k-mers to
+    /// this counter.
+    pub fn add_files<P: AsRef<Path>>(
+        &mut self,
+        paths: impl IntoIterator<Item = P>,
+    ) -> io::Result<InputStats> {
+        let mut stream = input::Stream::serial(self);
+        for path in paths {
+            stream.add_file(path)?;
+        }
+        stream.finish()
     }
 
     /// Write headerless `KMER<TAB>COUNT` rows. For k <= 32 they come in the

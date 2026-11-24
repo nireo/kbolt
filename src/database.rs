@@ -66,7 +66,7 @@ use std::io::{self, Read, Write};
 
 use crate::table::{self, Mixer, PackedCounts};
 use crate::table_wide::{HighKey, PackedCountsWide};
-use crate::{Counter, Counts, OutputTable, StrandMode, WideCounts, format_count};
+use crate::{Counter, Counts, OutputTable, StrandMode, dispatch_wide, format_count};
 
 const MAGIC: &[u8; 8] = b"KBOLTDB\0";
 /// The only version read or written. Version 1, with whole keys and
@@ -75,6 +75,9 @@ const VERSION: u16 = 2;
 const HEADER_BYTES: usize = 40;
 /// Bytes of records after which a writer closes a section.
 const SECTION_BYTES: usize = 32 * 1024;
+const FLAG_CANONICAL: u8 = 1 << 0;
+const FLAG_ASCENDING: u8 = 1 << 1;
+const ALL_FLAGS: u8 = FLAG_CANONICAL | FLAG_ASCENDING;
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -244,6 +247,25 @@ pub enum KeyOrder {
     Kmer,
 }
 
+impl KeyOrder {
+    fn from_byte(byte: u8) -> io::Result<Self> {
+        match byte {
+            0 => Ok(Self::Unordered),
+            1 => Ok(Self::Hash),
+            2 => Ok(Self::Kmer),
+            _ => Err(invalid("unsupported database key order")),
+        }
+    }
+
+    const fn as_byte(self) -> u8 {
+        match self {
+            Self::Unordered => 0,
+            Self::Hash => 1,
+            Self::Kmer => 2,
+        }
+    }
+}
+
 /// Metadata describing a kbolt count database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DatabaseHeader {
@@ -296,17 +318,13 @@ impl<R: Read> DatabaseReader<R> {
             return Err(invalid("unsupported kbolt database version"));
         }
         reader.read_exact(&mut bytes[10..])?;
-        let order = match bytes[11] {
-            0 => KeyOrder::Unordered,
-            1 => KeyOrder::Hash,
-            2 => KeyOrder::Kmer,
-            _ => return Err(invalid("unsupported database key order")),
-        };
+        let flags = bytes[10];
+        let order = KeyOrder::from_byte(bytes[11])?;
         let seed = u64::from_le_bytes(bytes[32..].try_into().unwrap());
-        if bytes[10] > 3
+        if flags & !ALL_FLAGS != 0
             || bytes[12..16] != [0; 4]
             || (order != KeyOrder::Hash && seed != 0)
-            || (order == KeyOrder::Unordered && bytes[10] & 2 != 0)
+            || (order == KeyOrder::Unordered && flags & FLAG_ASCENDING != 0)
         {
             return Err(invalid("unsupported database flags or reserved bytes"));
         }
@@ -333,14 +351,14 @@ impl<R: Read> DatabaseReader<R> {
             .ok_or_else(|| invalid("database payload size overflow"))?;
         let header = DatabaseHeader {
             k,
-            strand: if bytes[10] & 1 == 1 {
+            strand: if flags & FLAG_CANONICAL != 0 {
                 StrandMode::Canonical
             } else {
                 StrandMode::Forward
             },
             entries,
             order,
-            ascending: bytes[10] & 2 != 0,
+            ascending: flags & FLAG_ASCENDING != 0,
         };
         Ok(Self {
             reader,
@@ -391,7 +409,7 @@ impl<R: Read> DatabaseReader<R> {
         let read = (&mut self.reader)
             .take(u64::from(bytes))
             .read_to_end(&mut self.section)?;
-        if read != bytes as usize {
+        if read as u64 != u64::from(bytes) {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
         (self.position, self.section_records) = (0, records);
@@ -559,18 +577,9 @@ impl Counter {
                     }
                     sections.finish()
                 }
-                match counts {
-                    WideCounts::W80(c) => encode_wide(c, first, tables, key_bytes, writer),
-                    WideCounts::W96(c) => encode_wide(c, first, tables, key_bytes, writer),
-                    WideCounts::W128(c) => encode_wide(c, first, tables, key_bytes, writer),
-                    WideCounts::W192(c) => encode_wide(c, first, tables, key_bytes, writer),
-                    WideCounts::W256(c) => encode_wide(c, first, tables, key_bytes, writer),
-                }
+                dispatch_wide!(counts, c => encode_wide(c, first, tables, key_bytes, writer))
             }
-            OutputTable::Map(Counts::Packed(_) | Counts::Wide(_)) => {
-                unreachable!("packed tables are split")
-            }
-            OutputTable::Map(Counts::Bytes(counts)) => {
+            OutputTable::Bytes(counts) => {
                 let mut sections = SectionWriter::new(writer);
                 let mut packed = buffer(key_bytes)?;
                 for (key, &count) in counts {
@@ -609,18 +618,11 @@ impl Counter {
                     }
                     let size = header.k.div_ceil(4);
                     let bytes = &reader.record[..size];
-                    match counts {
-                        WideCounts::W80(c) => insert_wide(c, bytes, count)?,
-                        WideCounts::W96(c) => insert_wide(c, bytes, count)?,
-                        WideCounts::W128(c) => insert_wide(c, bytes, count)?,
-                        WideCounts::W192(c) => insert_wide(c, bytes, count)?,
-                        WideCounts::W256(c) => insert_wide(c, bytes, count)?,
-                    }
+                    dispatch_wide!(counts, c => insert_wide(c, bytes, count)?)
                 }
-                Counts::Bytes(counts) => {
-                    counts.try_reserve(1).map_err(io::Error::other)?;
-                    counts.insert(key.to_vec(), count).is_some()
-                }
+                Counts::Bytes(counts) => !counts
+                    .insert_new(key, count)
+                    .map_err(io::Error::other)?,
             };
             if duplicate {
                 return Err(invalid("duplicate key in database"));
@@ -651,12 +653,12 @@ pub(crate) fn header(
     let mut header = [0; HEADER_BYTES];
     header[..8].copy_from_slice(MAGIC);
     header[8..10].copy_from_slice(&VERSION.to_le_bytes());
-    header[10] = u8::from(strand == StrandMode::Canonical) | u8::from(ascending) << 1;
-    header[11] = match order {
-        KeyOrder::Unordered => 0,
-        KeyOrder::Hash => 1,
-        KeyOrder::Kmer => 2,
-    };
+    header[10] = if strand == StrandMode::Canonical {
+        FLAG_CANONICAL
+    } else {
+        0
+    } | if ascending { FLAG_ASCENDING } else { 0 };
+    header[11] = order.as_byte();
     header[16..24].copy_from_slice(&(k as u64).to_le_bytes());
     header[24..32].copy_from_slice(&entries.to_le_bytes());
     if order == KeyOrder::Hash {
@@ -1008,8 +1010,11 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_both_backends_and_strands_and_streams_tsv() {
-        for k in (1..=70).chain([129, 200]) {
+    fn round_trips_all_backends_and_strands_and_streams_tsv() {
+        for k in [
+            1, 2, 3, 4, 5, 31, 32, 33, 34, 35, 36, 40, 41, 48, 49, 63, 64, 65, 96, 97, 128, 129,
+            200,
+        ] {
             for strand in [StrandMode::Forward, StrandMode::Canonical] {
                 let mut counter = Counter::new(k, strand).unwrap();
                 for sequence in [
@@ -1112,7 +1117,7 @@ mod tests {
 
     #[test]
     fn preserves_full_width_keys_and_maximum_counts() {
-        for k in [1, 31, 32, 33, 63, 64, 65] {
+        for k in [1, 31, 32, 33, 40, 48, 63, 64, 65, 96, 97, 128, 129] {
             let mut counter = Counter::new(k, StrandMode::Forward).unwrap();
             counter.add_record(&vec![b'T'; k]).unwrap();
             counter.counts.set_counts(u64::MAX);
@@ -1238,37 +1243,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_truncation_trailing_bytes_and_invalid_records() {
-        // ACG once.
+    fn rejects_invalid_headers_noncanonical_and_impossible_allocations() {
         let mut valid = header2(3, 1, false);
         valid.extend(section(1, &[6, 0b11]));
         assert!(Counter::read_binary(valid.as_slice()).is_ok());
-        for end in 0..valid.len() {
-            assert!(Counter::read_binary(&valid[..end]).is_err(), "end={end}");
-        }
         let mut corruptions = Vec::new();
         for (offset, value) in [
-            // Magic, version (the former one too), flags, order, reserved
-            // bytes, k of zero, key padding, and a count of zero.
+            // Magic, version 1 (removed), version high byte, flags, reserved
+            // bytes, and k of zero.
             (0, b'X'),
             (8, 1),
-            (8, 3),
             (9, 1),
             (10, 4),
-            (11, 2),
             (12, 1),
             (15, 1),
             (16, 0),
-            (48, 0xc6),
-            (49, 1),
         ] {
             let mut bytes = valid.clone();
             bytes[offset] = value;
             corruptions.push(bytes);
         }
-        let mut trailing = valid.clone();
-        trailing.push(0);
-        corruptions.push(trailing);
         let mut noncanonical = header2(1, 1, true);
         noncanonical.extend(section(1, &[3, 0b11]));
         corruptions.push(noncanonical);

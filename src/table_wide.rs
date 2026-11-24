@@ -27,47 +27,30 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::Hash;
 
-use crate::table::{Load, MASK_BITS, Overflow, bucket_masks_8_unaligned, prefetch};
+use crate::table::{
+    Buckets, C1, C1_INVERSE, C2, C2_INVERSE, Load, MASK_BITS, Overflow, SEED, bucket_masks_8,
+    prefetch,
+};
 use crate::{Error, decode_packed32};
 
-const M1: u64 = 0xbf58_476d_1ce4_e5b9;
-const M2: u64 = 0x94d0_49bb_1331_11eb;
 const M3: u64 = 0x9e37_79b9_7f4a_7c15;
-
-const fn inverse64(value: u64) -> u64 {
-    let mut inv = value;
-    let mut step = 0;
-    while step < 6 {
-        inv = inv.wrapping_mul(2_u64.wrapping_sub(value.wrapping_mul(inv)));
-        step += 1;
-    }
-    inv
-}
-
-const M1_INV: u64 = inverse64(M1);
-const M2_INV: u64 = inverse64(M2);
-
-const _: () = assert!(M1.wrapping_mul(M1_INV) == 1);
-const _: () = assert!(M2.wrapping_mul(M2_INV) == 1);
-
-const SEED: u64 = 0x6b62_6f6c_7420_7632;
 
 #[inline(always)]
 pub(crate) fn mix_lo<H: HighKey>(hi: H, lo: u64) -> u64 {
     let mut x = lo ^ hi.fold() ^ SEED;
     x ^= x >> 32;
-    x = x.wrapping_mul(M1);
+    x = x.wrapping_mul(C1);
     x ^= x >> 32;
-    x = x.wrapping_mul(M2);
+    x = x.wrapping_mul(C2);
     x ^ (x >> 32)
 }
 
 #[inline(always)]
 pub(crate) fn unmix_lo<H: HighKey>(hi: H, l: u64) -> u64 {
     let mut x = l ^ (l >> 32);
-    x = x.wrapping_mul(M2_INV);
+    x = x.wrapping_mul(C2_INVERSE);
     x ^= x >> 32;
-    x = x.wrapping_mul(M1_INV);
+    x = x.wrapping_mul(C1_INVERSE);
     x ^= x >> 32;
     x ^ hi.fold() ^ SEED
 }
@@ -101,139 +84,61 @@ pub(crate) trait HighKey: Copy + Eq + Hash + Default + Send + Sync + 'static {
     fn cmp_key(self, lo: u64, other_hi: Self, other_lo: u64) -> Ordering;
 }
 
-impl HighKey for u16 {
-    #[inline(always)]
-    fn fold(self) -> u64 {
-        u64::from(self).wrapping_mul(M1)
-    }
+macro_rules! impl_scalar_high_key {
+    ($ty:ty, $buf_len:expr) => {
+        impl HighKey for $ty {
+            #[inline(always)]
+            fn fold(self) -> u64 {
+                u64::from(self).wrapping_mul(C1)
+            }
 
-    #[inline(always)]
-    fn push_le(self, lo: u64, key_bytes: usize, out: &mut Vec<u8>) {
-        let end = out.len() + key_bytes;
-        out.extend_from_slice(&lo.to_le_bytes());
-        out.extend_from_slice(&self.to_le_bytes());
-        out.truncate(end);
-    }
+            #[inline(always)]
+            fn push_le(self, lo: u64, key_bytes: usize, out: &mut Vec<u8>) {
+                let end = out.len() + key_bytes;
+                out.extend_from_slice(&lo.to_le_bytes());
+                out.extend_from_slice(&self.to_le_bytes());
+                out.truncate(end);
+            }
 
-    #[inline(always)]
-    fn read_le(bytes: &[u8]) -> (Self, u64) {
-        let mut buf = [0_u8; 10];
-        buf[..bytes.len()].copy_from_slice(bytes);
-        let lo = u64::from_le_bytes(buf[..8].try_into().unwrap());
-        let hi = u16::from_le_bytes(buf[8..10].try_into().unwrap());
-        (hi, lo)
-    }
+            #[inline(always)]
+            fn read_le(bytes: &[u8]) -> (Self, u64) {
+                let mut buf = [0_u8; $buf_len];
+                buf[..bytes.len()].copy_from_slice(bytes);
+                let lo = u64::from_le_bytes(buf[..8].try_into().unwrap());
+                let hi = <$ty>::from_le_bytes(buf[8..$buf_len].try_into().unwrap());
+                (hi, lo)
+            }
 
-    #[inline(always)]
-    fn decode_into(self, lo: u64, dna: &mut [u8]) {
-        let split = dna.len() - 32;
-        let high = decode_packed32(u64::from(self), split);
-        let low = decode_packed32(lo, 32);
-        dna[..split].copy_from_slice(&high[..split]);
-        dna[split..].copy_from_slice(&low);
-    }
+            #[inline(always)]
+            fn decode_into(self, lo: u64, dna: &mut [u8]) {
+                let split = dna.len() - 32;
+                let high = decode_packed32(u64::from(self), split);
+                let low = decode_packed32(lo, 32);
+                dna[..split].copy_from_slice(&high[..split]);
+                dna[split..].copy_from_slice(&low);
+            }
 
-    #[inline(always)]
-    fn top_bits(self, lo: u64, k: usize, bucket_bits: u32) -> usize {
-        extract_top_bits(u64::from(self), lo, (2 * k - 64) as u32, bucket_bits)
-    }
+            #[inline(always)]
+            fn top_bits(self, lo: u64, k: usize, bucket_bits: u32) -> usize {
+                extract_top_bits(u64::from(self), lo, (2 * k - 64) as u32, bucket_bits)
+            }
 
-    #[inline(always)]
-    fn cmp_key(self, lo: u64, other_hi: Self, other_lo: u64) -> Ordering {
-        (self, lo).cmp(&(other_hi, other_lo))
-    }
+            #[inline(always)]
+            fn cmp_key(self, lo: u64, other_hi: Self, other_lo: u64) -> Ordering {
+                (self, lo).cmp(&(other_hi, other_lo))
+            }
+        }
+    };
 }
 
-impl HighKey for u32 {
-    #[inline(always)]
-    fn fold(self) -> u64 {
-        u64::from(self).wrapping_mul(M1)
-    }
-
-    #[inline(always)]
-    fn push_le(self, lo: u64, key_bytes: usize, out: &mut Vec<u8>) {
-        let end = out.len() + key_bytes;
-        out.extend_from_slice(&lo.to_le_bytes());
-        out.extend_from_slice(&self.to_le_bytes());
-        out.truncate(end);
-    }
-
-    #[inline(always)]
-    fn read_le(bytes: &[u8]) -> (Self, u64) {
-        let mut buf = [0_u8; 12];
-        buf[..bytes.len()].copy_from_slice(bytes);
-        let lo = u64::from_le_bytes(buf[..8].try_into().unwrap());
-        let hi = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-        (hi, lo)
-    }
-
-    #[inline(always)]
-    fn decode_into(self, lo: u64, dna: &mut [u8]) {
-        let split = dna.len() - 32;
-        let high = decode_packed32(u64::from(self), split);
-        let low = decode_packed32(lo, 32);
-        dna[..split].copy_from_slice(&high[..split]);
-        dna[split..].copy_from_slice(&low);
-    }
-
-    #[inline(always)]
-    fn top_bits(self, lo: u64, k: usize, bucket_bits: u32) -> usize {
-        extract_top_bits(u64::from(self), lo, (2 * k - 64) as u32, bucket_bits)
-    }
-
-    #[inline(always)]
-    fn cmp_key(self, lo: u64, other_hi: Self, other_lo: u64) -> Ordering {
-        (self, lo).cmp(&(other_hi, other_lo))
-    }
-}
-
-impl HighKey for u64 {
-    #[inline(always)]
-    fn fold(self) -> u64 {
-        self.wrapping_mul(M1)
-    }
-
-    #[inline(always)]
-    fn push_le(self, lo: u64, key_bytes: usize, out: &mut Vec<u8>) {
-        let end = out.len() + key_bytes;
-        out.extend_from_slice(&lo.to_le_bytes());
-        out.extend_from_slice(&self.to_le_bytes());
-        out.truncate(end);
-    }
-
-    #[inline(always)]
-    fn read_le(bytes: &[u8]) -> (Self, u64) {
-        let mut buf = [0_u8; 16];
-        buf[..bytes.len()].copy_from_slice(bytes);
-        let lo = u64::from_le_bytes(buf[..8].try_into().unwrap());
-        let hi = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-        (hi, lo)
-    }
-
-    #[inline(always)]
-    fn decode_into(self, lo: u64, dna: &mut [u8]) {
-        let split = dna.len() - 32;
-        let high = decode_packed32(self, split);
-        let low = decode_packed32(lo, 32);
-        dna[..split].copy_from_slice(&high[..split]);
-        dna[split..].copy_from_slice(&low);
-    }
-
-    #[inline(always)]
-    fn top_bits(self, lo: u64, k: usize, bucket_bits: u32) -> usize {
-        extract_top_bits(self, lo, (2 * k - 64) as u32, bucket_bits)
-    }
-
-    #[inline(always)]
-    fn cmp_key(self, lo: u64, other_hi: Self, other_lo: u64) -> Ordering {
-        (self, lo).cmp(&(other_hi, other_lo))
-    }
-}
+impl_scalar_high_key!(u16, 10);
+impl_scalar_high_key!(u32, 12);
+impl_scalar_high_key!(u64, 16);
 
 impl HighKey for [u64; 2] {
     #[inline(always)]
     fn fold(self) -> u64 {
-        self[0].wrapping_mul(M1) ^ self[1].wrapping_mul(M2)
+        self[0].wrapping_mul(C1) ^ self[1].wrapping_mul(C2)
     }
 
     #[inline(always)]
@@ -280,7 +185,7 @@ impl HighKey for [u64; 2] {
 impl HighKey for [u64; 3] {
     #[inline(always)]
     fn fold(self) -> u64 {
-        self[0].wrapping_mul(M1) ^ self[1].wrapping_mul(M2) ^ self[2].wrapping_mul(M3)
+        self[0].wrapping_mul(C1) ^ self[1].wrapping_mul(C2) ^ self[2].wrapping_mul(M3)
     }
 
     #[inline(always)]
@@ -374,6 +279,12 @@ pub(crate) struct BucketWide<H: HighKey> {
     h: [H; SLOTS],
 }
 
+const _: () = assert!(std::mem::size_of::<BucketWide<u16>>() == 80);
+const _: () = assert!(std::mem::size_of::<BucketWide<u32>>() == 96);
+const _: () = assert!(std::mem::size_of::<BucketWide<u64>>() == 128);
+const _: () = assert!(std::mem::size_of::<BucketWide<[u64; 2]>>() == 192);
+const _: () = assert!(std::mem::size_of::<BucketWide<[u64; 3]>>() == 256);
+
 #[cfg(test)]
 impl<H: HighKey> BucketWide<H> {
     fn empty() -> Self {
@@ -384,111 +295,22 @@ impl<H: HighKey> BucketWide<H> {
     }
 }
 
-struct BucketsWide<H: HighKey> {
-    pointer: std::ptr::NonNull<BucketWide<H>>,
-    len: usize,
-}
-
-/// Map bucket arrays directly once they reach 16 KiB so outgrown tables return
-/// memory to the OS immediately.
-const MAPPED_BYTES: usize = 16 * 1024;
-
-// SAFETY: `BucketsWide` owns its allocation exclusively.
-unsafe impl<H: HighKey> Send for BucketsWide<H> {}
-// SAFETY: shared access only reads.
-unsafe impl<H: HighKey> Sync for BucketsWide<H> {}
-
-impl<H: HighKey> BucketsWide<H> {
-    const fn new() -> Self {
-        Self {
-            pointer: std::ptr::NonNull::dangling(),
-            len: 0,
-        }
-    }
-
-    const fn mapped_buckets() -> usize {
-        MAPPED_BYTES.div_ceil(std::mem::size_of::<BucketWide<H>>())
-    }
-
-    fn mapped(len: usize) -> bool {
-        cfg!(unix) && len >= Self::mapped_buckets()
-    }
-
-    fn zeroed(len: usize) -> Result<Self, Error> {
-        if len == 0 {
-            return Ok(Self::new());
-        }
-        let layout =
-            std::alloc::Layout::array::<BucketWide<H>>(len).map_err(|_| Error::ReserveFailed)?;
-        #[cfg(unix)]
-        if Self::mapped(len) {
-            // SAFETY: anonymous private mapping of nonzero size; page-aligned.
-            let pointer = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    layout.size(),
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANON,
-                    -1,
-                    0,
-                )
-            };
-            if pointer == libc::MAP_FAILED {
-                return Err(Error::ReserveFailed);
-            }
-            let pointer = std::ptr::NonNull::new(pointer.cast()).ok_or(Error::ReserveFailed)?;
-            return Ok(Self { pointer, len });
-        }
-        // SAFETY: nonzero layout; all-zero `BucketWide<H>` is valid and empty.
-        let pointer = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<BucketWide<H>>();
-        let pointer = std::ptr::NonNull::new(pointer).ok_or(Error::ReserveFailed)?;
-        Ok(Self { pointer, len })
-    }
-}
-
-impl<H: HighKey> Drop for BucketsWide<H> {
-    fn drop(&mut self) {
-        if self.len == 0 {
-            return;
-        }
-        let layout =
-            std::alloc::Layout::array::<BucketWide<H>>(self.len).expect("allocated layout");
-        #[cfg(unix)]
-        if Self::mapped(self.len) {
-            // SAFETY: matches mapping created in `zeroed`.
-            unsafe { libc::munmap(self.pointer.as_ptr().cast(), layout.size()) };
-            return;
-        }
-        // SAFETY: matches allocation created in `zeroed`.
-        unsafe { std::alloc::dealloc(self.pointer.as_ptr().cast(), layout) };
-    }
-}
-
-impl<H: HighKey> std::ops::Deref for BucketsWide<H> {
-    type Target = [BucketWide<H>];
-
-    #[inline(always)]
-    fn deref(&self) -> &[BucketWide<H>] {
-        // SAFETY: valid for `len` initialized buckets.
-        unsafe { std::slice::from_raw_parts(self.pointer.as_ptr(), self.len) }
-    }
-}
-
-impl<H: HighKey> std::ops::DerefMut for BucketsWide<H> {
-    #[inline(always)]
-    fn deref_mut(&mut self) -> &mut [BucketWide<H>] {
-        // SAFETY: exclusive access through `&mut self`.
-        unsafe { std::slice::from_raw_parts_mut(self.pointer.as_ptr(), self.len) }
-    }
-}
-
 /// Packed queued update entry: zero alignment padding (`8 + size_of::<H>()`
 /// bytes) so workers push into one `Vec` per group instead of two.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub(crate) struct QueuedEntry<H: HighKey> {
-    pub(crate) l: u64,
-    pub(crate) h: H,
+    l: u64,
+    h: H,
+}
+
+impl<H: HighKey> Default for QueuedEntry<H> {
+    fn default() -> Self {
+        Self {
+            l: 0,
+            h: H::default(),
+        }
+    }
 }
 
 impl<H: HighKey> QueuedEntry<H> {
@@ -519,16 +341,9 @@ fn prefetch_bucket<H: HighKey>(bucket_ptr: *const BucketWide<H>) {
     prefetch(base.wrapping_add(last));
 }
 
-const fn load_sixteenths(load: Load) -> usize {
-    match load {
-        Load::Sparse => 12,
-        Load::Dense => 14,
-    }
-}
-
 /// One partition's compact wide table.
 pub(crate) struct CompactTableWide<H: HighKey> {
-    buckets: BucketsWide<H>,
+    buckets: Buckets<BucketWide<H>>,
     len: usize,
     grow_at: usize,
     layout: LayoutWide,
@@ -548,7 +363,7 @@ impl<H: HighKey> CompactTableWide<H> {
     ) -> Self {
         debug_assert!(index < partitions);
         Self {
-            buckets: BucketsWide::new(),
+            buckets: Buckets::new(),
             len: 0,
             grow_at: 0,
             layout,
@@ -607,7 +422,7 @@ impl<H: HighKey> CompactTableWide<H> {
         let slots = needed
             .checked_mul(16)
             .ok_or(Error::ReserveFailed)?
-            .div_ceil(load_sixteenths(self.load));
+            .div_ceil(self.load.sixteenths());
         self.resize(slots.div_ceil(SLOTS).max(2))
     }
 
@@ -629,17 +444,18 @@ impl<H: HighKey> CompactTableWide<H> {
     }
 
     fn resize(&mut self, buckets: usize) -> Result<(), Error> {
+        let grow_at = buckets
+            .checked_mul(SLOTS)
+            .and_then(|s| s.checked_mul(self.load.sixteenths()))
+            .ok_or(Error::ReserveFailed)?
+            / 16;
         let mut filled = Vec::new();
         filled
             .try_reserve_exact(buckets)
             .map_err(|_| Error::ReserveFailed)?;
         filled.resize(buckets, 0_u8);
-        let old = std::mem::replace(&mut self.buckets, BucketsWide::zeroed(buckets)?);
-        self.grow_at = buckets
-            .checked_mul(SLOTS)
-            .and_then(|s| s.checked_mul(load_sixteenths(self.load)))
-            .ok_or(Error::ReserveFailed)?
-            / 16;
+        let old = std::mem::replace(&mut self.buckets, Buckets::zeroed(buckets)?);
+        self.grow_at = grow_at;
         let l_key_mask = self.layout.l_key_mask();
         for bucket in old.iter() {
             for slot in 0..SLOTS {
@@ -671,7 +487,7 @@ impl<H: HighKey> CompactTableWide<H> {
         loop {
             // SAFETY: `bucket < buckets.len()`, and the load factor guarantees an empty slot.
             let slots = unsafe { self.buckets.get_unchecked(bucket) };
-            let (matches, empty) = bucket_masks_8_unaligned(&slots.l, l_key, l_key_mask);
+            let (matches, empty) = bucket_masks_8(&slots.l, l_key, l_key_mask);
             let matches = matches & !empty;
             if matches != 0 {
                 let at = (matches.trailing_zeros() / MASK_BITS) as usize;
@@ -726,7 +542,7 @@ impl<H: HighKey> CompactTableWide<H> {
                 bucket = 0;
             }
             let next = unsafe { self.buckets.get_unchecked(bucket) };
-            let (m, e) = bucket_masks_8_unaligned(&next.l, l_key, l_key_mask);
+            let (m, e) = bucket_masks_8(&next.l, l_key, l_key_mask);
             matches = m & !e;
             empty = e;
         }
@@ -799,7 +615,7 @@ impl<H: HighKey> CompactTableWide<H> {
                 loop {
                     // SAFETY: `bucket < count`, and the load factor guarantees an empty slot.
                     let slots = unsafe { &mut *buckets.add(bucket) };
-                    let (matches, empty) = bucket_masks_8_unaligned(&slots.l, l_key, l_key_mask);
+                    let (matches, empty) = bucket_masks_8(&slots.l, l_key, l_key_mask);
                     let matches = matches & !empty;
                     let found = matches != 0;
                     let ends = if found { matches } else { empty };
@@ -1148,46 +964,6 @@ impl<H: HighKey> Drop for OrderedAdderWide<'_, H> {
     }
 }
 
-/// Counting-sort packed `QueuedEntry<H>` entries by sub-partition table and
-/// apply each table's burst.
-pub(crate) fn add_split<H: HighKey>(
-    tables: &mut [CompactTableWide<H>],
-    layout: LayoutWide,
-    input: &[QueuedEntry<H>],
-    split: &mut Vec<QueuedEntry<H>>,
-    ends: &mut Vec<usize>,
-    apply: impl Fn(&mut CompactTableWide<H>, &[QueuedEntry<H>]) -> Result<(), Error>,
-) -> Result<(), Error> {
-    if tables.len() == 1 {
-        return apply(&mut tables[0], input);
-    }
-    let mask = tables.len() - 1;
-    let shift = layout.l_rem_bits;
-    let table_of = |l_entry: u64| (l_entry >> shift) as usize & mask;
-    ends.clear();
-    ends.resize(tables.len(), 0);
-    for entry in input {
-        ends[table_of(entry.l())] += 1;
-    }
-    let mut start = 0;
-    for end in ends.iter_mut() {
-        start += std::mem::replace(end, start);
-    }
-    split.clear();
-    split.resize(input.len(), QueuedEntry::new(0, H::default()));
-    for &entry in input {
-        let cursor = &mut ends[table_of(entry.l())];
-        split[*cursor] = entry;
-        *cursor += 1;
-    }
-    let mut start = 0;
-    for (table, &end) in tables.iter_mut().zip(ends.iter()) {
-        apply(table, &split[start..end])?;
-        start = end;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1274,14 +1050,5 @@ mod tests {
             .try_for_each(|(h, l)| adder.push(h, l))
             .and_then(|()| adder.finish());
         assert_eq!(res, Err(Error::CountOverflow));
-    }
-
-    #[test]
-    fn bucket_sizes_are_tightly_packed() {
-        assert_eq!(std::mem::size_of::<BucketWide<u16>>(), 80);
-        assert_eq!(std::mem::size_of::<BucketWide<u32>>(), 96);
-        assert_eq!(std::mem::size_of::<BucketWide<u64>>(), 128);
-        assert_eq!(std::mem::size_of::<BucketWide<[u64; 2]>>(), 192);
-        assert_eq!(std::mem::size_of::<BucketWide<[u64; 3]>>(), 256);
     }
 }

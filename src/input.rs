@@ -324,7 +324,7 @@ mod tests {
                         count(reader, &mut counting).unwrap();
                         assert_eq!(counting.records, records.len() as u64);
                         assert_eq!(counting.bases, records.iter().map(|r| r.len() as u64).sum());
-                        assert!(counting.overlap.len() < k);
+                        assert!(counting.serial().overlap.len() < k);
                         counting.finish().unwrap();
                         assert_eq!(counts(&counter), counts(&expected), "k={k}, buffer={size}");
                     }

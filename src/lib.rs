@@ -87,6 +87,19 @@ pub(crate) enum WideCounts {
     W256(PackedCountsWide<[u64; 3]>),
 }
 
+macro_rules! dispatch_wide {
+    ($value:expr, $var:ident => $body:expr) => {
+        match $value {
+            $crate::WideCounts::W80($var) => $body,
+            $crate::WideCounts::W96($var) => $body,
+            $crate::WideCounts::W128($var) => $body,
+            $crate::WideCounts::W192($var) => $body,
+            $crate::WideCounts::W256($var) => $body,
+        }
+    };
+}
+pub(crate) use dispatch_wide;
+
 impl WideCounts {
     fn with_capacity(
         k: usize,
@@ -125,34 +138,16 @@ impl WideCounts {
     }
 
     pub(crate) fn table_count(&self) -> usize {
-        match self {
-            Self::W80(c) => c.tables().len(),
-            Self::W96(c) => c.tables().len(),
-            Self::W128(c) => c.tables().len(),
-            Self::W192(c) => c.tables().len(),
-            Self::W256(c) => c.tables().len(),
-        }
+        dispatch_wide!(self, c => c.tables().len())
     }
 
     fn len(&self) -> usize {
-        match self {
-            Self::W80(c) => c.len(),
-            Self::W96(c) => c.len(),
-            Self::W128(c) => c.len(),
-            Self::W192(c) => c.len(),
-            Self::W256(c) => c.len(),
-        }
+        dispatch_wide!(self, c => c.len())
     }
 
     #[cfg(test)]
     fn capacity(&self) -> usize {
-        match self {
-            Self::W80(c) => c.capacity(),
-            Self::W96(c) => c.capacity(),
-            Self::W128(c) => c.capacity(),
-            Self::W192(c) => c.capacity(),
-            Self::W256(c) => c.capacity(),
-        }
+        dispatch_wide!(self, c => c.capacity())
     }
 
     fn add_records<'a>(
@@ -161,72 +156,42 @@ impl WideCounts {
         k: usize,
         strand: StrandMode,
     ) -> Result<(), Error> {
+        macro_rules! add_wide {
+            ($counts:expr, $visit:ident, $cast:expr) => {{
+                let mut adder = $counts.adder();
+                for record in records {
+                    if record.len() >= k {
+                        $visit(record, k, strand, |hi, lo| adder.push($cast(hi), lo))?;
+                    }
+                }
+                adder.finish()
+            }};
+        }
         match self {
-            Self::W80(counts) => {
-                let mut adder = counts.adder();
-                for record in records {
-                    if record.len() >= k {
-                        visit_packed128(record, k, strand, |hi, lo| adder.push(hi as u16, lo))?;
-                    }
-                }
-                adder.finish()
-            }
-            Self::W96(counts) => {
-                let mut adder = counts.adder();
-                for record in records {
-                    if record.len() >= k {
-                        visit_packed128(record, k, strand, |hi, lo| adder.push(hi as u32, lo))?;
-                    }
-                }
-                adder.finish()
-            }
-            Self::W128(counts) => {
-                let mut adder = counts.adder();
-                for record in records {
-                    if record.len() >= k {
-                        visit_packed128(record, k, strand, |hi, lo| adder.push(hi, lo))?;
-                    }
-                }
-                adder.finish()
-            }
-            Self::W192(counts) => {
-                let mut adder = counts.adder();
-                for record in records {
-                    if record.len() >= k {
-                        visit_packed192(record, k, strand, |hi, lo| adder.push(hi, lo))?;
-                    }
-                }
-                adder.finish()
-            }
-            Self::W256(counts) => {
-                let mut adder = counts.adder();
-                for record in records {
-                    if record.len() >= k {
-                        visit_packed256(record, k, strand, |hi, lo| adder.push(hi, lo))?;
-                    }
-                }
-                adder.finish()
-            }
+            Self::W80(c) => add_wide!(c, visit_packed128, |hi| hi as u16),
+            Self::W96(c) => add_wide!(c, visit_packed128, |hi| hi as u32),
+            Self::W128(c) => add_wide!(c, visit_packed128, |hi| hi),
+            Self::W192(c) => add_wide!(c, visit_packed192, |hi| hi),
+            Self::W256(c) => add_wide!(c, visit_packed256, |hi| hi),
         }
     }
 
     fn merge(&mut self, other: &Self) -> Result<(), Error> {
+        fn merge_inner<H: HighKey>(
+            target: &mut PackedCountsWide<H>,
+            source: &PackedCountsWide<H>,
+        ) -> Result<(), Error> {
+            for ((hi, lo), delta) in source.entries() {
+                target.add_key(hi, lo, delta)?;
+            }
+            Ok(())
+        }
         match (self, other) {
-            (Self::W80(t), Self::W80(s)) => s
-                .entries()
-                .try_for_each(|((hi, lo), delta)| t.add_key(hi, lo, delta)),
-            (Self::W96(t), Self::W96(s)) => s
-                .entries()
-                .try_for_each(|((hi, lo), delta)| t.add_key(hi, lo, delta)),
-            (Self::W128(t), Self::W128(s)) => s
-                .entries()
-                .try_for_each(|((hi, lo), delta)| t.add_key(hi, lo, delta)),
-            (Self::W192(t), Self::W192(s)) => s
-                .entries()
-                .try_for_each(|((hi, lo), delta)| t.add_key(hi, lo, delta)),
-            (Self::W256(t), Self::W256(s)) => s
-                .entries()
-                .try_for_each(|((hi, lo), delta)| t.add_key(hi, lo, delta)),
+            (Self::W80(t), Self::W80(s)) => merge_inner(t, s),
+            (Self::W96(t), Self::W96(s)) => merge_inner(t, s),
+            (Self::W128(t), Self::W128(s)) => merge_inner(t, s),
+            (Self::W192(t), Self::W192(s)) => merge_inner(t, s),
+            (Self::W256(t), Self::W256(s)) => merge_inner(t, s),
             _ => unreachable!("matching k selects matching wide representation"),
         }
     }
@@ -247,15 +212,9 @@ impl WideCounts {
         ) -> io::Result<()> {
             let entries =
                 (first..first + tables).flat_map(|partition| counts.partition_entries(partition));
-            write_packed_tsv::<128, _>(entries, k, writer, |(hi, lo), dna| hi.decode_into(lo, dna))
+            write_packed_tsv(entries, k, writer, |(hi, lo), dna| hi.decode_into(lo, dna))
         }
-        match self {
-            Self::W80(c) => encode(c, first, tables, k, writer),
-            Self::W96(c) => encode(c, first, tables, k, writer),
-            Self::W128(c) => encode(c, first, tables, k, writer),
-            Self::W192(c) => encode(c, first, tables, k, writer),
-            Self::W256(c) => encode(c, first, tables, k, writer),
-        }
+        dispatch_wide!(self, c => encode(c, first, tables, k, writer))
     }
 
     fn decoded_entries(&self, k: usize) -> Box<dyn Iterator<Item = (Vec<u8>, u64)> + '_> {
@@ -269,35 +228,106 @@ impl WideCounts {
                 (dna, count)
             }))
         }
-        match self {
-            Self::W80(c) => decode_iter(c, k),
-            Self::W96(c) => decode_iter(c, k),
-            Self::W128(c) => decode_iter(c, k),
-            Self::W192(c) => decode_iter(c, k),
-            Self::W256(c) => decode_iter(c, k),
-        }
+        dispatch_wide!(self, c => decode_iter(c, k))
     }
 
     #[cfg(test)]
     fn set_counts(&mut self, count: u64) {
-        match self {
-            Self::W80(c) => c.tables_mut().iter_mut().for_each(|t| t.set_counts(count)),
-            Self::W96(c) => c.tables_mut().iter_mut().for_each(|t| t.set_counts(count)),
-            Self::W128(c) => c.tables_mut().iter_mut().for_each(|t| t.set_counts(count)),
-            Self::W192(c) => c.tables_mut().iter_mut().for_each(|t| t.set_counts(count)),
-            Self::W256(c) => c.tables_mut().iter_mut().for_each(|t| t.set_counts(count)),
+        dispatch_wide!(self, c => c.tables_mut().iter_mut().for_each(|t| t.set_counts(count)));
+    }
+}
+
+/// Byte-string count storage for k > 128, optionally partitioned across multiple
+/// maps (always a power-of-two count) when produced by `ParallelCounter`.
+pub(crate) struct ByteCounts {
+    pub(crate) maps: Vec<HashMap<Vec<u8>, u64, foldhash::fast::RandomState>>,
+    hash: foldhash::fast::RandomState,
+}
+
+impl ByteCounts {
+    fn with_capacity(capacity: usize) -> Result<Self, Error> {
+        let mut map = HashMap::default();
+        map.try_reserve(capacity)
+            .map_err(|_| Error::ReserveFailed)?;
+        Ok(Self {
+            maps: vec![map],
+            hash: foldhash::fast::RandomState::default(),
+        })
+    }
+
+    pub(crate) fn from_maps(
+        maps: Vec<HashMap<Vec<u8>, u64, foldhash::fast::RandomState>>,
+        hash: foldhash::fast::RandomState,
+    ) -> Self {
+        debug_assert!(maps.len().is_power_of_two());
+        Self { maps, hash }
+    }
+
+    fn map_mut(&mut self, key: &[u8]) -> &mut HashMap<Vec<u8>, u64, foldhash::fast::RandomState> {
+        let index = if self.maps.len() == 1 {
+            0
+        } else {
+            self.hash.hash_one(key) as usize & (self.maps.len() - 1)
+        };
+        &mut self.maps[index]
+    }
+
+    fn len(&self) -> usize {
+        self.maps.iter().map(HashMap::len).sum()
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.maps.iter().map(HashMap::capacity).sum()
+    }
+
+    fn add_record(&mut self, sequence: &[u8], k: usize, strand: StrandMode) -> Result<(), Error> {
+        visit_bytes(sequence, k, strand, |key| {
+            add_byte_delta(self.map_mut(key), key, 1)
+        })
+    }
+
+    fn merge(&mut self, other: Self) -> Result<(), Error> {
+        for source in other.maps {
+            if self.maps.len() == 1 {
+                merge_counts(&mut self.maps[0], source)?;
+            } else {
+                for (key, delta) in source {
+                    let target = self.map_mut(&key);
+                    add_delta(target, key, delta)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn insert_new(&mut self, key: &[u8], count: u64) -> Result<bool, Error> {
+        let map = self.map_mut(key);
+        if map.contains_key(key) {
+            return Ok(false);
+        }
+        map.try_reserve(1).map_err(|_| Error::ReserveFailed)?;
+        map.insert(key.to_vec(), count);
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    fn set_counts(&mut self, count: u64) {
+        for map in &mut self.maps {
+            map.values_mut().for_each(|value| *value = count);
         }
     }
 }
 
 // Keep the representation private so wider packed keys can be added without
 // changing the public output format.
-enum Counts {
-    /// k <= 32: compact, self-partitioned 64-bit tables (never in `Counter::partitions`).
+pub(crate) enum Counts {
+    /// k <= 32: compact, self-partitioned 64-bit tables.
     Packed(PackedCounts),
-    /// 33 <= k <= 128: compact, self-partitioned wide tables (never in `Counter::partitions`).
+    /// 33 <= k <= 128: compact, self-partitioned wide tables.
     Wide(WideCounts),
-    Bytes(HashMap<Vec<u8>, u64, foldhash::fast::RandomState>),
+    /// k > 128: byte-string hash maps, single or partitioned.
+    Bytes(ByteCounts),
 }
 
 /// An exact, in-memory DNA k-mer counter.
@@ -310,10 +340,6 @@ enum Counts {
 /// resist adaptive collision attacks.
 pub struct Counter {
     counts: Counts,
-    // For wider keys from `ParallelCounter`, partition zero is `counts` and the
-    // remaining partitions retain their own maps. Packed counts partition themselves.
-    partitions: Vec<Counts>,
-    partition_hash: Option<foldhash::fast::RandomState>,
     // Threads that may encode independent partitions during output. Results
     // from `ParallelCounter` inherit its worker count; other counters use one.
     output_threads: usize,
@@ -365,8 +391,8 @@ enum OutputTable<'a> {
     Packed(&'a PackedCounts, usize, usize),
     /// Consecutive partitions of compact wide tables: the first, and how many.
     Wide(&'a WideCounts, usize, usize),
-    /// A whole map for wider keys.
-    Map(&'a Counts),
+    /// One byte-string map for k > 128.
+    Bytes(&'a HashMap<Vec<u8>, u64, foldhash::fast::RandomState>),
 }
 
 impl Write for ChunkSink<'_> {
@@ -399,34 +425,24 @@ impl Counter {
             return Err(Error::InvalidK);
         }
 
-        Ok(Self {
-            counts: if k <= 32 {
-                Counts::Packed(PackedCounts::with_capacity(
-                    k,
-                    PACKED_PARTITION_BITS,
-                    capacity,
-                    table::Load::Sparse,
-                )?)
-            } else if k <= 128 {
-                Counts::Wide(WideCounts::with_capacity(
-                    k,
-                    PACKED_PARTITION_BITS,
-                    capacity,
-                    table::Load::Sparse,
-                )?)
-            } else {
-                let mut counts = HashMap::default();
-                counts
-                    .try_reserve(capacity)
-                    .map_err(|_| Error::ReserveFailed)?;
-                Counts::Bytes(counts)
-            },
-            partitions: Vec::new(),
-            partition_hash: None,
-            output_threads: 1,
-            strand,
-            k,
-        })
+        let counts = if k <= 32 {
+            Counts::Packed(PackedCounts::with_capacity(
+                k,
+                PACKED_PARTITION_BITS,
+                capacity,
+                table::Load::Sparse,
+            )?)
+        } else if k <= 128 {
+            Counts::Wide(WideCounts::with_capacity(
+                k,
+                PACKED_PARTITION_BITS,
+                capacity,
+                table::Load::Sparse,
+            )?)
+        } else {
+            Counts::Bytes(ByteCounts::with_capacity(capacity)?)
+        };
+        Ok(Self::from_counts(k, strand, counts, 1))
     }
 
     /// Count windows within one complete read or FASTA record.
@@ -439,33 +455,16 @@ impl Counter {
         if sequence.len() < self.k {
             return Ok(());
         }
-
-        if let Counts::Packed(counts) = &mut self.counts {
-            let (k, strand) = (self.k, self.strand);
-            let mut adder = counts.adder();
-            visit_packed(sequence, k, strand, |key| adder.push(key))?;
-            return adder.finish();
-        }
-        if let Counts::Wide(counts) = &mut self.counts {
-            return counts.add_records(std::iter::once(sequence), self.k, self.strand);
-        }
-        if !self.partitions.is_empty() {
-            let (k, strand) = (self.k, self.strand);
-            return match &self.counts {
-                Counts::Packed(_) | Counts::Wide(_) => {
-                    unreachable!("packed counts partition themselves")
-                }
-                Counts::Bytes(_) => visit_bytes(sequence, k, strand, |key| {
-                    let Counts::Bytes(map) = self.partition_mut(key) else {
-                        unreachable!()
-                    };
-                    add_byte_delta(map, key, 1)
-                }),
-            };
-        }
         match &mut self.counts {
-            Counts::Packed(_) | Counts::Wide(_) => unreachable!("handled above"),
-            Counts::Bytes(counts) => add_byte_record(counts, sequence, self.k, self.strand),
+            Counts::Packed(counts) => {
+                let mut adder = counts.adder();
+                visit_packed(sequence, self.k, self.strand, |key| adder.push(key))?;
+                adder.finish()
+            }
+            Counts::Wide(counts) => {
+                counts.add_records(std::iter::once(sequence), self.k, self.strand)
+            }
+            Counts::Bytes(counts) => counts.add_record(sequence, self.k, self.strand),
         }
     }
 
@@ -481,21 +480,26 @@ impl Counter {
         records: impl IntoIterator<Item = &'a [u8]>,
     ) -> Result<(), Error> {
         let (k, strand) = (self.k, self.strand);
-        if let Counts::Packed(counts) = &mut self.counts {
-            let mut adder = counts.adder();
-            for record in records {
-                if record.len() >= k {
-                    visit_packed(record, k, strand, |key| adder.push(key))?;
+        match &mut self.counts {
+            Counts::Packed(counts) => {
+                let mut adder = counts.adder();
+                for record in records {
+                    if record.len() >= k {
+                        visit_packed(record, k, strand, |key| adder.push(key))?;
+                    }
                 }
+                adder.finish()
             }
-            return adder.finish();
+            Counts::Wide(counts) => counts.add_records(records, k, strand),
+            Counts::Bytes(counts) => {
+                for record in records {
+                    if record.len() >= k {
+                        counts.add_record(record, k, strand)?;
+                    }
+                }
+                Ok(())
+            }
         }
-        if let Counts::Wide(counts) = &mut self.counts {
-            return counts.add_records(records, k, strand);
-        }
-        records
-            .into_iter()
-            .try_for_each(|record| self.add_record(record))
     }
 
     /// Consume another counter with the same k and strand mode, adding its counts.
@@ -505,94 +509,32 @@ impl Counter {
         if self.k != other.k || self.strand != other.strand {
             return Err(Error::IncompatibleCounters);
         }
-        if let (Counts::Packed(target), Counts::Packed(source)) = (&mut self.counts, &other.counts)
-        {
-            // Keys are routed by this counter's own mixer and partitions.
-            return source
-                .entries()
-                .try_for_each(|(key, delta)| target.add_key(key, delta));
-        }
-        if let (Counts::Wide(target), Counts::Wide(source)) = (&mut self.counts, &other.counts) {
-            return target.merge(source);
-        }
-        for source in std::iter::once(other.counts).chain(other.partitions) {
-            if self.partitions.is_empty() {
-                match (&mut self.counts, source) {
-                    (Counts::Bytes(target), Counts::Bytes(source)) => merge_counts(target, source)?,
-                    _ => unreachable!("matching k selects matching representations"),
+        match (&mut self.counts, other.counts) {
+            (Counts::Packed(target), Counts::Packed(source)) => {
+                // Keys are routed by this counter's own mixer and partitions.
+                for (key, delta) in source.entries() {
+                    target.add_key(key, delta)?;
                 }
-            } else {
-                match source {
-                    Counts::Packed(_) | Counts::Wide(_) => {
-                        unreachable!("matching k selects matching representations")
-                    }
-                    Counts::Bytes(source) => {
-                        for (key, delta) in source {
-                            let Counts::Bytes(target) = self.partition_mut(&key) else {
-                                unreachable!()
-                            };
-                            add_delta(target, key, delta)?;
-                        }
-                    }
-                }
+                Ok(())
             }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn from_partitions(
-        k: usize,
-        strand: StrandMode,
-        partitions: Vec<Counts>,
-        hash: foldhash::fast::RandomState,
-        output_threads: usize,
-    ) -> Self {
-        debug_assert!(partitions.len().is_power_of_two());
-        let mut partitions = partitions.into_iter();
-        Self {
-            counts: partitions.next().unwrap(),
-            partitions: partitions.collect(),
-            partition_hash: Some(hash),
-            output_threads: output_threads.max(1),
-            k,
-            strand,
+            (Counts::Wide(target), Counts::Wide(source)) => target.merge(&source),
+            (Counts::Bytes(target), Counts::Bytes(source)) => target.merge(source),
+            _ => unreachable!("matching k selects matching representations"),
         }
     }
 
-    pub(crate) fn from_packed(
+    pub(crate) fn from_counts(
         k: usize,
         strand: StrandMode,
-        counts: PackedCounts,
+        counts: Counts,
         output_threads: usize,
     ) -> Self {
         Self {
-            counts: Counts::Packed(counts),
-            partitions: Vec::new(),
-            partition_hash: None,
+            counts,
             output_threads: output_threads.max(1),
-            k,
             strand,
-        }
-    }
-
-    pub(crate) fn from_wide(
-        k: usize,
-        strand: StrandMode,
-        counts: WideCounts,
-        output_threads: usize,
-    ) -> Self {
-        Self {
-            counts: Counts::Wide(counts),
-            partitions: Vec::new(),
-            partition_hash: None,
-            output_threads: output_threads.max(1),
             k,
-            strand,
         }
-    }
-
-    fn tables(&self) -> impl Iterator<Item = &Counts> {
-        std::iter::once(&self.counts).chain(&self.partitions)
     }
 
     /// Encode every table with `encode`, writing the bytes in table order;
@@ -616,7 +558,7 @@ impl Counter {
                     .map(|first| OutputTable::Wide(counts, first, (len - first).min(step)))
                     .collect()
             }
-            _ => self.tables().map(OutputTable::Map).collect(),
+            Counts::Bytes(counts) => counts.maps.iter().map(OutputTable::Bytes).collect(),
         };
         write_ordered(
             self.output_threads,
@@ -634,25 +576,13 @@ impl Counter {
         (counts.tables().len() >> serial).max(1)
     }
 
-    fn partition_mut<K: Hash + ?Sized>(&mut self, key: &K) -> &mut Counts {
-        let index =
-            self.partition_hash.as_ref().unwrap().hash_one(key) as usize & self.partitions.len();
-        if index == 0 {
-            &mut self.counts
-        } else {
-            &mut self.partitions[index - 1]
-        }
-    }
-
     /// Return the number of distinct k-mers counted so far.
     pub fn len(&self) -> usize {
-        self.tables()
-            .map(|table| match table {
-                Counts::Packed(counts) => counts.len(),
-                Counts::Wide(counts) => counts.len(),
-                Counts::Bytes(map) => map.len(),
-            })
-            .sum()
+        match &self.counts {
+            Counts::Packed(counts) => counts.len(),
+            Counts::Wide(counts) => counts.len(),
+            Counts::Bytes(counts) => counts.len(),
+        }
     }
 
     /// Return whether no valid k-mers have been counted.
@@ -672,20 +602,18 @@ impl Counter {
         self.write_tables(&mut writer, 1, |table, writer| match table {
             OutputTable::Packed(counts, first, tables) => {
                 let mut slots = Vec::new();
-                (first..first + tables).try_for_each(|partition| {
+                for partition in first..first + tables {
                     let entries = counts
                         .sorted_partition(partition, &mut slots)
                         .map(|(mixed, count)| (counts.unmix(mixed), count));
-                    write_packed64_tsv(entries, self.k, writer)
-                })
+                    write_packed64_tsv(entries, self.k, writer)?;
+                }
+                Ok(())
             }
             OutputTable::Wide(counts, first, tables) => {
                 counts.write_tsv_range(first, tables, self.k, writer)
             }
-            OutputTable::Map(Counts::Packed(_) | Counts::Wide(_)) => {
-                unreachable!("packed tables are split")
-            }
-            OutputTable::Map(Counts::Bytes(counts)) => {
+            OutputTable::Bytes(counts) => {
                 // A u64 has at most 20 decimal digits, plus a tab and newline.
                 let mut suffix = [0; 22];
                 for (key, &count) in counts {
@@ -712,24 +640,21 @@ impl Counter {
     /// assert_eq!(counts[b"ACG".as_slice()], 2);
     /// ```
     pub fn counts(&self) -> impl Iterator<Item = (Vec<u8>, u64)> + '_ {
-        self.tables().flat_map(move |table| {
-            let (packed, wide, bytes) = match table {
-                Counts::Packed(counts) => (Some(counts.entries()), None, None),
-                Counts::Wide(counts) => (None, Some(counts.decoded_entries(self.k)), None),
-                Counts::Bytes(counts) => (None, None, Some(counts.iter())),
-            };
-            packed
-                .into_iter()
-                .flatten()
-                .map(|(key, count)| (decode_packed(key, self.k), count))
-                .chain(wide.into_iter().flatten())
-                .chain(
-                    bytes
-                        .into_iter()
-                        .flatten()
-                        .map(|(key, &count)| (key.clone(), count)),
-                )
-        })
+        let iter: Box<dyn Iterator<Item = (Vec<u8>, u64)> + '_> = match &self.counts {
+            Counts::Packed(counts) => Box::new(
+                counts
+                    .entries()
+                    .map(|(key, count)| (decode_packed(key, self.k), count)),
+            ),
+            Counts::Wide(counts) => counts.decoded_entries(self.k),
+            Counts::Bytes(counts) => Box::new(
+                counts
+                    .maps
+                    .iter()
+                    .flat_map(|map| map.iter().map(|(key, &count)| (key.clone(), count))),
+            ),
+        };
+        iter
     }
 }
 
@@ -809,8 +734,8 @@ fn merge_counts<K: Eq + std::hash::Hash, S: std::hash::BuildHasher>(
 }
 
 // Assemble many rows directly in one buffer, avoiding a small memcpy and writer
-// call for every distinct key. MAX is the backend's maximum number of bases.
-fn write_packed_tsv<const MAX: usize, K>(
+// call for every distinct key.
+fn write_packed_tsv<K>(
     entries: impl Iterator<Item = (K, u64)>,
     k: usize,
     writer: &mut (impl Write + ?Sized),
@@ -819,7 +744,7 @@ fn write_packed_tsv<const MAX: usize, K>(
     let mut batch = [0; 16 * 1024];
     let mut offset = 0;
     for (key, count) in entries {
-        if offset + MAX + 22 > batch.len() {
+        if offset + k + 22 > batch.len() {
             writer.write_all(&batch[..offset])?;
             offset = 0;
         }
@@ -1160,32 +1085,12 @@ fn visit_packed256_record<const CANONICAL: bool>(
 }
 
 fn decode_packed(key: u64, k: usize) -> Vec<u8> {
-    let mut dna = vec![0; k];
-    decode_packed_into(key, &mut dna);
-    dna
+    decode_packed32(key, k)[..k].to_vec()
 }
 
-// Decode four bases per lookup, using a 1 KiB table shared by all packed widths.
-const DECODE_BASES: [[u8; 4]; 256] = {
-    let mut table = [[0; 4]; 256];
-    let mut value = 0;
-    while value < 256 {
-        let mut base = 0;
-        while base < 4 {
-            table[value][base] = b"ACGT"[(value >> (2 * (3 - base))) & 3];
-            base += 1;
-        }
-        value += 1;
-    }
-    table
-};
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 fn decode_packed_into(mut key: u64, dna: &mut [u8]) {
-    let mut chunks = dna.rchunks_exact_mut(4);
-    for chunk in &mut chunks {
-        chunk.copy_from_slice(&DECODE_BASES[(key & 255) as usize]);
-        key >>= 8;
-    }
-    for base in chunks.into_remainder().iter_mut().rev() {
+    for base in dna.iter_mut().rev() {
         *base = b"ACGT"[(key & 3) as usize];
         key >>= 2;
     }
@@ -1205,16 +1110,6 @@ fn format_count(mut count: u64, buffer: &mut [u8; 22]) -> &[u8] {
     start -= 1;
     buffer[start] = b'\t';
     &buffer[start..]
-}
-
-// Byte-string fallback for k > 128.
-fn add_byte_record(
-    counts: &mut HashMap<Vec<u8>, u64, foldhash::fast::RandomState>,
-    sequence: &[u8],
-    k: usize,
-    strand: StrandMode,
-) -> Result<(), Error> {
-    visit_bytes(sequence, k, strand, |key| add_byte_delta(counts, key, 1))
 }
 
 fn visit_bytes(
@@ -1262,11 +1157,12 @@ fn add_delta<K: Eq + Hash, S: BuildHasher>(
     key: K,
     delta: u64,
 ) -> Result<(), Error> {
-    if map.len() == map.capacity() {
+    if let Some(count) = map.get_mut(&key) {
+        *count = count.checked_add(delta).ok_or(Error::CountOverflow)?;
+    } else {
         map.try_reserve(1).map_err(|_| Error::ReserveFailed)?;
+        map.insert(key, delta);
     }
-    let count = map.entry(key).or_insert(0);
-    *count = count.checked_add(delta).ok_or(Error::CountOverflow)?;
     Ok(())
 }
 
@@ -1295,7 +1191,7 @@ impl Counts {
                 .iter_mut()
                 .for_each(|table| table.set_counts(count)),
             Counts::Wide(counts) => counts.set_counts(count),
-            Counts::Bytes(map) => map.values_mut().for_each(|value| *value = count),
+            Counts::Bytes(counts) => counts.set_counts(count),
         }
     }
 }
@@ -1303,6 +1199,9 @@ impl Counts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Representative k values covering every backend width and boundary.
+    const TEST_KS: &[usize] = &[1, 3, 4, 31, 32, 33, 40, 41, 48, 49, 64, 65, 96, 97, 128, 129];
 
     fn assert_counts(counter: &Counter, expected: &[(&str, u64)]) {
         let expected: HashMap<Vec<u8>, u64> = expected
@@ -1313,25 +1212,7 @@ mod tests {
     }
 
     #[test]
-    fn packed_decoder_matches_simple_loop_for_every_length() {
-        let mut state = 42_u64;
-        for _ in 0..1024 {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            for len in 0..=32 {
-                let mut actual = [0; 32];
-                decode_packed_into(state, &mut actual[..len]);
-                let expected: Vec<u8> = (0..len)
-                    .map(|index| b"ACGT"[((state >> (2 * (len - 1 - index))) & 3) as usize])
-                    .collect();
-                assert_eq!(&actual[..len], expected);
-            }
-        }
-    }
-
-    #[test]
-    fn whole_key_decoder_matches_base_decoder_for_every_length() {
+    fn whole_key_decoder_matches_simple_loop_for_every_length() {
         let mut state = 42_u64;
         for _ in 0..1024 {
             state ^= state << 13;
@@ -1339,16 +1220,17 @@ mod tests {
             state ^= state << 17;
             for k in 1..=32 {
                 let key = state & (u64::MAX >> (64 - 2 * k));
-                let mut expected = vec![0; k];
-                decode_packed_into(key, &mut expected);
+                let expected: Vec<u8> = (0..k)
+                    .map(|index| b"ACGT"[((key >> (2 * (k - 1 - index))) & 3) as usize])
+                    .collect();
                 assert_eq!(&decode_packed32(key, k)[..k], expected, "k={k}");
             }
         }
     }
 
     #[test]
-    fn full_width_wide_keys_preserve_high_bits_and_leading_as() {
-        for k in [40, 48, 64, 96, 128] {
+    fn full_width_keys_preserve_high_bits_and_leading_as() {
+        for k in [32, 40, 48, 64, 96, 128] {
             let mut counter = Counter::new(k, StrandMode::Forward).unwrap();
             counter.add_record(&vec![b'T'; k + 1]).unwrap();
             counter.add_record(&vec![b'A'; k]).unwrap();
@@ -1367,27 +1249,28 @@ mod tests {
     }
 
     #[test]
-    fn every_invalid_byte_breaks_wide_packed_runs() {
-        for k in [33, 40, 48, 64, 65, 96, 97, 128] {
-            for strand in [StrandMode::Forward, StrandMode::Canonical] {
-                for byte in 0..=u8::MAX {
-                    if b"ACGTacgt".contains(&byte) {
-                        continue;
-                    }
-                    let mut record = vec![b'A'; k - 1];
-                    record.push(byte);
-                    record.extend(vec![b'A'; k]);
-                    let mut counter = Counter::new(k, strand).unwrap();
-                    counter.add_record(&record).unwrap();
-                    assert_counts(&counter, &[(&"A".repeat(k), 1)]);
+    fn every_invalid_byte_breaks_runs_for_all_backends() {
+        for k in [3, 32, 33, 40, 48, 64, 65, 96, 97, 128, 129] {
+            let mut record = Vec::new();
+            for byte in 0..=u8::MAX {
+                if b"ACGTacgt".contains(&byte) {
+                    continue;
                 }
+                record.extend(std::iter::repeat_n(b'A', k - 1));
+                record.push(byte);
+            }
+            record.extend(std::iter::repeat_n(b'A', k));
+            for strand in [StrandMode::Forward, StrandMode::Canonical] {
+                let mut counter = Counter::new(k, strand).unwrap();
+                counter.add_record(&record).unwrap();
+                assert_counts(&counter, &[(&"A".repeat(k), 1)]);
             }
         }
     }
 
     #[test]
     fn capacity_hint_preserves_counts_and_allows_growth() {
-        for k in [1, 3, 31, 32, 33, 40, 48, 63, 64, 65, 96, 97, 128, 129] {
+        for &k in TEST_KS {
             for strand in [StrandMode::Canonical, StrandMode::Forward] {
                 let mut expected = Counter::new(k, strand).unwrap();
                 let mut reserved = Counter::with_capacity(k, strand, 1).unwrap();
@@ -1414,6 +1297,10 @@ mod tests {
     #[test]
     fn rejects_invalid_k_and_unrepresentable_capacity() {
         assert!(matches!(
+            Counter::new(0, StrandMode::Canonical),
+            Err(Error::InvalidK)
+        ));
+        assert!(matches!(
             Counter::with_capacity(0, StrandMode::Canonical, usize::MAX),
             Err(Error::InvalidK)
         ));
@@ -1426,18 +1313,18 @@ mod tests {
     }
 
     #[test]
-    fn tsv_matches_iterator_for_both_backends_and_strands() {
-        for k in 1..=66 {
+    fn tsv_matches_iterator_for_all_backends_and_strands() {
+        for &k in TEST_KS {
             for strand in [StrandMode::Canonical, StrandMode::Forward] {
                 let mut counter = Counter::new(k, strand).unwrap();
                 let mut empty = Vec::new();
                 counter.write_tsv(&mut empty).unwrap();
                 assert!(empty.is_empty());
                 for record in [
-                    b"acgTTacGAGTCAGATTCGAC".repeat(8),
-                    vec![b'T'; 80],
-                    vec![b'A'; 80],
-                    b"ACGTNACGT.--ACGT".repeat(8),
+                    b"acgTTacGAGTCAGATTCGAC".repeat(10),
+                    vec![b'T'; 140],
+                    vec![b'A'; 140],
+                    b"ACGTNACGT.--ACGT".repeat(10),
                 ] {
                     counter.add_record(&record).unwrap();
                 }
@@ -1448,7 +1335,6 @@ mod tests {
                 }
                 let mut actual = Vec::new();
                 counter.write_tsv(&mut actual).unwrap();
-                // The same rows; packed keys are written in hash order.
                 let rows = |tsv: &[u8]| {
                     let mut rows: Vec<Vec<u8>> =
                         tsv.split(|&b| b == b'\n').map(Vec::from).collect();
@@ -1462,33 +1348,21 @@ mod tests {
 
     #[test]
     fn tsv_formats_decimal_boundaries_and_maximum_counts() {
-        for k in [1, 32, 33, 63, 64, 65] {
+        for k in [1, 32, 33, 64, 97, 129] {
             let mut counter = Counter::new(k, StrandMode::Forward).unwrap();
             counter.add_record(&vec![b'A'; k]).unwrap();
-            // Stored counts are never zero (see `format_count` below for 0).
             let mut values = vec![u64::MAX];
             for exponent in 0..=19 {
                 let power = 10_u64.pow(exponent);
                 values.extend([power - 1, power, power + 1]);
             }
             for value in values.into_iter().filter(|&value| value > 0) {
-                // The counter holds exactly one key.
                 counter.counts.set_counts(value);
                 let mut output = Vec::new();
                 counter.write_tsv(&mut output).unwrap();
                 assert_eq!(output, format!("{}\t{value}\n", "A".repeat(k)).as_bytes());
             }
         }
-    }
-
-    #[test]
-    fn formats_zero_and_maximum_counts() {
-        let mut buffer = [0; 22];
-        assert_eq!(format_count(0, &mut buffer), b"\t0\n");
-        assert_eq!(
-            format_count(u64::MAX, &mut buffer),
-            format!("\t{}\n", u64::MAX).as_bytes()
-        );
     }
 
     #[test]
@@ -1511,7 +1385,7 @@ mod tests {
                 panic!("write_tsv must leave flushing to the caller")
             }
         }
-        for k in [3, 33] {
+        for k in [3, 33, 129] {
             let mut counter = Counter::new(k, StrandMode::Forward).unwrap();
             counter.add_record(&vec![b'A'; k]).unwrap();
             let expected = format!("{}\t1\n", "A".repeat(k));
@@ -1547,9 +1421,9 @@ mod tests {
             })
             .collect();
 
-        // Exercise both backends, full-width keys, and long valid runs. Dense
-        // ambiguity alone would almost never produce a valid 32-base window.
-        for len in [31, 32, 33, 64, 65, 66, 129, 1024] {
+        // Exercise every backend, full-width keys, palindromes, and long valid runs.
+        records.push(b"ACGT".to_vec());
+        for len in [31, 32, 33, 64, 65, 96, 97, 128, 129, 1024] {
             let valid: Vec<u8> = (0..len)
                 .map(|_| {
                     state ^= state << 13;
@@ -1565,7 +1439,7 @@ mod tests {
             records.extend([valid, ambiguous]);
         }
 
-        for k in 1..=66 {
+        for &k in TEST_KS {
             for strand in [StrandMode::Forward, StrandMode::Canonical] {
                 let mut counter = Counter::new(k, strand).unwrap();
                 let mut expected = HashMap::new();
@@ -1604,27 +1478,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_k() {
-        assert!(matches!(
-            Counter::new(0, StrandMode::Canonical),
-            Err(Error::InvalidK)
-        ));
-    }
-
-    #[test]
-    fn reports_overflow_without_changing_the_overflowing_count() {
-        let mut counter = Counter::new(3, StrandMode::Forward).unwrap();
-        counter.add_record(b"ACG").unwrap();
-        assert!(matches!(counter.counts, Counts::Packed(_)));
-        counter.counts.set_counts(u64::MAX - 1);
-        counter.add_record(b"ACG").unwrap();
-        assert_eq!(counter.add_record(b"ACG"), Err(Error::CountOverflow));
-        assert_counts(&counter, &[("ACG", u64::MAX)]);
-    }
-
-    #[test]
     fn overflow_keeps_earlier_windows_and_stops_before_later_ones() {
-        for k in [1, 3, 32, 33, 63, 64, 65] {
+        for k in [1, 3, 32, 33, 64, 65, 97, 128, 129] {
             for strand in [StrandMode::Forward, StrandMode::Canonical] {
                 let mut counter = Counter::new(k, strand).unwrap();
                 counter.add_record(&vec![b'A'; k]).unwrap();
@@ -1637,170 +1492,5 @@ mod tests {
                 assert_counts(&counter, &[(&"A".repeat(k), u64::MAX), (&first, 1)]);
             }
         }
-    }
-
-    #[test]
-    fn every_invalid_byte_breaks_a_valid_run() {
-        for strand in [StrandMode::Forward, StrandMode::Canonical] {
-            for byte in 0..=u8::MAX {
-                if b"ACGTacgt".contains(&byte) {
-                    continue;
-                }
-                let mut counter = Counter::new(3, strand).unwrap();
-                counter
-                    .add_record(&[b'a', b'c', byte, b'g', b't', b'a'])
-                    .unwrap();
-                assert_counts(&counter, &[("GTA", 1)]);
-            }
-        }
-    }
-
-    #[test]
-    fn full_width_keys_preserve_high_bits_and_leading_as() {
-        let mut counter = Counter::new(32, StrandMode::Forward).unwrap();
-        counter.add_record(&[b'T'; 33]).unwrap();
-        counter.add_record(&[b'A'; 32]).unwrap();
-        let leading_as = format!("{}C", "A".repeat(31));
-        counter.add_record(leading_as.as_bytes()).unwrap();
-        assert_counts(
-            &counter,
-            &[(&"T".repeat(32), 2), (&"A".repeat(32), 1), (&leading_as, 1)],
-        );
-
-        let mut canonical = Counter::new(32, StrandMode::Canonical).unwrap();
-        canonical.add_record(&[b'T'; 33]).unwrap();
-        canonical.add_record(&[b'A'; 32]).unwrap();
-        assert_counts(&canonical, &[(&"A".repeat(32), 3)]);
-    }
-
-    #[test]
-    fn full_width_windows_do_not_cross_invalid_bytes_or_records() {
-        for strand in [StrandMode::Forward, StrandMode::Canonical] {
-            let mut counter = Counter::new(32, strand).unwrap();
-            let mut record = vec![b'T'; 31];
-            record.push(b'N');
-            record.extend([b'A'; 31]);
-            counter.add_record(&record).unwrap();
-            counter.add_record(b"C").unwrap();
-            assert_counts(&counter, &[]);
-            counter.add_record(&[b'A'; 32]).unwrap();
-            assert_counts(&counter, &[(&"A".repeat(32), 1)]);
-        }
-    }
-
-    #[test]
-    fn non_ascii_and_whitespace_break_windows() {
-        let mut counter = Counter::new(3, StrandMode::Forward).unwrap();
-        counter.add_record(b"AC\xffACG\nTGC").unwrap();
-        assert_counts(&counter, &[("ACG", 1), ("TGC", 1)]);
-    }
-
-    #[test]
-    fn starts_empty() {
-        let counter = Counter::new(3, StrandMode::Canonical).unwrap();
-        assert!(counter.is_empty());
-        assert_eq!(counter.len(), 0);
-        assert_counts(&counter, &[]);
-    }
-
-    #[test]
-    fn counts_overlapping_windows() {
-        let mut counter = Counter::new(3, StrandMode::Forward).unwrap();
-        counter.add_record(b"ACGACG").unwrap();
-        assert_counts(&counter, &[("ACG", 2), ("CGA", 1), ("GAC", 1)]);
-    }
-
-    #[test]
-    fn counts_repeated_windows() {
-        let mut counter = Counter::new(3, StrandMode::Forward).unwrap();
-        counter.add_record(b"AAAAA").unwrap();
-        assert_counts(&counter, &[("AAA", 3)]);
-    }
-
-    #[test]
-    fn invalid_bases_break_windows() {
-        for sequence in [b"ACNACG".as_slice(), b"ACRACG", b"AC-ACG", b"ACUACG"] {
-            let mut counter = Counter::new(3, StrandMode::Forward).unwrap();
-            counter.add_record(sequence).unwrap();
-            assert_counts(&counter, &[("ACG", 1)]);
-        }
-    }
-
-    #[test]
-    fn never_joins_separate_records() {
-        let mut counter = Counter::new(3, StrandMode::Forward).unwrap();
-        counter.add_record(b"AC").unwrap();
-        counter.add_record(b"GT").unwrap();
-        assert_counts(&counter, &[]);
-    }
-
-    #[test]
-    fn normalizes_case() {
-        let mut counter = Counter::new(3, StrandMode::Forward).unwrap();
-        counter.add_record(b"acgACg").unwrap();
-        assert_counts(&counter, &[("ACG", 2), ("CGA", 1), ("GAC", 1)]);
-    }
-
-    #[test]
-    fn canonical_mode_combines_reverse_complements() {
-        let mut counter = Counter::new(3, StrandMode::Canonical).unwrap();
-        counter.add_record(b"ACG").unwrap();
-        counter.add_record(b"cgt").unwrap();
-        assert_counts(&counter, &[("ACG", 2)]);
-    }
-
-    #[test]
-    fn forward_mode_keeps_reverse_complements_separate() {
-        let mut counter = Counter::new(3, StrandMode::Forward).unwrap();
-        counter.add_record(b"ACG").unwrap();
-        counter.add_record(b"CGT").unwrap();
-        assert_counts(&counter, &[("ACG", 1), ("CGT", 1)]);
-    }
-
-    #[test]
-    fn reverse_complement_palindrome_is_counted_once_per_window() {
-        let mut counter = Counter::new(4, StrandMode::Canonical).unwrap();
-        counter.add_record(b"ACGT").unwrap();
-        assert_counts(&counter, &[("ACGT", 1)]);
-    }
-
-    #[test]
-    fn empty_short_and_all_ambiguous_records_add_nothing() {
-        let mut counter = Counter::new(3, StrandMode::Canonical).unwrap();
-        for sequence in [b"".as_slice(), b"A", b"AC", b"NNNNN"] {
-            counter.add_record(sequence).unwrap();
-        }
-        assert_counts(&counter, &[]);
-    }
-
-    #[test]
-    fn exact_length_record_adds_one_window() {
-        let mut counter = Counter::new(3, StrandMode::Forward).unwrap();
-        counter.add_record(b"TGC").unwrap();
-        assert_counts(&counter, &[("TGC", 1)]);
-    }
-
-    #[test]
-    fn counts_accumulate_across_records() {
-        let mut counter = Counter::new(3, StrandMode::Forward).unwrap();
-        counter.add_record(b"ACG").unwrap();
-        counter.add_record(b"ACG").unwrap();
-        assert_counts(&counter, &[("ACG", 2)]);
-    }
-
-    #[test]
-    fn supports_single_base_kmers() {
-        let mut counter = Counter::new(1, StrandMode::Canonical).unwrap();
-        counter.add_record(b"ACGTNacgt").unwrap();
-        assert_counts(&counter, &[("A", 4), ("C", 4)]);
-    }
-
-    #[test]
-    fn supports_k_above_packed_integer_limits() {
-        let mut counter = Counter::new(65, StrandMode::Forward).unwrap();
-        counter.add_record(&[b'A'; 66]).unwrap();
-        assert!(!counter.is_empty());
-        assert_eq!(counter.len(), 1);
-        assert_counts(&counter, &[(&"A".repeat(65), 2)]);
     }
 }

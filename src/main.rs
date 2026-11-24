@@ -50,7 +50,7 @@ enum OutputFormat {
 #[derive(Args)]
 struct CountArgs {
     /// K-mer length (greater than zero)
-    #[arg(short = 'k', long, value_parser = clap::value_parser!(usize))]
+    #[arg(short = 'k', long)]
     k: usize,
     /// Count forward strands separately instead of canonicalizing
     #[arg(long)]
@@ -123,75 +123,31 @@ fn parse_size(value: &str) -> Result<u64, String> {
 /// The smallest --memory accepted: below it, fixed buffers dominate.
 const MIN_MEMORY: u64 = 64 << 20;
 
-enum CountSink<'a> {
-    Serial(&'a mut Counter),
-    Parallel(ParallelInput<'a>),
-}
-
-struct Counting<'a> {
-    counter: CountSink<'a>,
-    // Serial input: batch up to 64 KiB of new sequence bytes from one or more
-    // records, then count them together. `ends` closes each finished record in
-    // the batch; the current record starts at `record_start`. Each flush keeps
-    // the current record's last k-1 bytes so windows continue across flushes.
+struct SerialBuffer<'a> {
+    counter: &'a mut Counter,
+    // Batch up to 64 KiB of new sequence bytes from one or more records, then
+    // count them together. `ends` closes each finished record in the batch;
+    // the current record starts at `record_start`. Each flush keeps the current
+    // record's last k-1 bytes so windows continue across flushes.
     overlap: Vec<u8>,
     ends: Vec<usize>,
     record_start: usize,
     pending: usize,
     k: usize,
-    records: u64,
-    bases: u64,
-    progress: bool,
-    started: Instant,
-    last_report: Instant,
-    source: Option<PathBuf>,
 }
 
-impl<'a> Counting<'a> {
-    fn new(counter: &'a mut Counter, k: usize, progress: bool) -> Self {
-        Self::with_sink(CountSink::Serial(counter), k, progress)
-    }
-
-    fn with_sink(counter: CountSink<'a>, k: usize, progress: bool) -> Self {
-        let now = Instant::now();
-        Self {
-            counter,
-            overlap: Vec::new(),
-            ends: Vec::new(),
-            record_start: 0,
-            pending: 0,
-            k,
-            records: 0,
-            bases: 0,
-            progress,
-            started: now,
-            last_report: now,
-            source: None,
+impl SerialBuffer<'_> {
+    fn start_record(&mut self) {
+        if self.overlap.len() > self.record_start {
+            self.ends.push(self.overlap.len());
         }
-    }
-
-    fn start_record(&mut self) -> io::Result<()> {
-        match &mut self.counter {
-            CountSink::Parallel(counter) => counter.start_record(),
-            // Close the current record; it is counted at the next flush.
-            CountSink::Serial(_) => {
-                if self.overlap.len() > self.record_start {
-                    self.ends.push(self.overlap.len());
-                }
-                self.record_start = self.overlap.len();
-            }
-        }
-        self.records += 1;
-        Ok(())
+        self.record_start = self.overlap.len();
     }
 
     fn flush(&mut self) -> io::Result<()> {
         if self.pending == 0 {
             return Ok(());
         }
-        let CountSink::Serial(counter) = &mut self.counter else {
-            unreachable!("parallel input is not buffered here")
-        };
         let (bytes, mut start) = (&self.overlap, 0);
         let records = self
             .ends
@@ -203,7 +159,9 @@ impl<'a> Counting<'a> {
                 start = end;
                 record
             });
-        counter.add_records(records).map_err(io::Error::other)?;
+        self.counter
+            .add_records(records)
+            .map_err(io::Error::other)?;
         let keep = (self.k - 1).min(self.overlap.len() - self.record_start);
         let start = self.overlap.len() - keep;
         self.overlap.copy_within(start.., 0);
@@ -214,20 +172,91 @@ impl<'a> Counting<'a> {
         Ok(())
     }
 
-    fn sequence(&mut self, bytes: &[u8]) -> io::Result<()> {
-        if let CountSink::Parallel(counter) = &mut self.counter {
-            counter.add_sequence(bytes).map_err(io::Error::other)?;
-        } else {
-            let mut remaining = bytes;
-            while !remaining.is_empty() {
-                let take = remaining.len().min(BUFFER_SIZE - self.pending);
-                self.overlap.extend_from_slice(&remaining[..take]);
-                self.pending += take;
-                remaining = &remaining[take..];
-                if self.pending == BUFFER_SIZE {
-                    self.flush()?;
-                }
+    fn push(&mut self, mut remaining: &[u8]) -> io::Result<()> {
+        while !remaining.is_empty() {
+            let take = remaining.len().min(BUFFER_SIZE - self.pending);
+            self.overlap.extend_from_slice(&remaining[..take]);
+            self.pending += take;
+            remaining = &remaining[take..];
+            if self.pending == BUFFER_SIZE {
+                self.flush()?;
             }
+        }
+        Ok(())
+    }
+}
+
+enum CountSink<'a> {
+    Serial(SerialBuffer<'a>),
+    Parallel(ParallelInput<'a>),
+}
+
+struct Counting<'a> {
+    counter: CountSink<'a>,
+    records: u64,
+    bases: u64,
+    progress: bool,
+    started: Instant,
+    last_report: Instant,
+    source: Option<PathBuf>,
+}
+
+impl<'a> Counting<'a> {
+    fn new(counter: &'a mut Counter, k: usize, progress: bool) -> Self {
+        Self::with_sink(
+            CountSink::Serial(SerialBuffer {
+                counter,
+                overlap: Vec::new(),
+                ends: Vec::new(),
+                record_start: 0,
+                pending: 0,
+                k,
+            }),
+            progress,
+        )
+    }
+
+    fn with_sink(counter: CountSink<'a>, progress: bool) -> Self {
+        let now = Instant::now();
+        Self {
+            counter,
+            records: 0,
+            bases: 0,
+            progress,
+            started: now,
+            last_report: now,
+            source: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn serial(&self) -> &SerialBuffer<'a> {
+        match &self.counter {
+            CountSink::Serial(serial) => serial,
+            CountSink::Parallel(_) => panic!("expected serial sink"),
+        }
+    }
+
+    fn start_record(&mut self) -> io::Result<()> {
+        match &mut self.counter {
+            CountSink::Parallel(counter) => counter.start_record(),
+            CountSink::Serial(serial) => serial.start_record(),
+        }
+        self.records += 1;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match &mut self.counter {
+            CountSink::Serial(serial) => serial.flush(),
+            CountSink::Parallel(_) => Ok(()),
+        }
+    }
+
+    fn sequence(&mut self, bytes: &[u8]) -> io::Result<()> {
+        match &mut self.counter {
+            CountSink::Parallel(counter) => counter.add_sequence(bytes).map_err(io::Error::other)?,
+            CountSink::Serial(serial) => serial.push(bytes)?,
         }
         self.bases += bytes.len() as u64;
         if self.progress && self.last_report.elapsed() >= Duration::from_secs(1) {
@@ -244,12 +273,12 @@ impl<'a> Counting<'a> {
             write!(stderr, "{}: ", source.display())?;
         }
         match &self.counter {
-            CountSink::Serial(counter) => writeln!(
+            CountSink::Serial(serial) => writeln!(
                 stderr,
                 "{} records, {} bases, {} distinct k-mers, {:.1}s elapsed",
                 self.records,
                 self.bases,
-                counter.len(),
+                serial.counter.len(),
                 self.started.elapsed().as_secs_f64(),
             ),
             CountSink::Parallel(_) => writeln!(
@@ -299,18 +328,27 @@ fn concurrent_file(path: &Path) -> bool {
 }
 
 fn count_parallel_inputs<'a>(
-    input: &(dyn Fn() -> ParallelInput<'a> + Sync),
+    input: impl Fn() -> ParallelInput<'a> + Sync,
     inputs: &[PathBuf],
-    k: usize,
     readers: usize,
     progress: bool,
 ) -> io::Result<(u64, u64)> {
+    // Blocking devices/FIFOs (including stdin aliases) cannot be interrupted
+    // when another file fails. Only regular files use concurrent readers.
+    if readers <= 1 || inputs.len() <= 1 || !inputs.iter().all(|path| concurrent_file(path)) {
+        let mut counting = Counting::with_sink(CountSink::Parallel(input()), progress);
+        for path in inputs {
+            count_path(path, &mut counting)?;
+        }
+        return counting.finish();
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for index in 0..readers.min(inputs.len()) {
             let next = &next;
+            let input = &input;
             handles.push(
                 std::thread::Builder::new()
                     .name(format!("reader-{index}"))
@@ -318,7 +356,7 @@ fn count_parallel_inputs<'a>(
                         let mut totals = (0, 0);
                         while let Some(path) = inputs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             let mut counting =
-                                Counting::with_sink(CountSink::Parallel(input()), k, progress);
+                                Counting::with_sink(CountSink::Parallel(input()), progress);
                             counting.source = Some(path.clone());
                             count_path(path, &mut counting)?;
                             let (records, bases) = counting.finish()?;
@@ -358,7 +396,7 @@ fn count_reader<R: Read + Send + 'static>(
             Err(error) => return Err(error),
         }
     }
-    let reader = io::Cursor::new(magic[..size].to_vec()).chain(reader);
+    let reader = io::Cursor::new(magic).take(size as u64).chain(reader);
     if size == 2 && magic == [0x1f, 0x8b] {
         // The decoder buffers its own input.
         decompress_concurrently(gzip::GzDecoder::new(reader), |decoded| {
@@ -519,20 +557,21 @@ fn output_writer(output: &Path) -> io::Result<BufWriter<Box<dyn Write>>> {
 
 fn dump(input: PathBuf, output: PathBuf) -> io::Result<()> {
     check_output(std::slice::from_ref(&input), &output)?;
-    let result = (|| {
-        let source: Box<dyn Read> = if input.as_os_str() == "-" {
-            Box::new(io::stdin().lock())
-        } else {
-            Box::new(File::open(&input)?)
-        };
-        let reader = DatabaseReader::new(BufReader::with_capacity(BUFFER_SIZE, source))?;
-        let mut writer = output_writer(&output)?;
-        reader.write_tsv(&mut writer)?;
-        writer.flush()
-    })();
-    result.map_err(|error: io::Error| {
+    let with_input = |error: io::Error| {
         io::Error::new(error.kind(), format!("{}: {error}", input.display()))
-    })
+    };
+    let source: Box<dyn Read> = if input.as_os_str() == "-" {
+        Box::new(io::stdin().lock())
+    } else {
+        Box::new(File::open(&input).map_err(with_input)?)
+    };
+    let reader =
+        DatabaseReader::new(BufReader::with_capacity(BUFFER_SIZE, source)).map_err(with_input)?;
+    let mut writer = output_writer(&output).map_err(|error| {
+        io::Error::new(error.kind(), format!("{}: {error}", output.display()))
+    })?;
+    reader.write_tsv(&mut writer).map_err(with_input)?;
+    writer.flush()
 }
 
 fn count_inputs(args: CountArgs) -> io::Result<()> {
@@ -570,16 +609,7 @@ fn count_inputs(args: CountArgs) -> io::Result<()> {
         let directory = temp_dir.unwrap_or_else(std::env::temp_dir);
         let counter = DiskCounter::new(k, strand, threads, memory, &directory)?;
         let (records, bases) =
-            if readers > 1 && inputs.len() > 1 && inputs.iter().all(|path| concurrent_file(path)) {
-                count_parallel_inputs(&|| counter.input(), &inputs, k, readers, progress)?
-            } else {
-                let mut counting =
-                    Counting::with_sink(CountSink::Parallel(counter.input()), k, progress);
-                for path in &inputs {
-                    count_path(path, &mut counting)?;
-                }
-                counting.finish()?
-            };
+            count_parallel_inputs(|| counter.input(), &inputs, readers, progress)?;
         // The reader threads are done; give their cores to counting.
         let bins = counter
             .finish()?
@@ -626,42 +656,21 @@ fn count_inputs(args: CountArgs) -> io::Result<()> {
         }
         return Ok(());
     }
-    let mut counter = Counter::with_capacity(k, strand, if threads == 1 { capacity } else { 0 })
-        .map_err(io::Error::other)?;
-    let mut parallel = if threads > 1 {
-        Some(
-            ParallelCounter::with_capacity(k, strand, threads, capacity)
-                .map_err(io::Error::other)?,
-        )
-    } else {
-        None
-    };
-    let (records, bases) = if let Some(parallel) = &parallel
-        && readers > 1
-        && inputs.len() > 1
-        // Blocking devices/FIFOs (including stdin aliases) cannot be interrupted
-        // when another file fails. Only regular files use concurrent readers.
-        && inputs.iter().all(|path| concurrent_file(path))
-    {
-        count_parallel_inputs(&|| parallel.input(), &inputs, k, readers, progress)?
-    } else {
-        let mut counting = match &mut parallel {
-            Some(parallel) => {
-                Counting::with_sink(CountSink::Parallel(parallel.input()), k, progress)
-            }
-            None => Counting::new(&mut counter, k, progress),
-        };
+    let (counter, records, bases, counting_time, merge_time) = if threads == 1 {
+        let mut counter = Counter::with_capacity(k, strand, capacity).map_err(io::Error::other)?;
+        let mut counting = Counting::new(&mut counter, k, progress);
         for path in &inputs {
             count_path(path, &mut counting)?;
         }
-        counting.finish()?
-    };
-    let (counting_time, merge_time) = if let Some(parallel) = parallel {
-        let (result, stats) = parallel.finish_with_stats().map_err(io::Error::other)?;
-        counter = result;
-        (stats.counting, stats.merging)
+        let (records, bases) = counting.finish()?;
+        (counter, records, bases, started.elapsed(), Duration::ZERO)
     } else {
-        (started.elapsed(), Duration::ZERO)
+        let parallel = ParallelCounter::with_capacity(k, strand, threads, capacity)
+            .map_err(io::Error::other)?;
+        let (records, bases) =
+            count_parallel_inputs(|| parallel.input(), &inputs, readers, progress)?;
+        let (counter, stats) = parallel.finish_with_stats().map_err(io::Error::other)?;
+        (counter, records, bases, stats.counting, stats.merging)
     };
     if progress {
         writeln!(
@@ -720,7 +729,7 @@ mod tests {
             fasta.extend_from_slice(b"\r\n");
         }
         fasta.extend_from_slice(b">short\r\nAC\r\n>short2\r\nGT");
-        for k in [1, 31, 32, 33, 63, 64, 65] {
+        for k in [1, 31, 32, 33, 63, 64, 65, 128, 129] {
             for strand in [StrandMode::Forward, StrandMode::Canonical] {
                 let mut expected = Counter::new(k, strand).unwrap();
                 for record in [sequence.as_slice(), b"AC", b"GT"] {
@@ -729,9 +738,9 @@ mod tests {
                 let mut actual = Counter::new(k, strand).unwrap();
                 let mut counting = Counting::new(&mut actual, k, false);
                 count_reader(io::Cursor::new(fasta.clone()), &mut counting).unwrap();
-                assert_eq!(counting.pending, 0);
-                assert!(counting.overlap.len() < k);
-                assert!(counting.overlap.capacity() <= 2 * (BUFFER_SIZE + k - 1));
+                assert_eq!(counting.serial().pending, 0);
+                assert!(counting.serial().overlap.len() < k);
+                assert!(counting.serial().overlap.capacity() <= 2 * (BUFFER_SIZE + k - 1));
                 assert_eq!(counting.records, 3);
                 assert_eq!(counting.bases, sequence.len() as u64 + 4);
                 counting.finish().unwrap();
@@ -757,8 +766,8 @@ mod tests {
         count_reader(reader, &mut counting).unwrap();
         assert_eq!(counting.records, 1);
         assert_eq!(counting.bases, bases);
-        assert_eq!(counting.overlap.len(), 30);
-        assert!(counting.overlap.capacity() <= 2 * (BUFFER_SIZE + 30));
+        assert_eq!(counting.serial().overlap.len(), 30);
+        assert!(counting.serial().overlap.capacity() <= 2 * (BUFFER_SIZE + 30));
         counting.finish().unwrap();
         assert_eq!(
             counter.counts().collect::<Vec<_>>(),

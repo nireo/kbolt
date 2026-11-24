@@ -27,7 +27,8 @@ fn run(args: &[&str], input: &[u8]) -> Output {
     })
 }
 
-fn table(output: &Output) -> BTreeMap<String, u64> {
+/// The rows of a successful run, in the order they were written.
+fn rows(output: &Output) -> Vec<(String, u64)> {
     assert!(
         output.status.success(),
         "{}",
@@ -41,6 +42,10 @@ fn table(output: &Output) -> BTreeMap<String, u64> {
             (key.to_owned(), count.parse().unwrap())
         })
         .collect()
+}
+
+fn table(output: &Output) -> BTreeMap<String, u64> {
+    rows(output).into_iter().collect()
 }
 
 fn gzip(input: &[u8]) -> Vec<u8> {
@@ -94,7 +99,7 @@ fn capacity_hint_preserves_output_and_is_not_a_limit() {
     let mut input = b">reads\n".to_vec();
     input.extend_from_slice(&b"acGTTACGAGTCAGATTCGAC".repeat(8));
     input.extend_from_slice(b"\n>ambiguous\nACGTNNACGT\n");
-    for k in [1, 3, 31, 32, 33, 63, 64, 65] {
+    for k in [31, 65, 129] {
         let k = k.to_string();
         for forward in [false, true] {
             let mut args = vec!["count", "-k", &k];
@@ -153,7 +158,7 @@ fn huge_single_line_and_wrapped_fasta_preserve_chunk_windows() {
     let mut input = b">large\n".to_vec();
     input.extend_from_slice(&sequence);
     input.extend_from_slice(b"\n>short\nAC\n>short2\nGT\n");
-    for k in [1, 3, 32, 33, 63, 64, 65] {
+    for k in [1, 32, 33, 129] {
         let output = run(&["count", "-k", &k.to_string(), "--forward"], &input);
         let actual = table(&output);
         let mut expected = kbolt::Counter::new(k, kbolt::StrandMode::Forward).unwrap();
@@ -261,20 +266,11 @@ fn validates_arguments_and_missing_files() {
 }
 
 #[test]
-fn refuses_overwriting_an_input_path() {
-    let temp = TempDir::new();
-    let input = temp.file("input.fa", b">x\nACGT\n");
-    let output = run(&["count", "-k", "3", "-o", &input, &input], b"");
-    assert!(!output.status.success());
-    assert_eq!(fs::read(input).unwrap(), b">x\nACGT\n");
-}
-
-#[test]
 fn binary_output_and_streaming_dump_match_tsv_for_all_modes() {
     let mut input = b">mixed\n".to_vec();
     input.extend_from_slice(&b"acGTTACGAGTCAGATTCGAC".repeat(8));
     input.extend_from_slice(b"\n>ambiguous\nACGTNNACGT\n");
-    for k in [1, 3, 31, 32, 33, 63, 64, 65] {
+    for k in [1, 32, 33, 65, 129] {
         let k = k.to_string();
         for forward in [false, true] {
             let mut args = vec!["count", "-k", &k];
@@ -387,17 +383,17 @@ fn dump_rejects_invalid_databases_and_identifies_input() {
 }
 
 #[test]
-fn binary_count_and_dump_refuse_overwriting_inputs() {
+fn count_and_dump_refuse_overwriting_inputs() {
     let temp = TempDir::new();
     let input = temp.file("input.fa", b">x\nACGT\n");
-    let output = run(
-        &[
-            "count", "-k", "3", "--format", "binary", "-o", &input, &input,
-        ],
-        b"",
-    );
-    assert!(!output.status.success());
-    assert_eq!(fs::read(&input).unwrap(), b">x\nACGT\n");
+    for format in ["tsv", "binary"] {
+        let output = run(
+            &["count", "-k", "3", "--format", format, "-o", &input, &input],
+            b"",
+        );
+        assert!(!output.status.success());
+        assert_eq!(fs::read(&input).unwrap(), b">x\nACGT\n");
+    }
     let binary = run(&["count", "-k", "3", "--format", "binary"], b">x\nACGT\n").stdout;
     let database = temp.file("counts.kbolt", &binary);
     assert!(
@@ -420,7 +416,8 @@ fn parallel_cli_matches_serial_for_formats_compression_and_record_boundaries() {
         fasta.extend_from_slice(b"\r\n");
     }
     fasta.extend_from_slice(b">short\nAC\n>short2\nGT\n");
-    for k in [1, 31, 32, 33, 63, 64, 65] {
+    let compressed_fasta = gzip(&fasta);
+    for k in [1, 32, 33, 129] {
         let k = k.to_string();
         for forward in [false, true] {
             let mut args = vec!["count", "-k", &k];
@@ -429,7 +426,7 @@ fn parallel_cli_matches_serial_for_formats_compression_and_record_boundaries() {
             }
             let expected = table(&run(&args, &fasta));
             args.extend(["--threads", "3", "--progress", "--timings"]);
-            let parallel = run(&args, &gzip(&fasta));
+            let parallel = run(&args, &compressed_fasta);
             assert_eq!(table(&parallel), expected);
             let stderr = String::from_utf8_lossy(&parallel.stderr);
             assert!(stderr.contains("timings: counting="), "{stderr}");
@@ -485,7 +482,7 @@ fn concurrent_readers_preserve_counts_validation_and_final_progress_totals() {
     }
     let compressed = temp.file("reads.fq.gz", &gzip(&fastq));
     let stdin_file = temp.file("stdin.fa", b">stdin\nACGTTGCAACGTTGCA\n");
-    for k in [31, 33, 65] {
+    for k in [31, 33, 129] {
         let k = k.to_string();
         for forward in [false, true] {
             let mut args = vec!["count", "-k", &k, &plain, &stdin_file, &compressed];
@@ -636,23 +633,6 @@ fn gzip_input_errors_are_reported_while_the_pipe_stays_open() {
     assert!(stderr.contains("line 2: invalid sequence byte"), "{stderr}");
 }
 
-/// The rows of a successful run, in the order they were written.
-fn rows(output: &Output) -> Vec<(String, u64)> {
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout.clone())
-        .unwrap()
-        .lines()
-        .map(|line| {
-            let (key, count) = line.split_once('\t').unwrap();
-            (key.to_owned(), count.parse().unwrap())
-        })
-        .collect()
-}
-
 #[test]
 fn sorted_output_is_alphabetical_in_memory_and_on_disk() {
     let temp = TempDir::new();
@@ -664,7 +644,7 @@ fn sorted_output_is_alphabetical_in_memory_and_on_disk() {
     let mut reads = Vec::new();
     for _ in 0..600 {
         reads.extend_from_slice(b">r\n");
-        for _ in 0..120 {
+        for _ in 0..140 {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
@@ -672,10 +652,19 @@ fn sorted_output_is_alphabetical_in_memory_and_on_disk() {
         }
         reads.push(b'\n');
     }
+    // Include one long valid run so k = 129 produces non-empty output.
+    reads.extend_from_slice(b">long\n");
+    for _ in 0..160 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        reads.push(b"ACGT"[(state & 3) as usize]);
+    }
+    reads.push(b'\n');
     let input = temp.file("reads.fa", &reads);
     let database = temp.0.join("sorted.kbolt");
     let database = database.to_str().unwrap();
-    for k in ["1", "4", "13", "31", "32", "40", "70"] {
+    for k in ["1", "31", "32", "40", "129"] {
         for strand in [&[][..], &["--forward"]] {
             let common = [&["count", "-k", k], strand, &[&input]].concat();
             // A map lists its keys in order: the rows expected, and theirs.

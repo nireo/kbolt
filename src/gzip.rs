@@ -250,11 +250,8 @@ fn invalid(message: &'static str) -> io::Error {
 /// if more bytes are needed to tell.
 fn header_length(bytes: &[u8]) -> io::Result<Option<usize>> {
     const BAD: &str = "invalid gzip header";
-    for (index, expected) in [0x1f, 0x8b, 8].into_iter().enumerate() {
-        match bytes.get(index) {
-            Some(&byte) if byte != expected => return Err(invalid(BAD)),
-            _ => {}
-        }
+    if !bytes.starts_with(&[0x1f, 0x8b, 8][..bytes.len().min(3)]) {
+        return Err(invalid(BAD));
     }
     if bytes.len() < 10 {
         return Ok(None);
@@ -558,7 +555,9 @@ impl<R: Read> GzDecoder<R> {
                     let length = u32::from_le_bytes(trailer[4..].try_into().unwrap());
                     self.position += 8;
                     self.check(chunk, *out);
-                    if self.checksum.clone().finalize() != checksum || self.length != length {
+                    if std::mem::take(&mut self.checksum).finalize() != checksum
+                        || self.length != length
+                    {
                         return Err(invalid(
                             "corrupt gzip stream does not have a matching checksum",
                         ));

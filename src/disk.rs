@@ -104,10 +104,15 @@ pub(crate) struct Spill {
 
 impl Spill {
     pub(crate) fn create(directory: &Path) -> io::Result<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
-        let path: PathBuf = directory.join(format!("kbolt-{}-{unique:x}.bins", std::process::id()));
+        let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path: PathBuf = directory.join(format!(
+            "kbolt-{}-{unique:x}-{sequence}.bins",
+            std::process::id()
+        ));
         let file = File::options()
             .read(true)
             .write(true)
@@ -364,10 +369,12 @@ impl Bins {
 
     /// Hand over everything a finishing worker still holds.
     pub(crate) fn flush(&self, buffers: &mut BinBuffers) -> Result<(), Error> {
-        (0..BINS).try_for_each(|bin| match buffers.buffers[bin].is_empty() {
-            true => Ok(()),
-            false => self.hand(buffers, bin),
-        })
+        for bin in 0..BINS {
+            if !buffers.buffers[bin].is_empty() {
+                self.hand(buffers, bin)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -532,12 +539,13 @@ impl Tables {
     fn apply(&mut self, group: usize) -> Result<(), Error> {
         let capacity = self.grouped * BURST;
         let filled = std::mem::take(&mut self.filled[group]);
+        let (shift, mask) = (self.layout.remainder_bits, self.grouped - 1);
         crate::table::add_split(
             &mut self.counts.tables_mut()[group * self.grouped..(group + 1) * self.grouped],
-            self.layout,
             &self.pending[group * capacity..group * capacity + filled],
             &mut self.split,
             &mut self.ends,
+            |entry| (entry >> shift) as usize & mask,
             |table, updates| table.add_burst(updates, self.group_shift),
         )
     }
@@ -847,9 +855,7 @@ impl DiskCounts {
         let slots = usize::try_from(self.memory / 8).unwrap_or(usize::MAX)
             / self.threads
             / std::mem::size_of::<Repeat>();
-        let slots = (slots / 2 + 1)
-            .next_power_of_two()
-            .clamp(MIN_REPEATS, MAX_REPEATS);
+        let slots = (1_usize << slots.max(1).ilog2()).clamp(MIN_REPEATS, MAX_REPEATS);
         let mut repeats = Repeats::new(slots);
         // Bins this thread still counts without merging; see below.
         let mut unmerged = 0;
@@ -886,9 +892,12 @@ impl DiskCounts {
                         },
                     )
                 };
-                let mut read = |block: &[u8]| match unmerged {
-                    0 => repeats.add(block, self.k, &mut count),
-                    _ => Repeats::pass(block, self.k, &mut count),
+                let mut read = |block: &[u8]| {
+                    if unmerged == 0 {
+                        repeats.add(block, self.k, &mut count)
+                    } else {
+                        Repeats::pass(block, self.k, &mut count)
+                    }
                 };
                 for block in bin.held.iter().chain(std::iter::once(&bin.open)) {
                     read(block)?;

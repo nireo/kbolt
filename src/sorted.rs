@@ -21,15 +21,15 @@
 
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use crate::database::{self, KeyOrder, SectionWriter};
 use crate::disk::Spill;
-use crate::table::{self, CompactTable, PackedCounts};
-use crate::table_wide::{self, CompactTableWide, HighKey, PackedCountsWide};
+use crate::table::{self, PackedCounts};
+use crate::table_wide::{self, HighKey, PackedCountsWide};
 use crate::{
-    Counter, Counts, WideCounts, format_count, write_ordered, write_packed_tsv, write_packed64_tsv,
+    Counter, Counts, dispatch_wide, format_count, write_ordered, write_packed_tsv,
+    write_packed64_tsv,
 };
 
 /// Bytes of a record in a bucket.
@@ -143,7 +143,7 @@ impl Sorter {
         // average. An eighth holds the records not yet written.
         let sorting = memory / 2;
         let bucket = (sorting / 8 / threads.max(1) as u64 / WORD as u64).max(1);
-        let most = ((memory / 8 / MIN_BLOCK as u64).max(1) + 1).next_power_of_two() / 2;
+        let most = 1_u64 << (memory / 8 / MIN_BLOCK as u64).max(1).ilog2();
         let buckets = records.div_ceil(bucket).min(most);
         let block = usize::try_from(memory / 8 / buckets.max(1).next_power_of_two())
             .unwrap_or(MAX_BLOCK)
@@ -228,24 +228,7 @@ impl Sorter {
         } = batch;
         // Group the records by bucket, a counting sort, so that each bucket
         // is locked once for all of its records.
-        starts.clear();
-        starts.resize(self.buckets.len() + 1, 0);
-        for &bucket in buckets.iter() {
-            starts[bucket as usize + 1] += 1;
-        }
-        let mut start = 0;
-        for next in starts.iter_mut() {
-            start += std::mem::replace(next, start);
-        }
-        grouped.clear();
-        grouped.resize(words.len(), 0);
-        for (&bucket, &word) in buckets.iter().zip(words.iter()) {
-            // (Entry `bucket + 1` holds the bucket's start until its records
-            // are placed, and its end, the next one's start, after.)
-            let next = &mut starts[bucket as usize + 1];
-            grouped[*next] = word;
-            *next += 1;
-        }
+        scatter_by_bucket(buckets, words, self.buckets.len(), grouped, starts);
         buckets.clear();
         words.clear();
         for (bucket, bounds) in self.buckets.iter().zip(starts.windows(2)) {
@@ -322,30 +305,25 @@ impl Sorter {
     /// buckets grow no faster than the tables shrink.
     fn consume(&self, counts: PackedCounts, threads: usize) -> io::Result<()> {
         let (mixer, layout) = (counts.mixer(), counts.layout());
-        let tables: Vec<Mutex<Option<CompactTable>>> = counts
-            .into_tables()
-            .into_iter()
-            .map(|table| Mutex::new(Some(table)))
-            .collect();
-        let next = AtomicUsize::new(0);
+        let tables = counts.into_tables();
+        let workers_count = threads.clamp(1, tables.len());
+        let tables = Mutex::new(tables.into_iter().enumerate());
         std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..threads.clamp(1, tables.len()))
+            let workers: Vec<_> = (0..workers_count)
                 .map(|_| {
                     scope.spawn(|| -> io::Result<()> {
                         let mut batch = Batch::default();
                         loop {
-                            let partition = next.fetch_add(1, Ordering::Relaxed);
-                            let Some(table) = tables.get(partition) else {
-                                return self.flush(&mut batch);
-                            };
-                            let Some(table) = table.lock().map_err(poisoned)?.take() else {
-                                continue;
+                            let next = tables.lock().map_err(poisoned)?.next();
+                            let Some((partition, table)) = next else {
+                                break;
                             };
                             let base = (partition as u64) << layout.remainder_bits;
                             for (remainder, count) in table.iter() {
                                 self.push(&mut batch, mixer.unmix(base | remainder), count)?;
                             }
                         }
+                        self.flush(&mut batch)
                     })
                 })
                 .collect();
@@ -548,6 +526,35 @@ impl Drop for Admitted<'_> {
     }
 }
 
+/// Group `items` by `buckets` into `grouped`, leaving bucket `b` at
+/// `grouped[starts[b]..starts[b + 1]]`.
+fn scatter_by_bucket<T: Copy + Default>(
+    buckets: &[u32],
+    items: &[T],
+    num_buckets: usize,
+    grouped: &mut Vec<T>,
+    starts: &mut Vec<usize>,
+) {
+    starts.clear();
+    starts.resize(num_buckets + 1, 0);
+    for &bucket in buckets {
+        starts[bucket as usize + 1] += 1;
+    }
+    let mut start = 0;
+    for next in starts.iter_mut() {
+        start += std::mem::replace(next, start);
+    }
+    grouped.clear();
+    grouped.resize(items.len(), T::default());
+    for (&bucket, &item) in buckets.iter().zip(items) {
+        // Entry `bucket + 1` holds the bucket's start until its items are
+        // placed, and its end (the next bucket's start) after.
+        let next = &mut starts[bucket as usize + 1];
+        grouped[*next] = item;
+        *next += 1;
+    }
+}
+
 /// Parallel bucketed sort for wide packed keys (33 <= k <= 128).
 ///
 /// Tables are freed as their entries are scattered into leading-bit buckets,
@@ -574,20 +581,15 @@ fn write_sorted_wide<H: HighKey>(
     let buckets: Vec<Mutex<Vec<(H, u64, u64)>>> =
         (0..num_buckets).map(|_| Mutex::default()).collect();
     let layout = counts.layout();
-    let tables: Vec<Mutex<Option<CompactTableWide<H>>>> = counts
-        .into_tables()
-        .into_iter()
-        .map(|table| Mutex::new(Some(table)))
-        .collect();
-    let next = AtomicUsize::new(0);
+    let tables = counts.into_tables();
+    let workers_count = threads.clamp(1, tables.len());
+    let tables = Mutex::new(tables.into_iter().enumerate());
     std::thread::scope(|scope| -> io::Result<()> {
-        let workers: Vec<_> = (0..threads.clamp(1, tables.len()))
+        let workers: Vec<_> = (0..workers_count)
             .map(|_| {
                 scope.spawn(|| -> io::Result<()> {
-                    let mut b_ids: Vec<u32> = Vec::new();
-                    let mut items: Vec<(H, u64, u64)> = Vec::new();
-                    let mut grouped: Vec<(H, u64, u64)> = Vec::new();
-                    let mut starts: Vec<usize> = Vec::new();
+                    let (mut b_ids, mut items, mut grouped, mut starts) =
+                        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
                     let flush = |b_ids: &mut Vec<u32>,
                                  items: &mut Vec<(H, u64, u64)>,
                                  grouped: &mut Vec<(H, u64, u64)>,
@@ -596,22 +598,7 @@ fn write_sorted_wide<H: HighKey>(
                         if items.is_empty() {
                             return Ok(());
                         }
-                        starts.clear();
-                        starts.resize(num_buckets + 1, 0);
-                        for &b in b_ids.iter() {
-                            starts[b as usize + 1] += 1;
-                        }
-                        let mut start = 0;
-                        for next in starts.iter_mut() {
-                            start += std::mem::replace(next, start);
-                        }
-                        grouped.clear();
-                        grouped.resize(items.len(), (H::default(), 0, 0));
-                        for (&b, &item) in b_ids.iter().zip(items.iter()) {
-                            let next = &mut starts[b as usize + 1];
-                            grouped[*next] = item;
-                            *next += 1;
-                        }
+                        scatter_by_bucket(b_ids, items, num_buckets, grouped, starts);
                         b_ids.clear();
                         items.clear();
                         for (bucket, bounds) in buckets.iter().zip(starts.windows(2)) {
@@ -623,24 +610,21 @@ fn write_sorted_wide<H: HighKey>(
                         Ok(())
                     };
                     loop {
-                        let partition = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(table) = tables.get(partition) else {
-                            return flush(&mut b_ids, &mut items, &mut grouped, &mut starts);
-                        };
-                        let Some(table) = table.lock().map_err(poisoned)?.take() else {
-                            continue;
+                        let next = tables.lock().map_err(poisoned)?.next();
+                        let Some((partition, table)) = next else {
+                            break;
                         };
                         let base = (partition as u64) << layout.l_rem_bits;
                         for (l_rem, hi, count) in table.iter() {
                             let lo = table_wide::unmix_lo(hi, base | l_rem);
-                            let bucket = hi.top_bits(lo, k, bucket_bits) as u32;
-                            b_ids.push(bucket);
+                            b_ids.push(hi.top_bits(lo, k, bucket_bits) as u32);
                             items.push((hi, lo, count));
                             if items.len() >= BATCH {
                                 flush(&mut b_ids, &mut items, &mut grouped, &mut starts)?;
                             }
                         }
                     }
+                    flush(&mut b_ids, &mut items, &mut grouped, &mut starts)
                 })
             })
             .collect();
@@ -657,7 +641,7 @@ fn write_sorted_wide<H: HighKey>(
         }
         bucket.sort_unstable_by(|a, b| a.0.cmp_key(a.1, b.0, b.1));
         if !binary {
-            return write_packed_tsv::<128, _>(
+            return write_packed_tsv(
                 bucket.into_iter().map(|(hi, lo, count)| ((hi, lo), count)),
                 k,
                 writer,
@@ -716,62 +700,43 @@ impl Counter {
     fn write_sorted(self, writer: &mut dyn Write, binary: bool) -> io::Result<()> {
         let Counter {
             counts,
-            partitions,
             k,
             output_threads: threads,
             ..
         } = self;
-        let key_bytes = k.div_ceil(4);
-        let tables = std::iter::once(counts).chain(partitions);
-        if k <= 32 {
-            let Some(Counts::Packed(counts)) = tables.into_iter().next() else {
-                unreachable!("keys of at most 32 bases are packed")
-            };
-            let sorter = Sorter::in_memory(table::key_bits(k), counts.len() as u64);
-            sorter.consume(counts, threads)?;
-            return if binary {
-                sorter.write(threads, writer, binary_sections)
-            } else {
-                sorter.write(threads, writer, tsv_rows(k))
-            };
-        }
-        // Wide packed keys (33 <= k <= 128): bucket by leading bits while freeing
-        // each table, then sort and encode each bucket in parallel.
-        if k <= 128 {
-            let Some(Counts::Wide(counts)) = tables.into_iter().next() else {
-                unreachable!("keys of 33..=128 bases are wide packed")
-            };
-            return match counts {
-                WideCounts::W80(c) => write_sorted_wide(c, k, threads, writer, binary),
-                WideCounts::W96(c) => write_sorted_wide(c, k, threads, writer, binary),
-                WideCounts::W128(c) => write_sorted_wide(c, k, threads, writer, binary),
-                WideCounts::W192(c) => write_sorted_wide(c, k, threads, writer, binary),
-                WideCounts::W256(c) => write_sorted_wide(c, k, threads, writer, binary),
-            };
-        }
-        let mut entries: Vec<(Vec<u8>, u64)> = Vec::new();
-        for table in tables {
-            let Counts::Bytes(counts) = table else {
-                unreachable!("every table holds keys of the same width")
-            };
-            entries.extend(counts);
-        }
-        entries.sort_unstable();
-        if !binary {
-            let mut suffix = [0; 22];
-            for (key, count) in entries {
-                writer.write_all(&key)?;
-                writer.write_all(format_count(count, &mut suffix))?;
+        match counts {
+            Counts::Packed(counts) => {
+                let sorter = Sorter::in_memory(table::key_bits(k), counts.len() as u64);
+                sorter.consume(counts, threads)?;
+                if binary {
+                    sorter.write(threads, writer, binary_sections)
+                } else {
+                    sorter.write(threads, writer, tsv_rows(k))
+                }
             }
-            return Ok(());
+            Counts::Wide(counts) => {
+                dispatch_wide!(counts, c => write_sorted_wide(c, k, threads, writer, binary))
+            }
+            Counts::Bytes(counts) => {
+                let mut entries: Vec<(Vec<u8>, u64)> = counts.maps.into_iter().flatten().collect();
+                entries.sort_unstable();
+                if !binary {
+                    let mut suffix = [0; 22];
+                    for (key, count) in entries {
+                        writer.write_all(&key)?;
+                        writer.write_all(format_count(count, &mut suffix))?;
+                    }
+                    return Ok(());
+                }
+                let mut sections = SectionWriter::new(writer);
+                let mut packed = vec![0; k.div_ceil(4)];
+                for (key, count) in entries {
+                    database::pack_bases(&key, &mut packed);
+                    sections.raw(&packed, count)?;
+                }
+                sections.finish()
+            }
         }
-        let mut sections = SectionWriter::new(writer);
-        let mut packed = vec![0; key_bytes];
-        for (key, count) in entries {
-            database::pack_bases(&key, &mut packed);
-            sections.raw(&packed, count)?;
-        }
-        sections.finish()
     }
 }
 
@@ -959,7 +924,7 @@ mod tests {
                 value => b"ACGTacgt"[(value % 8) as usize],
             })
             .collect();
-        for k in [1, 5, 31, 32, 33, 64, 65, 80] {
+        for k in [1, 5, 31, 32, 33, 64, 65, 97, 128, 129] {
             for strand in [StrandMode::Forward, StrandMode::Canonical] {
                 // Sorting consumes a counter: one of each kind per output.
                 let counter = |parallel: bool| {

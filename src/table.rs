@@ -25,8 +25,8 @@ use std::collections::HashMap;
 
 use crate::Error;
 
-const C1: u64 = 0xbf58_476d_1ce4_e5b9;
-const C2: u64 = 0x94d0_49bb_1331_11eb;
+pub(crate) const C1: u64 = 0xbf58_476d_1ce4_e5b9;
+pub(crate) const C2: u64 = 0x94d0_49bb_1331_11eb;
 
 /// Multiplicative inverse modulo 2^64 of an odd constant (Newton iteration).
 const fn inverse(value: u64) -> u64 {
@@ -39,8 +39,11 @@ const fn inverse(value: u64) -> u64 {
     inverse
 }
 
-const C1_INVERSE: u64 = inverse(C1);
-const C2_INVERSE: u64 = inverse(C2);
+pub(crate) const C1_INVERSE: u64 = inverse(C1);
+pub(crate) const C2_INVERSE: u64 = inverse(C2);
+
+const _: () = assert!(C1.wrapping_mul(C1_INVERSE) == 1);
+const _: () = assert!(C2.wrapping_mul(C2_INVERSE) == 1);
 
 /// Bits of a packed key's two-bit bases.
 pub(crate) fn key_bits(k: usize) -> u32 {
@@ -129,42 +132,45 @@ struct Bucket([u64; 8]);
 /// blocks of that size for reuse, so every outgrown table would stay resident
 /// (and a reused block must be cleared by hand). Large tables are therefore
 /// mapped directly: fresh mappings are zero pages, and unmapping frees them.
-struct Buckets {
-    pointer: std::ptr::NonNull<Bucket>,
+pub(crate) struct Buckets<T> {
+    pointer: std::ptr::NonNull<T>,
     len: usize,
 }
 
-/// Bucket counts from this size up are mapped directly (16 KiB). With
+/// Allocations from this size up are mapped directly (16 KiB). With
 /// thousands of tables, even outgrown tables of a few pages add up.
-const MAPPED_BUCKETS: usize = 256;
+const MAPPED_BYTES: usize = 16 * 1024;
 
-// SAFETY: `Buckets` owns its allocation exclusively, like a `Vec<Bucket>`.
-unsafe impl Send for Buckets {}
+// SAFETY: `Buckets<T>` owns its allocation exclusively, like a `Vec<T>`.
+unsafe impl<T: Send> Send for Buckets<T> {}
 // SAFETY: as above; shared access only reads.
-unsafe impl Sync for Buckets {}
+unsafe impl<T: Sync> Sync for Buckets<T> {}
 
-impl Buckets {
-    const fn new() -> Self {
+impl<T> Buckets<T> {
+    pub(crate) const fn new() -> Self {
         Self {
             pointer: std::ptr::NonNull::dangling(),
             len: 0,
         }
     }
 
+    #[cfg(unix)]
     fn mapped(len: usize) -> bool {
-        cfg!(unix) && len >= MAPPED_BUCKETS
+        len >= MAPPED_BYTES.div_ceil(std::mem::size_of::<T>())
     }
 
-    /// Allocate `len` empty (all-zero) buckets.
-    fn zeroed(len: usize) -> Result<Self, Error> {
+    /// Allocate `len` zero-initialized buckets.
+    ///
+    /// Callers must ensure an all-zero bit pattern is valid for `T`.
+    pub(crate) fn zeroed(len: usize) -> Result<Self, Error> {
         if len == 0 {
             return Ok(Self::new());
         }
-        let layout = std::alloc::Layout::array::<Bucket>(len).map_err(|_| Error::ReserveFailed)?;
+        let layout = std::alloc::Layout::array::<T>(len).map_err(|_| Error::ReserveFailed)?;
         #[cfg(unix)]
         if Self::mapped(len) {
             // SAFETY: an anonymous private mapping of nonzero size; the result
-            // is checked. Mappings are page aligned, which satisfies `Bucket`.
+            // is checked. Mappings are page aligned, which satisfies `T`.
             let pointer = unsafe {
                 libc::mmap(
                     std::ptr::null_mut(),
@@ -181,20 +187,20 @@ impl Buckets {
             let pointer = std::ptr::NonNull::new(pointer.cast()).ok_or(Error::ReserveFailed)?;
             return Ok(Self { pointer, len });
         }
-        // SAFETY: the layout has nonzero size, and an all-zero `Bucket` is
-        // valid (and empty).
-        let pointer = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<Bucket>();
+        // SAFETY: the layout has nonzero size, and callers ensure all-zero `T`
+        // is valid (and empty).
+        let pointer = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<T>();
         let pointer = std::ptr::NonNull::new(pointer).ok_or(Error::ReserveFailed)?;
         Ok(Self { pointer, len })
     }
 }
 
-impl Drop for Buckets {
+impl<T> Drop for Buckets<T> {
     fn drop(&mut self) {
         if self.len == 0 {
             return;
         }
-        let layout = std::alloc::Layout::array::<Bucket>(self.len).expect("allocated layout");
+        let layout = std::alloc::Layout::array::<T>(self.len).expect("allocated layout");
         #[cfg(unix)]
         if Self::mapped(self.len) {
             // SAFETY: this is exactly the mapping made in `zeroed`.
@@ -206,20 +212,20 @@ impl Drop for Buckets {
     }
 }
 
-impl std::ops::Deref for Buckets {
-    type Target = [Bucket];
+impl<T> std::ops::Deref for Buckets<T> {
+    type Target = [T];
 
     #[inline(always)]
-    fn deref(&self) -> &[Bucket] {
+    fn deref(&self) -> &[T] {
         // SAFETY: `pointer` is valid for `len` initialized buckets (or
         // dangling and aligned when `len` is zero).
         unsafe { std::slice::from_raw_parts(self.pointer.as_ptr(), self.len) }
     }
 }
 
-impl std::ops::DerefMut for Buckets {
+impl<T> std::ops::DerefMut for Buckets<T> {
     #[inline(always)]
-    fn deref_mut(&mut self) -> &mut [Bucket] {
+    fn deref_mut(&mut self) -> &mut [T] {
         // SAFETY: as in `deref`, with exclusive access through `&mut self`.
         unsafe { std::slice::from_raw_parts_mut(self.pointer.as_ptr(), self.len) }
     }
@@ -239,7 +245,7 @@ pub(crate) enum Load {
 
 impl Load {
     /// The limit in sixteenths of the slots.
-    const fn sixteenths(self) -> usize {
+    pub(crate) const fn sixteenths(self) -> usize {
         match self {
             Self::Sparse => 12,
             Self::Dense => 14,
@@ -253,7 +259,7 @@ impl Load {
 /// the limit instead of dropping to half of it.
 const STEADY_BUCKETS: usize = 1024;
 
-/// Bits per slot in the masks of `bucket_masks`: slot `i` owns bits
+/// Bits per slot in the masks of `bucket_masks_8`: slot `i` owns bits
 /// `i * MASK_BITS..(i + 1) * MASK_BITS`, all of them set or all clear. NEON
 /// narrows each comparison to a byte; x86 extracts one bit per slot.
 #[cfg(target_arch = "x86_64")]
@@ -266,89 +272,11 @@ pub(crate) const MASK_BITS: u32 = 8;
 ///
 /// On x86-64 the widest instruction set enabled for the build is used:
 /// AVX-512 compares a whole bucket at once, AVX2 half of it, and the SSE2
-/// baseline a quarter. Build with `-C target-cpu=native` (or `x86-64-v3`,
-/// `x86-64-v4`) to select the wider ones; the choice is made at compile time
-/// so that the comparison stays inlined in every update loop.
-#[inline(always)]
-fn bucket_masks(bucket: &Bucket, key: u64, key_mask: u64) -> (u64, u64) {
-    bucket_masks_8(&bucket.0, key, key_mask)
-}
-
-/// Same as `bucket_masks_8`, but safe when `slots_arr` is only 8-byte aligned
-/// (used by compact wide buckets whose size is not a multiple of 64 bytes).
-#[inline(always)]
-pub(crate) fn bucket_masks_8_unaligned(
-    slots_arr: &[u64; 8],
-    key: u64,
-    key_mask: u64,
-) -> (u64, u64) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        bucket_masks_8(slots_arr, key, key_mask)
-    }
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-    // SAFETY: AVX-512F is enabled; unaligned load needs no 64-byte alignment.
-    unsafe {
-        use core::arch::x86_64::*;
-        let slots = _mm512_loadu_si512(slots_arr.as_ptr().cast());
-        let matches = _mm512_cmpeq_epi64_mask(
-            _mm512_and_si512(slots, _mm512_set1_epi64(key_mask as i64)),
-            _mm512_set1_epi64(key as i64),
-        );
-        let empty = _mm512_testn_epi64_mask(slots, slots);
-        (u64::from(matches), u64::from(empty))
-    }
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx2",
-        not(target_feature = "avx512f")
-    ))]
-    // SAFETY: AVX2 is enabled; unaligned loads need no 32-byte alignment.
-    unsafe {
-        use core::arch::x86_64::*;
-        let pointer = slots_arr.as_ptr().cast::<__m256i>();
-        let (low, high) = (
-            _mm256_loadu_si256(pointer),
-            _mm256_loadu_si256(pointer.add(1)),
-        );
-        let key = _mm256_set1_epi64x(key as i64);
-        let key_mask = _mm256_set1_epi64x(key_mask as i64);
-        let zero = _mm256_setzero_si256();
-        let bits = |equal| _mm256_movemask_pd(_mm256_castsi256_pd(equal)) as u32 as u64;
-        let matches = |slots| bits(_mm256_cmpeq_epi64(_mm256_and_si256(slots, key_mask), key));
-        let empty = |slots| bits(_mm256_cmpeq_epi64(slots, zero));
-        (
-            matches(low) | (matches(high) << 4),
-            empty(low) | (empty(high) << 4),
-        )
-    }
-    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
-    // SAFETY: SSE2 is baseline on x86-64; unaligned loads need no 16-byte alignment.
-    unsafe {
-        use core::arch::x86_64::*;
-        let pointer = slots_arr.as_ptr().cast::<__m128i>();
-        let key = _mm_set1_epi64x(key as i64);
-        let key_mask = _mm_set1_epi64x(key_mask as i64);
-        let zero = _mm_setzero_si128();
-        let equal = |a, b| {
-            let halves = _mm_cmpeq_epi32(a, b);
-            let both = _mm_and_si128(halves, _mm_shuffle_epi32::<0b1011_0001>(halves));
-            _mm_movemask_pd(_mm_castsi128_pd(both)) as u32 as u64
-        };
-        let (mut matches, mut empty) = (0, 0);
-        for quarter in 0..4 {
-            let slots = _mm_loadu_si128(pointer.add(quarter));
-            matches |= equal(_mm_and_si128(slots, key_mask), key) << (2 * quarter);
-            empty |= equal(slots, zero) << (2 * quarter);
-        }
-        (matches, empty)
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        bucket_masks_8(slots_arr, key, key_mask)
-    }
-}
-
+/// baseline a quarter. Unaligned loads have zero penalty on aligned addresses
+/// and keep this safe for 8-byte-aligned wide buckets as well. Build with
+/// `-C target-cpu=native` (or `x86-64-v3`, `x86-64-v4`) to select the wider
+/// ones; the choice is made at compile time so that the comparison stays
+/// inlined in every update loop.
 #[inline(always)]
 pub(crate) fn bucket_masks_8(slots_arr: &[u64; 8], key: u64, key_mask: u64) -> (u64, u64) {
     #[cfg(target_arch = "aarch64")]
@@ -381,10 +309,10 @@ pub(crate) fn bucket_masks_8(slots_arr: &[u64; 8], key: u64, key_mask: u64) -> (
         )
     }
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-    // SAFETY: AVX-512F is enabled for this build, and callers align to 64 bytes.
+    // SAFETY: AVX-512F is enabled; unaligned load needs no 64-byte alignment.
     unsafe {
         use core::arch::x86_64::*;
-        let slots = _mm512_load_si512(slots_arr.as_ptr().cast());
+        let slots = _mm512_loadu_si512(slots_arr.as_ptr().cast());
         let matches = _mm512_cmpeq_epi64_mask(
             _mm512_and_si512(slots, _mm512_set1_epi64(key_mask as i64)),
             _mm512_set1_epi64(key as i64),
@@ -397,13 +325,13 @@ pub(crate) fn bucket_masks_8(slots_arr: &[u64; 8], key: u64, key_mask: u64) -> (
         target_feature = "avx2",
         not(target_feature = "avx512f")
     ))]
-    // SAFETY: AVX2 is enabled for this build, and callers align to 64 bytes.
+    // SAFETY: AVX2 is enabled; unaligned loads need no 32-byte alignment.
     unsafe {
         use core::arch::x86_64::*;
         let pointer = slots_arr.as_ptr().cast::<__m256i>();
         let (low, high) = (
-            _mm256_load_si256(pointer),
-            _mm256_load_si256(pointer.add(1)),
+            _mm256_loadu_si256(pointer),
+            _mm256_loadu_si256(pointer.add(1)),
         );
         let key = _mm256_set1_epi64x(key as i64);
         let key_mask = _mm256_set1_epi64x(key_mask as i64);
@@ -418,7 +346,7 @@ pub(crate) fn bucket_masks_8(slots_arr: &[u64; 8], key: u64, key_mask: u64) -> (
         )
     }
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
-    // SAFETY: SSE2 is part of the x86-64 baseline, and callers align to 64 bytes.
+    // SAFETY: SSE2 is part of the x86-64 baseline; unaligned loads need no 16-byte alignment.
     unsafe {
         use core::arch::x86_64::*;
         let pointer = slots_arr.as_ptr().cast::<__m128i>();
@@ -434,7 +362,7 @@ pub(crate) fn bucket_masks_8(slots_arr: &[u64; 8], key: u64, key_mask: u64) -> (
         };
         let (mut matches, mut empty) = (0, 0);
         for quarter in 0..4 {
-            let slots = _mm_load_si128(pointer.add(quarter));
+            let slots = _mm_loadu_si128(pointer.add(quarter));
             matches |= equal(_mm_and_si128(slots, key_mask), key) << (2 * quarter);
             empty |= equal(slots, zero) << (2 * quarter);
         }
@@ -484,7 +412,7 @@ pub(crate) enum Overflow {
 
 /// One partition's compact table.
 pub(crate) struct CompactTable {
-    buckets: Buckets,
+    buckets: Buckets<Bucket>,
     len: usize,
     grow_at: usize,
     layout: Layout,
@@ -636,7 +564,7 @@ impl CompactTable {
             // SAFETY: `home` is below the bucket count, and the wrap below
             // keeps `bucket` in bounds; the load factor guarantees an empty slot.
             let (matches, empty) =
-                bucket_masks(unsafe { self.buckets.get_unchecked(bucket) }, key, key_mask);
+                bucket_masks_8(&unsafe { self.buckets.get_unchecked(bucket) }.0, key, key_mask);
             // Slots fill left to right and are never removed, so a stored key
             // precedes every empty slot; clear empties that compare equal to 0.
             let matches = matches & !empty;
@@ -684,19 +612,18 @@ impl CompactTable {
         if self.len >= self.grow_at {
             self.grow()?;
         }
-        let marker = self.layout.count_marker();
+        let (marker, count_bits) = (self.layout.count_marker(), self.layout.count_bits);
         let (found, index) = self.find(remainder);
         // SAFETY: `find` returns an in-bounds slot.
-        let slot = unsafe { *self.slot_mut(index) };
+        let slot_ref = unsafe { self.slot_mut(index) };
+        let slot = *slot_ref;
         let small = slot & marker;
         if found && small != marker && delta < marker - small {
-            // SAFETY: as above.
-            unsafe { *self.slot_mut(index) = slot + delta };
+            *slot_ref = slot + delta;
             return Ok(());
         }
         if !found && delta < marker {
-            // SAFETY: as above.
-            unsafe { *self.slot_mut(index) = (remainder << self.layout.count_bits) | delta };
+            *slot_ref = (remainder << count_bits) | delta;
             self.len += 1;
             return Ok(());
         }
@@ -744,7 +671,7 @@ impl CompactTable {
                     // below keeps `bucket` in bounds; the load factor
                     // guarantees an empty slot.
                     let slots = unsafe { &mut *buckets.add(bucket) };
-                    let (matches, empty) = bucket_masks(slots, key, key_mask);
+                    let (matches, empty) = bucket_masks_8(&slots.0, key, key_mask);
                     let matches = matches & !empty;
                     // One test covers both ways a search ends, at the key or
                     // at the first empty slot. Which of the two it was is
@@ -1287,22 +1214,19 @@ impl Drop for OrderedAdder<'_> {
 /// Apply `input` to `tables` (a power-of-two number of them), one table at a
 /// time.
 ///
-/// An entry's table is given by the bits above its remainder, modulo the
-/// number of tables. The entries are first split by table, a sequential
-/// pass, so that `apply` then gives each table all of its updates in one
-/// burst while it is cached.
-pub(crate) fn add_split(
-    tables: &mut [CompactTable],
-    layout: Layout,
-    input: &[u64],
-    split: &mut Vec<u64>,
+/// The entries are first split by table, a sequential pass, so that `apply` then
+/// gives each table all of its updates in one burst while it is cached.
+pub(crate) fn add_split<T, E: Copy + Default>(
+    tables: &mut [T],
+    input: &[E],
+    split: &mut Vec<E>,
     ends: &mut Vec<usize>,
-    apply: impl Fn(&mut CompactTable, &[u64]) -> Result<(), Error>,
+    table_of: impl Fn(E) -> usize,
+    apply: impl Fn(&mut T, &[E]) -> Result<(), Error>,
 ) -> Result<(), Error> {
     if tables.len() == 1 {
         return apply(&mut tables[0], input);
     }
-    let table_of = |entry: u64| (entry >> layout.remainder_bits) as usize & (tables.len() - 1);
     // A counting sort by table: count, turn counts into start offsets, then
     // scatter (advancing each start to its end).
     ends.clear();
@@ -1315,7 +1239,7 @@ pub(crate) fn add_split(
         start += std::mem::replace(end, start);
     }
     split.clear();
-    split.resize(input.len(), 0);
+    split.resize(input.len(), E::default());
     for &entry in input {
         let cursor = &mut ends[table_of(entry)];
         split[*cursor] = entry;
@@ -1405,7 +1329,7 @@ mod tests {
                         }
                     };
                 }
-                let (matches, empty) = bucket_masks(&bucket, key, key_mask);
+                let (matches, empty) = bucket_masks_8(&bucket.0, key, key_mask);
                 for (index, &slot) in bucket.0.iter().enumerate() {
                     let shift = index as u32 * MASK_BITS;
                     let expected = |set: bool| if set { slot_mask } else { 0 };

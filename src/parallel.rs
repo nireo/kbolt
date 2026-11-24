@@ -5,7 +5,7 @@
 
 use crossbeam_channel as channel;
 use std::collections::HashMap;
-use std::hash::{BuildHasher, Hash};
+use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -14,11 +14,11 @@ use std::time::{Duration, Instant};
 use crate::disk::{BinBuffers, Bins};
 use crate::table::{self, CompactTable, Layout, Load, Mixer, Overflow, PackedCounts};
 use crate::table_wide::{
-    self, BucketWide, CompactTableWide, HighKey, LayoutWide, PackedCountsWide, QueuedEntry, mix_lo,
+    BucketWide, CompactTableWide, HighKey, LayoutWide, PackedCountsWide, QueuedEntry, mix_lo,
 };
 use crate::{
-    Counter, Counts, Error, StrandMode, WideCounts, add_delta, visit_bytes, visit_packed,
-    visit_packed128, visit_packed192, visit_packed256,
+    ByteCounts, Counter, Counts, Error, StrandMode, WideCounts, add_delta, visit_bytes,
+    visit_packed, visit_packed128, visit_packed192, visit_packed256,
 };
 
 const BATCH_BASES: usize = 1024 * 1024;
@@ -50,55 +50,6 @@ impl Batch {
 // Keep unrelated partition locks off the same cache line.
 #[repr(align(128))]
 struct Shard<T>(Mutex<T>);
-
-/// Apply each nonempty worker-local partition buffer to its shard.
-///
-/// Different workers start at different partitions, and a partition held by
-/// another worker is skipped and revisited instead of waited on. Only when
-/// every remaining partition is busy does a worker block on one. Ownership
-/// follows the partition, not the worker or input batch.
-fn apply_partitions<T, U>(
-    shards: &[Shard<T>],
-    partitions: &mut [Vec<U>],
-    pending: &mut Vec<usize>,
-    offset: usize,
-    drain: impl Fn(&mut T, &mut Vec<U>) -> Result<(), Error>,
-) -> Result<(), Error> {
-    pending.clear();
-    let mask = shards.len() - 1;
-    pending.extend(
-        (0..shards.len())
-            .map(|step| (step + offset) & mask)
-            .filter(|&index| !partitions[index].is_empty()),
-    );
-    while !pending.is_empty() {
-        let before = pending.len();
-        let mut result = Ok(());
-        pending.retain(|&index| {
-            if result.is_err() {
-                return true;
-            }
-            match shards[index].0.try_lock() {
-                Ok(mut table) => {
-                    result = drain(&mut table, &mut partitions[index]);
-                    false
-                }
-                Err(std::sync::TryLockError::WouldBlock) => true,
-                Err(std::sync::TryLockError::Poisoned(_)) => {
-                    result = Err(Error::WorkerFailed);
-                    true
-                }
-            }
-        });
-        result?;
-        if pending.len() == before {
-            let index = pending.swap_remove(0);
-            let mut table = shards[index].0.lock().map_err(|_| Error::WorkerFailed)?;
-            drain(&mut table, &mut partitions[index])?;
-        }
-    }
-    Ok(())
-}
 
 /// Partition bits for parallel packed counting: this many top bits of a mixed
 /// key select its table. With thousands of tables, each one stays small enough
@@ -135,114 +86,69 @@ const MIN_BACKLOG: usize = if cfg!(test) { 256 } else { 256 * 1024 };
 /// One group of compact tables and the updates queued for them.
 // Keep unrelated groups' locks off the same cache line.
 #[repr(align(128))]
-struct Group {
-    /// Queued updates in arrival order; see `PackedShared::push` for the
-    /// entry format. Held only to append a buffer or to take the whole queue.
-    pending: Mutex<Vec<u64>>,
+struct Group<T, E> {
+    /// Queued updates in arrival order. Held only to append a buffer or to
+    /// take the whole queue.
+    pending: Mutex<Vec<E>>,
     /// The group's tables, in sub-partition order. Whoever holds this lock
     /// applies queued updates.
-    tables: Mutex<Vec<CompactTable>>,
+    tables: Mutex<Vec<T>>,
     /// Queue length at which applying is worthwhile; follows the table sizes.
     threshold: AtomicUsize,
 }
 
-/// Shared compact tables for packed keys (k <= 32); see `crate::table`.
-struct PackedShared {
-    mixer: Mixer,
-    layout: Layout,
-    /// Bits of a mixed key below its group index: sub-partition and remainder.
-    entry_bits: u32,
-    groups: Vec<Group>,
-}
-
-/// Worker-local state for packed keys.
-#[derive(Default)]
-struct PackedUpdates {
+/// Worker-local buffers shared by packed and wide group backends.
+struct GroupUpdates<E> {
     /// Updates not yet queued, one buffer per group.
-    local: Vec<Vec<u64>>,
+    local: Vec<Vec<E>>,
     /// A group's queue while this worker applies it.
-    input: Vec<u64>,
+    input: Vec<E>,
     /// The same updates grouped by table.
-    split: Vec<u64>,
+    split: Vec<E>,
     /// Where each table's updates end (then, while scattering, the cursors).
     ends: Vec<usize>,
     /// Small groups found busy during a pass, to revisit at its end.
     busy: Vec<usize>,
-    /// The mixed key this worker buffered last.
-    previous: u64,
 }
 
-/// The queue length at which a group with these tables is applied, or zero
-/// while the group is small enough to be updated directly.
-fn pending_threshold(tables: &[CompactTable]) -> usize {
-    let buckets: usize = tables.iter().map(CompactTable::buckets).sum();
-    if buckets <= DIRECT_BUCKETS {
-        0
-    } else {
-        buckets.clamp(MIN_PENDING, MAX_PENDING)
+impl<E> Default for GroupUpdates<E> {
+    fn default() -> Self {
+        Self {
+            local: Vec::new(),
+            input: Vec::new(),
+            split: Vec::new(),
+            ends: Vec::new(),
+            busy: Vec::new(),
+        }
     }
 }
 
-impl PackedShared {
-    fn new(k: usize, capacity: usize) -> Result<Self, Error> {
-        let counts =
-            PackedCounts::with_capacity(k, PARALLEL_PARTITION_BITS, capacity, Load::Dense)?;
-        let (mixer, layout) = (counts.mixer(), counts.layout());
-        let partition_bits = table::key_bits(k) - layout.remainder_bits;
-        let group_bits = GROUP_BITS.min(partition_bits);
-        let per_group = 1_usize << (partition_bits - group_bits);
-        let mut tables = counts.into_tables().into_iter();
-        let groups = (0..1_usize << group_bits)
-            .map(|_| {
-                let tables: Vec<_> = tables.by_ref().take(per_group).collect();
-                Group {
-                    pending: Mutex::new(Vec::new()),
-                    threshold: AtomicUsize::new(pending_threshold(&tables)),
-                    tables: Mutex::new(tables),
-                }
-            })
-            .collect();
-        Ok(Self {
-            mixer,
-            layout,
-            entry_bits: table::key_bits(k) - group_bits,
-            groups,
-        })
-    }
-
-    fn updates(&self) -> PackedUpdates {
-        PackedUpdates {
-            local: (0..self.groups.len()).map(|_| Vec::new()).collect(),
-            ..PackedUpdates::default()
+impl<E> GroupUpdates<E> {
+    fn for_groups(groups: usize) -> Self {
+        Self {
+            local: (0..groups).map(|_| Vec::new()).collect(),
+            ..Self::default()
         }
     }
+}
 
-    /// Buffer one occurrence of `key`. An entry holds the mixed key's bits
-    /// below its group index, with a run of repeated increments above them.
-    #[inline(always)]
-    fn push(&self, updates: &mut PackedUpdates, key: u64) {
-        let mixed = self.mixer.mix(key);
-        let entry_mask = u64::MAX >> (64 - self.entry_bits);
-        let entry = mixed & entry_mask;
-        let run = 1_u64 << self.entry_bits;
-        // Run aggregation handles hot keys and short motifs cheaply. A repeat
-        // is the same mixed key as the one before, a comparison of two
-        // registers; only then is the last entry of its buffer read back. That
-        // entry is the earlier occurrence unless the buffer has been handed
-        // on since, which the checks below cover.
-        let repeated = mixed == updates.previous;
-        updates.previous = mixed;
-        let buffer = &mut updates.local[(mixed >> self.entry_bits) as usize];
-        if repeated
-            && let Some(last) = buffer.last_mut()
-            && *last & entry_mask == entry
-            && *last >> self.entry_bits < !entry_mask >> self.entry_bits
-        {
-            *last += run;
-            return;
-        }
-        buffer.push(run | entry);
-    }
+/// Common group-queueing and submission behavior for 64-bit and wide compact
+/// tables, monomorphized so hot update loops stay fully specialized.
+trait GroupBackend: Sync {
+    type Table: Send;
+    type Entry: Copy + Default + Send;
+
+    fn groups(&self) -> &[Group<Self::Table, Self::Entry>];
+    fn into_groups(self) -> Vec<Group<Self::Table, Self::Entry>>;
+    fn threshold(&self, tables: &[Self::Table]) -> usize;
+    fn add_direct(&self, tables: &mut [Self::Table], entries: &[Self::Entry]) -> Result<(), Error>;
+    fn add_split(
+        &self,
+        tables: &mut [Self::Table],
+        input: &[Self::Entry],
+        split: &mut Vec<Self::Entry>,
+        ends: &mut Vec<usize>,
+    ) -> Result<(), Error>;
 
     /// Hand this worker's buffered updates to their groups.
     ///
@@ -251,10 +157,11 @@ impl PackedShared {
     /// and a large one simply keeps the queued updates for that worker's next
     /// visit, so no worker waits on a table unless a queue has grown far past
     /// its threshold.
-    fn submit(&self, updates: &mut PackedUpdates, offset: usize) -> Result<(), Error> {
-        let mask = self.groups.len() - 1;
+    fn submit(&self, updates: &mut GroupUpdates<Self::Entry>, offset: usize) -> Result<(), Error> {
+        let len = self.groups().len();
+        let mask = len - 1;
         updates.busy.clear();
-        for step in 0..self.groups.len() {
+        for step in 0..len {
             let index = (step + offset) & mask;
             if !updates.local[index].is_empty() && !self.submit_group(index, updates, false)? {
                 updates.busy.push(index);
@@ -274,22 +181,22 @@ impl PackedShared {
     fn submit_group(
         &self,
         index: usize,
-        updates: &mut PackedUpdates,
+        updates: &mut GroupUpdates<Self::Entry>,
         queue_if_busy: bool,
     ) -> Result<bool, Error> {
-        let group = &self.groups[index];
+        let group = &self.groups()[index];
         let threshold = group.threshold.load(Ordering::Relaxed);
         if threshold == 0 {
             match group.tables.try_lock() {
                 Ok(mut tables) => {
                     // First anything queued while the group was busy, then
                     // this worker's updates straight from its buffer.
-                    self.apply(group, &mut tables, updates)?;
+                    self.apply_group(group, &mut tables, updates)?;
                     self.add_direct(&mut tables, &updates.local[index])?;
                     updates.local[index].clear();
                     group
                         .threshold
-                        .store(pending_threshold(&tables), Ordering::Relaxed);
+                        .store(self.threshold(&tables), Ordering::Relaxed);
                     return Ok(true);
                 }
                 Err(std::sync::TryLockError::WouldBlock) if !queue_if_busy => return Ok(false),
@@ -325,11 +232,195 @@ impl PackedShared {
             }
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::WorkerFailed),
         };
-        self.apply(group, &mut tables, updates)?;
+        self.apply_group(group, &mut tables, updates)?;
         Ok(true)
     }
 
-    /// Apply `entries` to a small group's tables in arrival order.
+    /// Apply every update queued for `group` to its tables.
+    fn apply_group(
+        &self,
+        group: &Group<Self::Table, Self::Entry>,
+        tables: &mut [Self::Table],
+        updates: &mut GroupUpdates<Self::Entry>,
+    ) -> Result<(), Error> {
+        let GroupUpdates {
+            input, split, ends, ..
+        } = updates;
+        input.clear();
+        // Trade buffers: the queue keeps this worker's capacity for reuse.
+        std::mem::swap(
+            &mut *group.pending.lock().map_err(|_| Error::WorkerFailed)?,
+            input,
+        );
+        if input.is_empty() {
+            return Ok(());
+        }
+        self.add_split(tables, input, split, ends)?;
+        group
+            .threshold
+            .store(self.threshold(tables), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Apply whatever is still queued, on `threads` threads, and return all
+    /// tables in partition order.
+    fn finish_tables(self, threads: usize) -> Result<Vec<Self::Table>, Error>
+    where
+        Self: Sized,
+    {
+        let next = AtomicUsize::new(0);
+        thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads.clamp(1, self.groups().len()))
+                .map(|_| {
+                    scope.spawn(|| -> Result<(), Error> {
+                        let mut updates = GroupUpdates::default();
+                        while let Some(group) =
+                            self.groups().get(next.fetch_add(1, Ordering::Relaxed))
+                        {
+                            let mut tables =
+                                group.tables.lock().map_err(|_| Error::WorkerFailed)?;
+                            self.apply_group(group, &mut tables, &mut updates)?;
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .try_for_each(|worker| worker.join().map_err(|_| Error::WorkerFailed)?)
+        })?;
+        let mut tables = Vec::new();
+        for group in self.into_groups() {
+            tables.extend(group.tables.into_inner().map_err(|_| Error::WorkerFailed)?);
+        }
+        Ok(tables)
+    }
+}
+
+fn make_groups<T, E>(
+    tables: Vec<T>,
+    group_bits: u32,
+    per_group: usize,
+    threshold: impl Fn(&[T]) -> usize,
+) -> Vec<Group<T, E>> {
+    let mut tables = tables.into_iter();
+    (0..1_usize << group_bits)
+        .map(|_| {
+            let group_tables: Vec<_> = tables.by_ref().take(per_group).collect();
+            Group {
+                pending: Mutex::new(Vec::new()),
+                threshold: AtomicUsize::new(threshold(&group_tables)),
+                tables: Mutex::new(group_tables),
+            }
+        })
+        .collect()
+}
+
+/// Shared compact tables for packed keys (k <= 32); see `crate::table`.
+struct PackedShared {
+    mixer: Mixer,
+    layout: Layout,
+    /// Bits of a mixed key below its group index: sub-partition and remainder.
+    entry_bits: u32,
+    groups: Vec<Group<CompactTable, u64>>,
+}
+
+/// Worker-local state for packed keys.
+#[derive(Default)]
+struct PackedUpdates {
+    group: GroupUpdates<u64>,
+    /// The mixed key this worker buffered last.
+    previous: u64,
+}
+
+/// The queue length at which a group with these tables is applied, or zero
+/// while the group is small enough to be updated directly.
+fn pending_threshold(tables: &[CompactTable]) -> usize {
+    let buckets: usize = tables.iter().map(CompactTable::buckets).sum();
+    if buckets <= DIRECT_BUCKETS {
+        0
+    } else {
+        buckets.clamp(MIN_PENDING, MAX_PENDING)
+    }
+}
+
+impl PackedShared {
+    fn new(k: usize, capacity: usize) -> Result<Self, Error> {
+        let counts =
+            PackedCounts::with_capacity(k, PARALLEL_PARTITION_BITS, capacity, Load::Dense)?;
+        let (mixer, layout) = (counts.mixer(), counts.layout());
+        let partition_bits = table::key_bits(k) - layout.remainder_bits;
+        let group_bits = GROUP_BITS.min(partition_bits);
+        let per_group = 1_usize << (partition_bits - group_bits);
+        let groups = make_groups(counts.into_tables(), group_bits, per_group, pending_threshold);
+        Ok(Self {
+            mixer,
+            layout,
+            entry_bits: table::key_bits(k) - group_bits,
+            groups,
+        })
+    }
+
+    fn updates(&self) -> PackedUpdates {
+        PackedUpdates {
+            group: GroupUpdates::for_groups(self.groups.len()),
+            previous: 0,
+        }
+    }
+
+    /// Buffer one occurrence of `key`. An entry holds the mixed key's bits
+    /// below its group index, with a run of repeated increments above them.
+    #[inline(always)]
+    fn push(&self, updates: &mut PackedUpdates, key: u64) {
+        let mixed = self.mixer.mix(key);
+        let entry_mask = u64::MAX >> (64 - self.entry_bits);
+        let entry = mixed & entry_mask;
+        let run = 1_u64 << self.entry_bits;
+        // Run aggregation handles hot keys and short motifs cheaply. A repeat
+        // is the same mixed key as the one before, a comparison of two
+        // registers; only then is the last entry of its buffer read back. That
+        // entry is the earlier occurrence unless the buffer has been handed
+        // on since, which the checks below cover.
+        let repeated = mixed == updates.previous;
+        updates.previous = mixed;
+        let buffer = &mut updates.group.local[(mixed >> self.entry_bits) as usize];
+        if repeated
+            && let Some(last) = buffer.last_mut()
+            && *last & entry_mask == entry
+            && *last >> self.entry_bits < !entry_mask >> self.entry_bits
+        {
+            *last += run;
+            return;
+        }
+        buffer.push(run | entry);
+    }
+
+    fn into_counts(self, threads: usize) -> Result<PackedCounts, Error> {
+        let (mixer, layout) = (self.mixer, self.layout);
+        Ok(PackedCounts::from_tables(
+            mixer,
+            layout,
+            self.finish_tables(threads)?,
+        ))
+    }
+}
+
+impl GroupBackend for PackedShared {
+    type Table = CompactTable;
+    type Entry = u64;
+
+    fn groups(&self) -> &[Group<CompactTable, u64>] {
+        &self.groups
+    }
+
+    fn into_groups(self) -> Vec<Group<CompactTable, u64>> {
+        self.groups
+    }
+
+    fn threshold(&self, tables: &[CompactTable]) -> usize {
+        pending_threshold(tables)
+    }
+
     fn add_direct(&self, tables: &mut [CompactTable], entries: &[u64]) -> Result<(), Error> {
         let layout = self.layout;
         let (mask, run_shift) = (layout.remainder_mask(), self.entry_bits);
@@ -345,34 +436,6 @@ impl PackedShared {
         Ok(())
     }
 
-    /// Apply every update queued for `group` to its tables.
-    fn apply(
-        &self,
-        group: &Group,
-        tables: &mut [CompactTable],
-        updates: &mut PackedUpdates,
-    ) -> Result<(), Error> {
-        let PackedUpdates {
-            input, split, ends, ..
-        } = updates;
-        input.clear();
-        // Trade buffers: the queue keeps this worker's capacity for reuse.
-        std::mem::swap(
-            &mut *group.pending.lock().map_err(|_| Error::WorkerFailed)?,
-            input,
-        );
-        if input.is_empty() {
-            return Ok(());
-        }
-        self.add_split(tables, input, split, ends)?;
-        group
-            .threshold
-            .store(pending_threshold(tables), Ordering::Relaxed);
-        Ok(())
-    }
-
-    /// Apply `input` to a group's tables, one table at a time; see
-    /// [`table::add_split`].
     fn add_split(
         &self,
         tables: &mut [CompactTable],
@@ -380,50 +443,19 @@ impl PackedShared {
         split: &mut Vec<u64>,
         ends: &mut Vec<usize>,
     ) -> Result<(), Error> {
-        let run_shift = self.entry_bits;
-        table::add_split(tables, self.layout, input, split, ends, |table, entries| {
-            table.warm(entries.len());
-            table.add_entries(entries, run_shift)
-        })
+        let (shift, mask, run_shift) = (self.layout.remainder_bits, tables.len() - 1, self.entry_bits);
+        table::add_split(
+            tables,
+            input,
+            split,
+            ends,
+            |entry| (entry >> shift) as usize & mask,
+            |table, entries| {
+                table.warm(entries.len());
+                table.add_entries(entries, run_shift)
+            },
+        )
     }
-
-    /// Apply whatever is still queued, on `threads` threads, and return the
-    /// tables.
-    fn into_counts(self, threads: usize) -> Result<PackedCounts, Error> {
-        let next = AtomicUsize::new(0);
-        thread::scope(|scope| {
-            let workers: Vec<_> = (0..threads.clamp(1, self.groups.len()))
-                .map(|_| {
-                    scope.spawn(|| -> Result<(), Error> {
-                        let mut updates = PackedUpdates::default();
-                        while let Some(group) =
-                            self.groups.get(next.fetch_add(1, Ordering::Relaxed))
-                        {
-                            let mut tables =
-                                group.tables.lock().map_err(|_| Error::WorkerFailed)?;
-                            self.apply(group, &mut tables, &mut updates)?;
-                        }
-                        Ok(())
-                    })
-                })
-                .collect();
-            workers
-                .into_iter()
-                .try_for_each(|worker| worker.join().map_err(|_| Error::WorkerFailed)?)
-        })?;
-        let mut tables = Vec::new();
-        for group in self.groups {
-            tables.extend(group.tables.into_inner().map_err(|_| Error::WorkerFailed)?);
-        }
-        Ok(PackedCounts::from_tables(self.mixer, self.layout, tables))
-    }
-}
-
-#[repr(align(128))]
-struct GroupWide<H: HighKey> {
-    pending: Mutex<Vec<QueuedEntry<H>>>,
-    tables: Mutex<Vec<CompactTableWide<H>>>,
-    threshold: AtomicUsize,
 }
 
 /// Shared compact tables for wide packed keys (`33 <= k <= 128`); see `crate::table_wide`.
@@ -431,31 +463,13 @@ struct PackedWideShared<H: HighKey> {
     layout: LayoutWide,
     /// Bits of `mixed_l` below its group index (`64 - GROUP_BITS = 58`).
     entry_bits: u32,
-    groups: Vec<GroupWide<H>>,
+    groups: Vec<Group<CompactTableWide<H>, QueuedEntry<H>>>,
 }
 
 struct PackedWideUpdates<H: HighKey> {
-    local: Vec<Vec<QueuedEntry<H>>>,
-    input: Vec<QueuedEntry<H>>,
-    split: Vec<QueuedEntry<H>>,
-    ends: Vec<usize>,
-    busy: Vec<usize>,
+    group: GroupUpdates<QueuedEntry<H>>,
     previous_l: u64,
     previous_h: H,
-}
-
-impl<H: HighKey> Default for PackedWideUpdates<H> {
-    fn default() -> Self {
-        Self {
-            local: Vec::new(),
-            input: Vec::new(),
-            split: Vec::new(),
-            ends: Vec::new(),
-            busy: Vec::new(),
-            previous_l: 0,
-            previous_h: H::default(),
-        }
-    }
 }
 
 fn pending_threshold_wide<H: HighKey>(tables: &[CompactTableWide<H>]) -> usize {
@@ -482,17 +496,12 @@ impl<H: HighKey> PackedWideShared<H> {
         let partition_bits = layout.partition_bits;
         let group_bits = GROUP_BITS.min(partition_bits);
         let per_group = 1_usize << (partition_bits - group_bits);
-        let mut tables = counts.into_tables().into_iter();
-        let groups = (0..1_usize << group_bits)
-            .map(|_| {
-                let tables: Vec<_> = tables.by_ref().take(per_group).collect();
-                GroupWide {
-                    pending: Mutex::new(Vec::new()),
-                    threshold: AtomicUsize::new(pending_threshold_wide(&tables)),
-                    tables: Mutex::new(tables),
-                }
-            })
-            .collect();
+        let groups = make_groups(
+            counts.into_tables(),
+            group_bits,
+            per_group,
+            pending_threshold_wide,
+        );
         Ok(Self {
             layout,
             entry_bits: 64 - group_bits,
@@ -502,8 +511,9 @@ impl<H: HighKey> PackedWideShared<H> {
 
     fn updates(&self) -> PackedWideUpdates<H> {
         PackedWideUpdates {
-            local: (0..self.groups.len()).map(|_| Vec::new()).collect(),
-            ..PackedWideUpdates::default()
+            group: GroupUpdates::for_groups(self.groups.len()),
+            previous_l: 0,
+            previous_h: H::default(),
         }
     }
 
@@ -516,7 +526,7 @@ impl<H: HighKey> PackedWideShared<H> {
         let repeated = l == updates.previous_l && hi == updates.previous_h;
         updates.previous_l = l;
         updates.previous_h = hi;
-        let buffer = &mut updates.local[(l >> self.entry_bits) as usize];
+        let buffer = &mut updates.group.local[(l >> self.entry_bits) as usize];
         if repeated
             && let Some(last) = buffer.last_mut()
             && last.l() & entry_mask == entry_l
@@ -529,74 +539,29 @@ impl<H: HighKey> PackedWideShared<H> {
         buffer.push(QueuedEntry::new(run | entry_l, hi));
     }
 
-    fn submit(&self, updates: &mut PackedWideUpdates<H>, offset: usize) -> Result<(), Error> {
-        let mask = self.groups.len() - 1;
-        updates.busy.clear();
-        for step in 0..self.groups.len() {
-            let index = (step + offset) & mask;
-            if !updates.local[index].is_empty() && !self.submit_group(index, updates, false)? {
-                updates.busy.push(index);
-            }
-        }
-        for position in 0..updates.busy.len() {
-            let index = updates.busy[position];
-            self.submit_group(index, updates, true)?;
-        }
-        Ok(())
+    fn into_counts(self, threads: usize) -> Result<PackedCountsWide<H>, Error> {
+        let layout = self.layout;
+        Ok(PackedCountsWide::from_tables(
+            layout,
+            self.finish_tables(threads)?,
+        ))
+    }
+}
+
+impl<H: HighKey> GroupBackend for PackedWideShared<H> {
+    type Table = CompactTableWide<H>;
+    type Entry = QueuedEntry<H>;
+
+    fn groups(&self) -> &[Group<CompactTableWide<H>, QueuedEntry<H>>] {
+        &self.groups
     }
 
-    fn submit_group(
-        &self,
-        index: usize,
-        updates: &mut PackedWideUpdates<H>,
-        queue_if_busy: bool,
-    ) -> Result<bool, Error> {
-        let group = &self.groups[index];
-        let threshold = group.threshold.load(Ordering::Relaxed);
-        if threshold == 0 {
-            match group.tables.try_lock() {
-                Ok(mut tables) => {
-                    self.apply(group, &mut tables, updates)?;
-                    self.add_direct(&mut tables, &updates.local[index])?;
-                    updates.local[index].clear();
-                    group
-                        .threshold
-                        .store(pending_threshold_wide(&tables), Ordering::Relaxed);
-                    return Ok(true);
-                }
-                Err(std::sync::TryLockError::WouldBlock) if !queue_if_busy => return Ok(false),
-                Err(std::sync::TryLockError::WouldBlock) => {}
-                Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::WorkerFailed),
-            }
-        }
-        let threshold = threshold.max(MIN_PENDING);
-        let queued = {
-            let mut pending = group.pending.lock().map_err(|_| Error::WorkerFailed)?;
-            let needed = pending.len() + updates.local[index].len();
-            if needed > pending.capacity() {
-                let target = needed.max(threshold + threshold / 4);
-                let additional = target - pending.len();
-                pending.reserve_exact(additional);
-            }
-            pending.extend_from_slice(&updates.local[index]);
-            pending.len()
-        };
-        updates.local[index].clear();
-        if queued < threshold {
-            return Ok(true);
-        }
-        let mut tables = match group.tables.try_lock() {
-            Ok(tables) => tables,
-            Err(std::sync::TryLockError::WouldBlock) => {
-                if queued < threshold.saturating_mul(BACKLOG).max(MIN_BACKLOG) {
-                    return Ok(true);
-                }
-                group.tables.lock().map_err(|_| Error::WorkerFailed)?
-            }
-            Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::WorkerFailed),
-        };
-        self.apply(group, &mut tables, updates)?;
-        Ok(true)
+    fn into_groups(self) -> Vec<Group<CompactTableWide<H>, QueuedEntry<H>>> {
+        self.groups
+    }
+
+    fn threshold(&self, tables: &[CompactTableWide<H>]) -> usize {
+        pending_threshold_wide(tables)
     }
 
     fn add_direct(
@@ -625,61 +590,25 @@ impl<H: HighKey> PackedWideShared<H> {
         Ok(())
     }
 
-    fn apply(
+    fn add_split(
         &self,
-        group: &GroupWide<H>,
         tables: &mut [CompactTableWide<H>],
-        updates: &mut PackedWideUpdates<H>,
+        input: &[QueuedEntry<H>],
+        split: &mut Vec<QueuedEntry<H>>,
+        ends: &mut Vec<usize>,
     ) -> Result<(), Error> {
-        let PackedWideUpdates {
-            input, split, ends, ..
-        } = updates;
-        input.clear();
-        std::mem::swap(
-            &mut *group.pending.lock().map_err(|_| Error::WorkerFailed)?,
+        let (shift, mask, run_shift) = (self.layout.l_rem_bits, tables.len() - 1, self.entry_bits);
+        table::add_split(
+            tables,
             input,
-        );
-        if input.is_empty() {
-            return Ok(());
-        }
-        let run_shift = self.entry_bits;
-        table_wide::add_split(tables, self.layout, input, split, ends, |table, entries| {
-            table.warm(entries.len());
-            table.add_entries(entries, run_shift)
-        })?;
-        group
-            .threshold
-            .store(pending_threshold_wide(tables), Ordering::Relaxed);
-        Ok(())
-    }
-
-    fn into_counts(self, threads: usize) -> Result<PackedCountsWide<H>, Error> {
-        let next = AtomicUsize::new(0);
-        thread::scope(|scope| {
-            let workers: Vec<_> = (0..threads.clamp(1, self.groups.len()))
-                .map(|_| {
-                    scope.spawn(|| -> Result<(), Error> {
-                        let mut updates = PackedWideUpdates::default();
-                        while let Some(group) =
-                            self.groups.get(next.fetch_add(1, Ordering::Relaxed))
-                        {
-                            let mut tables =
-                                group.tables.lock().map_err(|_| Error::WorkerFailed)?;
-                            self.apply(group, &mut tables, &mut updates)?;
-                        }
-                        Ok(())
-                    })
-                })
-                .collect();
-            workers
-                .into_iter()
-                .try_for_each(|worker| worker.join().map_err(|_| Error::WorkerFailed)?)
-        })?;
-        let mut tables = Vec::new();
-        for group in self.groups {
-            tables.extend(group.tables.into_inner().map_err(|_| Error::WorkerFailed)?);
-        }
-        Ok(PackedCountsWide::from_tables(self.layout, tables))
+            split,
+            ends,
+            |entry| (entry.l() >> shift) as usize & mask,
+            |table, entries| {
+                table.warm(entries.len());
+                table.add_entries(entries, run_shift)
+            },
+        )
     }
 }
 
@@ -729,52 +658,23 @@ impl WideShared {
         strand: StrandMode,
         offset: usize,
     ) -> Result<(), Error> {
+        macro_rules! count_wide {
+            ($table:expr, $buffers:expr, $visit:ident, $cast:expr) => {{
+                for record in batch.records() {
+                    $visit(record, k, strand, |hi, lo| {
+                        $table.push($buffers, $cast(hi), lo);
+                        Ok(())
+                    })?;
+                }
+                $table.submit(&mut $buffers.group, offset)
+            }};
+        }
         match (self, buffers) {
-            (Self::W80(table), WideUpdates::W80(buffers)) => {
-                for record in batch.records() {
-                    visit_packed128(record, k, strand, |hi, lo| {
-                        table.push(buffers, hi as u16, lo);
-                        Ok(())
-                    })?;
-                }
-                table.submit(buffers, offset)
-            }
-            (Self::W96(table), WideUpdates::W96(buffers)) => {
-                for record in batch.records() {
-                    visit_packed128(record, k, strand, |hi, lo| {
-                        table.push(buffers, hi as u32, lo);
-                        Ok(())
-                    })?;
-                }
-                table.submit(buffers, offset)
-            }
-            (Self::W128(table), WideUpdates::W128(buffers)) => {
-                for record in batch.records() {
-                    visit_packed128(record, k, strand, |hi, lo| {
-                        table.push(buffers, hi, lo);
-                        Ok(())
-                    })?;
-                }
-                table.submit(buffers, offset)
-            }
-            (Self::W192(table), WideUpdates::W192(buffers)) => {
-                for record in batch.records() {
-                    visit_packed192(record, k, strand, |hi, lo| {
-                        table.push(buffers, hi, lo);
-                        Ok(())
-                    })?;
-                }
-                table.submit(buffers, offset)
-            }
-            (Self::W256(table), WideUpdates::W256(buffers)) => {
-                for record in batch.records() {
-                    visit_packed256(record, k, strand, |hi, lo| {
-                        table.push(buffers, hi, lo);
-                        Ok(())
-                    })?;
-                }
-                table.submit(buffers, offset)
-            }
+            (Self::W80(t), WideUpdates::W80(b)) => count_wide!(t, b, visit_packed128, |hi| hi as u16),
+            (Self::W96(t), WideUpdates::W96(b)) => count_wide!(t, b, visit_packed128, |hi| hi as u32),
+            (Self::W128(t), WideUpdates::W128(b)) => count_wide!(t, b, visit_packed128, |hi| hi),
+            (Self::W192(t), WideUpdates::W192(b)) => count_wide!(t, b, visit_packed192, |hi| hi),
+            (Self::W256(t), WideUpdates::W256(b)) => count_wide!(t, b, visit_packed256, |hi| hi),
             _ => unreachable!("wide worker buffers match shared wide tables"),
         }
     }
@@ -790,19 +690,21 @@ impl WideShared {
     }
 }
 
-struct Partitioned<K, S> {
-    shards: Vec<Shard<HashMap<K, u64, S>>>,
+type ByteMap = HashMap<Vec<u8>, u64, foldhash::fast::RandomState>;
+
+struct ByteShared {
+    shards: Vec<Shard<ByteMap>>,
     hash: foldhash::fast::RandomState,
 }
 
-impl<K: Eq + Hash, S: BuildHasher + Default> Partitioned<K, S> {
+impl ByteShared {
     fn new(partitions: usize, capacity: usize) -> Result<Self, Error> {
         let mut shards = Vec::new();
         shards
             .try_reserve_exact(partitions)
             .map_err(|_| Error::ReserveFailed)?;
         for index in 0..partitions {
-            let mut map = HashMap::with_hasher(S::default());
+            let mut map = ByteMap::default();
             map.try_reserve(capacity / partitions + usize::from(index < capacity % partitions))
                 .map_err(|_| Error::ReserveFailed)?;
             shards.push(Shard(Mutex::new(map)));
@@ -813,43 +715,69 @@ impl<K: Eq + Hash, S: BuildHasher + Default> Partitioned<K, S> {
         })
     }
 
-    fn apply(&self, buffers: &mut Updates<K>, offset: usize) -> Result<(), Error> {
-        apply_partitions(
-            &self.shards,
-            &mut buffers.partitions,
-            &mut buffers.pending,
-            offset,
-            |map: &mut HashMap<K, u64, S>, updates: &mut Vec<(K, u64)>| {
-                updates
-                    .drain(..)
-                    .try_for_each(|(key, delta)| add_delta(map, key, delta))
-            },
-        )?;
+    /// Apply each nonempty worker-local partition buffer to its shard.
+    ///
+    /// Different workers start at different partitions, and a partition held by
+    /// another worker is skipped and revisited instead of waited on. Only when
+    /// every remaining partition is busy does a worker block on one.
+    fn apply(&self, buffers: &mut ByteUpdates, offset: usize) -> Result<(), Error> {
+        let drain = |map: &mut ByteMap, updates: &mut Vec<(Vec<u8>, u64)>| {
+            updates
+                .drain(..)
+                .try_for_each(|(key, delta)| add_delta(map, key, delta))
+        };
+        buffers.pending.clear();
+        let mask = self.shards.len() - 1;
+        buffers.pending.extend(
+            (0..self.shards.len())
+                .map(|step| (step + offset) & mask)
+                .filter(|&index| !buffers.partitions[index].is_empty()),
+        );
+        while !buffers.pending.is_empty() {
+            let before = buffers.pending.len();
+            let mut result = Ok(());
+            buffers.pending.retain(|&index| {
+                if result.is_err() {
+                    return true;
+                }
+                match self.shards[index].0.try_lock() {
+                    Ok(mut table) => {
+                        result = drain(&mut table, &mut buffers.partitions[index]);
+                        false
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => true,
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        result = Err(Error::WorkerFailed);
+                        true
+                    }
+                }
+            });
+            result?;
+            if buffers.pending.len() == before {
+                let index = buffers.pending.swap_remove(0);
+                let mut table = self.shards[index]
+                    .0
+                    .lock()
+                    .map_err(|_| Error::WorkerFailed)?;
+                drain(&mut table, &mut buffers.partitions[index])?;
+            }
+        }
         buffers.buffered_bytes = 0;
         Ok(())
     }
 
-    fn into_counts(
-        self,
-        wrap: impl Fn(HashMap<K, u64, S>) -> Counts,
-    ) -> Result<(Vec<Counts>, foldhash::fast::RandomState), Error> {
-        let counts = self
+    fn into_counts(self) -> Result<ByteCounts, Error> {
+        let maps = self
             .shards
             .into_iter()
-            .map(|shard| {
-                shard
-                    .0
-                    .into_inner()
-                    .map(&wrap)
-                    .map_err(|_| Error::WorkerFailed)
-            })
+            .map(|shard| shard.0.into_inner().map_err(|_| Error::WorkerFailed))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok((counts, self.hash))
+        Ok(ByteCounts::from_maps(maps, self.hash))
     }
 }
 
-struct Updates<K> {
-    partitions: Vec<Vec<(K, u64)>>,
+struct ByteUpdates {
+    partitions: Vec<Vec<(Vec<u8>, u64)>>,
     // Reused list of nonempty partitions still waiting for their lock.
     pending: Vec<usize>,
     buffered_bytes: usize,
@@ -857,7 +785,7 @@ struct Updates<K> {
     peak_buffered_bytes: usize,
 }
 
-impl<K: Eq + Hash> Updates<K> {
+impl ByteUpdates {
     fn new(partitions: usize) -> Self {
         Self {
             partitions: (0..partitions).map(|_| Vec::new()).collect(),
@@ -867,10 +795,8 @@ impl<K: Eq + Hash> Updates<K> {
             peak_buffered_bytes: 0,
         }
     }
-}
 
-impl Updates<Vec<u8>> {
-    fn push_bytes(&mut self, hash: &foldhash::fast::RandomState, key: &[u8]) -> Result<(), Error> {
+    fn push(&mut self, hash: &foldhash::fast::RandomState, key: &[u8]) -> Result<(), Error> {
         let index = hash.hash_one(key) as usize & (self.partitions.len() - 1);
         let buffer = &mut self.partitions[index];
         if let Some((previous, delta)) = buffer.last_mut()
@@ -895,7 +821,7 @@ impl Updates<Vec<u8>> {
 enum SharedCounts {
     Packed(PackedShared),
     Wide(WideShared),
-    Bytes(Partitioned<Vec<u8>, foldhash::fast::RandomState>),
+    Bytes(ByteShared),
     /// Nothing is counted: input is split into bins on disk; see `crate::disk`.
     Bins(Bins),
 }
@@ -903,7 +829,7 @@ enum SharedCounts {
 enum Buffers {
     Packed(PackedUpdates),
     Wide(WideUpdates),
-    Bytes(Updates<Vec<u8>>),
+    Bytes(ByteUpdates),
     Bins(BinBuffers),
 }
 
@@ -914,7 +840,7 @@ impl SharedCounts {
         } else if k <= 128 {
             Self::Wide(WideShared::new(k, capacity)?)
         } else {
-            Self::Bytes(Partitioned::new(partitions, capacity)?)
+            Self::Bytes(ByteShared::new(partitions, capacity)?)
         })
     }
 
@@ -922,7 +848,7 @@ impl SharedCounts {
         match self {
             Self::Packed(table) => Buffers::Packed(table.updates()),
             Self::Wide(table) => Buffers::Wide(table.updates()),
-            Self::Bytes(table) => Buffers::Bytes(Updates::new(table.shards.len())),
+            Self::Bytes(table) => Buffers::Bytes(ByteUpdates::new(table.shards.len())),
             Self::Bins(bins) => Buffers::Bins(bins.buffers()),
         }
     }
@@ -952,7 +878,7 @@ impl SharedCounts {
                         Ok(())
                     })?;
                 }
-                table.submit(buffers, offset)
+                table.submit(&mut buffers.group, offset)
             }
             (Self::Wide(table), Buffers::Wide(buffers)) => {
                 table.count(batch, buffers, k, strand, offset)
@@ -963,7 +889,7 @@ impl SharedCounts {
                         continue;
                     }
                     visit_bytes(record, k, strand, |key| {
-                        buffers.push_bytes(&table.hash, key)?;
+                        buffers.push(&table.hash, key)?;
                         // Large exact keys must not accumulate for an entire
                         // sequence batch. Limit owned key payload per worker,
                         // allowing at most one key to cross the byte budget.
@@ -983,29 +909,13 @@ impl SharedCounts {
     }
 
     fn finish(self, k: usize, strand: StrandMode, threads: usize) -> Result<Counter, Error> {
-        let (partitions, hash) = match self {
-            Self::Packed(table) => {
-                return Ok(Counter::from_packed(
-                    k,
-                    strand,
-                    table.into_counts(threads)?,
-                    threads,
-                ));
-            }
-            Self::Wide(table) => {
-                return Ok(Counter::from_wide(
-                    k,
-                    strand,
-                    table.into_counts(threads)?,
-                    threads,
-                ));
-            }
-            Self::Bytes(table) => table.into_counts(Counts::Bytes)?,
+        let counts = match self {
+            Self::Packed(table) => Counts::Packed(table.into_counts(threads)?),
+            Self::Wide(table) => Counts::Wide(table.into_counts(threads)?),
+            Self::Bytes(table) => Counts::Bytes(table.into_counts()?),
             Self::Bins(_) => unreachable!("bins are finished by `DiskCounter`"),
         };
-        Ok(Counter::from_partitions(
-            k, strand, partitions, hash, threads,
-        ))
+        Ok(Counter::from_counts(k, strand, counts, threads))
     }
 }
 
@@ -1263,7 +1173,7 @@ struct Batcher {
 
 impl Batcher {
     /// Submit a complete record. Worker errors may be reported by `finish`.
-    pub fn add_record(&mut self, sequence: &[u8]) -> Result<(), Error> {
+    fn add_record(&mut self, sequence: &[u8]) -> Result<(), Error> {
         self.start_record();
         if sequence.len() < self.k {
             return Ok(());
@@ -1276,7 +1186,7 @@ impl Batcher {
     /// Begin a new streaming record. Subsequent `add_sequence` fragments belong
     /// to this record until the next `start_record` or independent `add_record`.
     /// This resets context without flushing short records into separate batches.
-    pub fn start_record(&mut self) {
+    fn start_record(&mut self) {
         self.record_start = None;
         self.continuation.clear();
     }
@@ -1285,7 +1195,7 @@ impl Batcher {
     /// across fragments. Data is copied directly into reusable worker batches;
     /// only k−1 context bases are copied again at batch boundaries.
     /// A fresh counter implicitly starts its first streaming record.
-    pub fn add_sequence(&mut self, mut sequence: &[u8]) -> Result<(), Error> {
+    fn add_sequence(&mut self, mut sequence: &[u8]) -> Result<(), Error> {
         while !sequence.is_empty() {
             let limit = self.batch_bases.saturating_add(self.k - 1);
             if self.record_start.is_none() {
@@ -1429,7 +1339,7 @@ mod tests {
         for index in [BATCH_BASES - 1, BATCH_BASES + 29, 2 * BATCH_BASES] {
             long[index] = b'N';
         }
-        for k in [1, 31, 32, 33, 64, 65] {
+        for k in [1, 31, 32, 33, 64, 65, 97, 128, 129] {
             for strand in [StrandMode::Forward, StrandMode::Canonical] {
                 let mut expected = Counter::new(k, strand).unwrap();
                 for record in [&long[..], b"AC", b"GT", &long, b"ACGTTGCA"] {
@@ -1482,7 +1392,7 @@ mod tests {
                 assert!(match &result.counts {
                     Counts::Packed(counts) => counts.tables().len() > 1,
                     Counts::Wide(counts) => counts.table_count() > 1,
-                    _ => !result.partitions.is_empty(),
+                    Counts::Bytes(counts) => counts.maps.len() > 1,
                 });
                 result.add_record(&record).unwrap();
                 let mut other = ParallelCounter::new(k, strand, 2).unwrap();
@@ -1515,11 +1425,7 @@ mod tests {
                 let mut partitioned = ParallelCounter::new(k, strand, 2).unwrap();
                 partitioned.add_record(&vec![b'A'; k]).unwrap();
                 let mut partitioned = partitioned.finish().unwrap();
-                for counts in
-                    std::iter::once(&mut partitioned.counts).chain(&mut partitioned.partitions)
-                {
-                    counts.set_counts(u64::MAX);
-                }
+                partitioned.counts.set_counts(u64::MAX);
                 let before = table(&partitioned);
                 assert_eq!(
                     partitioned.add_record(&vec![b'A'; k]),
@@ -1621,7 +1527,7 @@ mod tests {
             &long,
             &random,
         ];
-        for k in [1, 3, 31, 32, 33, 63, 64, 65] {
+        for k in [1, 3, 31, 32, 33, 63, 64, 65, 97, 128, 129] {
             for strand in [StrandMode::Forward, StrandMode::Canonical] {
                 let mut serial = Counter::new(k, strand).unwrap();
                 for record in records {
@@ -1677,7 +1583,7 @@ mod tests {
 
     #[test]
     fn checked_merge_matches_serial_and_rejects_incompatible_counters() {
-        for k in [1, 32, 33, 64, 65] {
+        for k in [1, 32, 33, 64, 65, 97, 128, 129] {
             for strand in [StrandMode::Forward, StrandMode::Canonical] {
                 let sequence = b"ACGTTGCAAGTC".repeat(20);
                 let mut left = Counter::new(k, strand).unwrap();

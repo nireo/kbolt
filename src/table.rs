@@ -858,6 +858,43 @@ impl CompactTable {
         sort_nearly_sorted(slots);
     }
 
+    /// Return the count of `remainder`, or `0` if not present.
+    #[inline(always)]
+    pub(crate) fn get(&self, remainder: u64) -> u64 {
+        if self.len == 0 {
+            return 0;
+        }
+        let (found, index) = self.find(remainder);
+        if !found {
+            return 0;
+        }
+        // SAFETY: `find` returns an in-bounds slot index when `self.len > 0`.
+        let slot = unsafe {
+            *self
+                .buckets
+                .get_unchecked(index / SLOTS)
+                .0
+                .get_unchecked(index % SLOTS)
+        };
+        self.entry(slot).1
+    }
+
+    /// Visit the count of every occupied slot without unmixing keys.
+    pub(crate) fn for_each_count(&self, mut visit: impl FnMut(u64)) {
+        let marker = self.layout.count_marker();
+        for bucket in self.buckets.iter() {
+            for &slot in bucket.0.iter().take_while(|&&slot| slot != 0) {
+                let small = slot & marker;
+                let count = if small == marker {
+                    self.overflow[&(slot >> self.layout.count_bits)]
+                } else {
+                    small
+                };
+                visit(count);
+            }
+        }
+    }
+
     /// Iterate over `(remainder, count)` pairs in bucket order.
     pub(crate) fn iter(&self) -> Entries<'_> {
         Entries {
@@ -1059,6 +1096,13 @@ impl PackedCounts {
             .unmix(((partition as u64) << self.layout.remainder_bits) | remainder)
     }
 
+    /// Return the count of `key`, or `0` if not present.
+    #[inline(always)]
+    pub(crate) fn get(&self, key: u64) -> u64 {
+        let (partition, remainder) = self.route(key);
+        self.tables[partition].get(remainder)
+    }
+
     /// Add `delta` to `key`, leaving its count unchanged on overflow.
     pub(crate) fn add_key(&mut self, key: u64, delta: u64) -> Result<(), Error> {
         let (partition, remainder) = self.route(key);
@@ -1107,6 +1151,20 @@ impl PackedCounts {
     /// Iterate over every `(key, count)` pair.
     pub(crate) fn entries(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         (0..self.tables.len()).flat_map(|partition| self.partition_entries(partition))
+    }
+
+    /// Iterate over `(key, count)` pairs whose count satisfies `predicate`,
+    /// checking counts before unmixing keys.
+    pub(crate) fn filtered_entries(
+        &self,
+        predicate: impl Fn(u64) -> bool + Copy + 'static,
+    ) -> impl Iterator<Item = (u64, u64)> + '_ {
+        (0..self.tables.len()).flat_map(move |partition| {
+            self.tables[partition]
+                .iter()
+                .filter(move |&(_, count)| predicate(count))
+                .map(move |(remainder, count)| (self.key(partition, remainder), count))
+        })
     }
 
     /// Remove every key, keeping the tables' allocations for reuse.

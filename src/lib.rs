@@ -9,6 +9,7 @@ mod disk;
 mod gzip;
 pub mod input;
 mod parallel;
+mod query;
 mod sorted;
 mod table;
 mod table_wide;
@@ -16,6 +17,7 @@ mod table_wide;
 pub use disk::{DiskCounter, DiskCounts};
 pub use input::InputStats;
 pub use parallel::{ParallelCounter, ParallelInput, ParallelStats};
+pub use query::CountFilter;
 use table::PackedCounts;
 use table_wide::{HighKey, PackedCountsWide};
 
@@ -265,6 +267,15 @@ impl ByteCounts {
     ) -> Self {
         debug_assert!(maps.len().is_power_of_two());
         Self { maps, hash }
+    }
+
+    pub(crate) fn map(&self, key: &[u8]) -> &HashMap<Vec<u8>, u64, foldhash::fast::RandomState> {
+        let index = if self.maps.len() == 1 {
+            0
+        } else {
+            self.hash.hash_one(key) as usize & (self.maps.len() - 1)
+        };
+        &self.maps[index]
     }
 
     fn map_mut(&mut self, key: &[u8]) -> &mut HashMap<Vec<u8>, u64, foldhash::fast::RandomState> {

@@ -591,6 +591,76 @@ impl Counter {
         })
     }
 
+    /// Write a version-2 database containing only k-mers whose counts match
+    /// `filter`. Behavior is otherwise identical to [`Counter::write_binary`].
+    pub fn write_binary_filtered(
+        &self,
+        filter: crate::CountFilter,
+        mut writer: impl Write,
+    ) -> io::Result<()> {
+        if filter.is_all() {
+            return self.write_binary(writer);
+        }
+        let (order, unit) = match &self.counts {
+            Counts::Packed(counts) => (KeyOrder::Hash, self.serial_partition(counts)),
+            _ => (KeyOrder::Unordered, 1),
+        };
+        let ascending = order == KeyOrder::Hash;
+        let entries = self.len_filtered(filter) as u64;
+        writer.write_all(&header(self.k, self.strand, order, ascending, entries))?;
+        if entries == 0 {
+            return Ok(());
+        }
+        let key_bytes = self.k.div_ceil(4);
+        self.write_tables(&mut writer, unit, |table, writer| match table {
+            OutputTable::Packed(counts, first, tables) => {
+                let mut sections = SectionWriter::new(writer);
+                let mut slots = Vec::new();
+                for partition in first..first + tables {
+                    for (mixed, count) in counts.sorted_partition(partition, &mut slots) {
+                        if filter.matches(count) {
+                            sections.ascending(mixed, count)?;
+                        }
+                    }
+                }
+                sections.finish()
+            }
+            OutputTable::Wide(counts, first, tables) => {
+                fn encode_wide<H: HighKey>(
+                    counts: &PackedCountsWide<H>,
+                    first: usize,
+                    tables: usize,
+                    key_bytes: usize,
+                    filter: crate::CountFilter,
+                    writer: &mut dyn Write,
+                ) -> io::Result<()> {
+                    let mut sections = SectionWriter::new(writer);
+                    for partition in first..first + tables {
+                        for (l_rem, h, count) in counts.tables()[partition].iter() {
+                            if filter.matches(count) {
+                                let (hi, lo) = counts.key(partition, l_rem, h);
+                                sections.raw_wide(hi, lo, key_bytes, count)?;
+                            }
+                        }
+                    }
+                    sections.finish()
+                }
+                dispatch_wide!(counts, c => encode_wide(c, first, tables, key_bytes, filter, writer))
+            }
+            OutputTable::Bytes(counts) => {
+                let mut sections = SectionWriter::new(writer);
+                let mut packed = buffer(key_bytes)?;
+                for (key, &count) in counts {
+                    if filter.matches(count) {
+                        pack_bases(key, &mut packed);
+                        sections.raw(&packed, count)?;
+                    }
+                }
+                sections.finish()
+            }
+        })
+    }
+
     /// Load a database into RAM, validating records and rejecting duplicate keys.
     /// The declared entry count is never used for an upfront table allocation.
     pub fn read_binary(reader: impl Read) -> io::Result<Self> {

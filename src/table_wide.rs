@@ -731,6 +731,45 @@ impl<H: HighKey> CompactTableWide<H> {
         (l_rem, h, count)
     }
 
+    /// Return the count of `(l_rem, h)`, or `0` if not present.
+    #[inline(always)]
+    pub(crate) fn get(&self, l_rem: u64, h: H) -> u64 {
+        if self.len == 0 {
+            return 0;
+        }
+        let l_key = l_rem << self.layout.count_bits();
+        let (found, index) = self.find(l_key, h);
+        if !found {
+            return 0;
+        }
+        // SAFETY: `find` returns an in-bounds slot index when `self.len > 0`.
+        let bucket = unsafe { self.buckets.get_unchecked(index / SLOTS) };
+        let at = index % SLOTS;
+        self.entry(bucket.l[at], bucket.h[at]).2
+    }
+
+    /// Visit the count of every occupied slot without reading `h` except on
+    /// overflow and without unmixing `l`.
+    pub(crate) fn for_each_count(&self, mut visit: impl FnMut(u64)) {
+        let marker = self.layout.count_marker();
+        let count_bits = self.layout.count_bits();
+        for bucket in self.buckets.iter() {
+            for slot in 0..SLOTS {
+                let l = bucket.l[slot];
+                if l == 0 {
+                    break;
+                }
+                let small = l & marker;
+                let count = if small == marker {
+                    self.overflow[&(l >> count_bits, bucket.h[slot])]
+                } else {
+                    small
+                };
+                visit(count);
+            }
+        }
+    }
+
     pub(crate) fn iter(&self) -> EntriesWide<'_, H> {
         EntriesWide {
             buckets: self.buckets.iter(),
@@ -874,6 +913,12 @@ impl<H: HighKey> PackedCountsWide<H> {
         (h, unmix_lo(h, l))
     }
 
+    #[inline(always)]
+    pub(crate) fn get(&self, hi: H, lo: u64) -> u64 {
+        let (partition, l_rem) = self.route(hi, lo);
+        self.tables[partition].get(l_rem, hi)
+    }
+
     pub(crate) fn add_key(&mut self, hi: H, lo: u64, delta: u64) -> Result<(), Error> {
         let (partition, l_rem) = self.route(hi, lo);
         self.tables[partition].add(l_rem, hi, delta, Overflow::Reject)
@@ -895,6 +940,18 @@ impl<H: HighKey> PackedCountsWide<H> {
 
     pub(crate) fn entries(&self) -> impl Iterator<Item = ((H, u64), u64)> + '_ {
         (0..self.tables.len()).flat_map(|partition| self.partition_entries(partition))
+    }
+
+    pub(crate) fn filtered_entries(
+        &self,
+        predicate: impl Fn(u64) -> bool + Copy + 'static,
+    ) -> impl Iterator<Item = ((H, u64), u64)> + '_ {
+        (0..self.tables.len()).flat_map(move |partition| {
+            self.tables[partition]
+                .iter()
+                .filter(move |&(_, _, count)| predicate(count))
+                .map(move |(l_rem, h, count)| (self.key(partition, l_rem, h), count))
+        })
     }
 
     pub(crate) fn adder(&mut self) -> OrderedAdderWide<'_, H> {

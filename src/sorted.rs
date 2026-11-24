@@ -27,9 +27,9 @@ use std::sync::{Condvar, Mutex};
 use crate::database::{self, KeyOrder, SectionWriter};
 use crate::disk::Spill;
 use crate::table::{self, CompactTable, PackedCounts};
+use crate::table_wide::{self, CompactTableWide, HighKey, PackedCountsWide};
 use crate::{
-    Counter, Counts, decode_packed128_into, format_count, write_ordered, write_packed_tsv,
-    write_packed64_tsv,
+    Counter, Counts, WideCounts, format_count, write_ordered, write_packed_tsv, write_packed64_tsv,
 };
 
 /// Bytes of a record in a bucket.
@@ -548,6 +548,130 @@ impl Drop for Admitted<'_> {
     }
 }
 
+/// Parallel bucketed sort for wide packed keys (33 <= k <= 128).
+///
+/// Tables are freed as their entries are scattered into leading-bit buckets,
+/// then each bucket is sorted and encoded in parallel.
+fn write_sorted_wide<H: HighKey>(
+    counts: PackedCountsWide<H>,
+    k: usize,
+    threads: usize,
+    writer: &mut dyn Write,
+    binary: bool,
+) -> io::Result<()> {
+    let total = counts.len() as u64;
+    if total == 0 {
+        return Ok(());
+    }
+    let bucket_bits = total
+        .div_ceil(BUCKET_RECORDS)
+        .max(1)
+        .next_power_of_two()
+        .trailing_zeros()
+        .clamp(8, MAX_BUCKET_BITS);
+    let num_buckets = 1_usize << bucket_bits;
+
+    let buckets: Vec<Mutex<Vec<(H, u64, u64)>>> =
+        (0..num_buckets).map(|_| Mutex::default()).collect();
+    let layout = counts.layout();
+    let tables: Vec<Mutex<Option<CompactTableWide<H>>>> = counts
+        .into_tables()
+        .into_iter()
+        .map(|table| Mutex::new(Some(table)))
+        .collect();
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| -> io::Result<()> {
+        let workers: Vec<_> = (0..threads.clamp(1, tables.len()))
+            .map(|_| {
+                scope.spawn(|| -> io::Result<()> {
+                    let mut b_ids: Vec<u32> = Vec::new();
+                    let mut items: Vec<(H, u64, u64)> = Vec::new();
+                    let mut grouped: Vec<(H, u64, u64)> = Vec::new();
+                    let mut starts: Vec<usize> = Vec::new();
+                    let flush = |b_ids: &mut Vec<u32>,
+                                 items: &mut Vec<(H, u64, u64)>,
+                                 grouped: &mut Vec<(H, u64, u64)>,
+                                 starts: &mut Vec<usize>|
+                     -> io::Result<()> {
+                        if items.is_empty() {
+                            return Ok(());
+                        }
+                        starts.clear();
+                        starts.resize(num_buckets + 1, 0);
+                        for &b in b_ids.iter() {
+                            starts[b as usize + 1] += 1;
+                        }
+                        let mut start = 0;
+                        for next in starts.iter_mut() {
+                            start += std::mem::replace(next, start);
+                        }
+                        grouped.clear();
+                        grouped.resize(items.len(), (H::default(), 0, 0));
+                        for (&b, &item) in b_ids.iter().zip(items.iter()) {
+                            let next = &mut starts[b as usize + 1];
+                            grouped[*next] = item;
+                            *next += 1;
+                        }
+                        b_ids.clear();
+                        items.clear();
+                        for (bucket, bounds) in buckets.iter().zip(starts.windows(2)) {
+                            let run = &grouped[bounds[0]..bounds[1]];
+                            if !run.is_empty() {
+                                bucket.lock().map_err(poisoned)?.extend_from_slice(run);
+                            }
+                        }
+                        Ok(())
+                    };
+                    loop {
+                        let partition = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(table) = tables.get(partition) else {
+                            return flush(&mut b_ids, &mut items, &mut grouped, &mut starts);
+                        };
+                        let Some(table) = table.lock().map_err(poisoned)?.take() else {
+                            continue;
+                        };
+                        let base = (partition as u64) << layout.l_rem_bits;
+                        for (l_rem, hi, count) in table.iter() {
+                            let lo = table_wide::unmix_lo(hi, base | l_rem);
+                            let bucket = hi.top_bits(lo, k, bucket_bits) as u32;
+                            b_ids.push(bucket);
+                            items.push((hi, lo, count));
+                            if items.len() >= BATCH {
+                                flush(&mut b_ids, &mut items, &mut grouped, &mut starts)?;
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .try_for_each(|worker| worker.join().map_err(poisoned)?)
+    })?;
+
+    let key_bytes = k.div_ceil(4);
+    write_ordered(threads, num_buckets, writer, |bucket_index, writer| {
+        let mut bucket = std::mem::take(&mut *buckets[bucket_index].lock().map_err(poisoned)?);
+        if bucket.is_empty() {
+            return Ok(());
+        }
+        bucket.sort_unstable_by(|a, b| a.0.cmp_key(a.1, b.0, b.1));
+        if !binary {
+            return write_packed_tsv::<128, _>(
+                bucket.into_iter().map(|(hi, lo, count)| ((hi, lo), count)),
+                k,
+                writer,
+                |(hi, lo), dna| hi.decode_into(lo, dna),
+            );
+        }
+        let mut sections = SectionWriter::new(writer);
+        for (hi, lo, count) in bucket {
+            sections.raw_wide(hi, lo, key_bytes, count)?;
+        }
+        sections.finish()
+    })
+}
+
 /// Write the entries of packed keys, sorted, as rows of text.
 pub(crate) fn tsv_rows(k: usize) -> impl Fn(Sorted<'_>, &mut dyn Write) -> io::Result<()> + Sync {
     move |entries, writer| write_packed64_tsv(entries, k, writer)
@@ -611,30 +735,19 @@ impl Counter {
                 sorter.write(threads, writer, tsv_rows(k))
             };
         }
-        // Wider keys are sorted in one piece, taken out of their maps.
-        if k <= 64 {
-            let mut entries: Vec<((u64, u64), u64)> = Vec::new();
-            for table in tables {
-                let Counts::Packed128(counts) = table else {
-                    unreachable!("every table holds keys of the same width")
-                };
-                entries.extend(counts);
-            }
-            entries.sort_unstable();
-            if !binary {
-                return write_packed_tsv::<64, _>(
-                    entries.into_iter(),
-                    k,
-                    writer,
-                    decode_packed128_into,
-                );
-            }
-            let mut sections = SectionWriter::new(writer);
-            for ((high, low), count) in entries {
-                let key = (u128::from(high) << 64) | u128::from(low);
-                sections.raw(&key.to_le_bytes()[..key_bytes], count)?;
-            }
-            return sections.finish();
+        // Wide packed keys (33 <= k <= 128): bucket by leading bits while freeing
+        // each table, then sort and encode each bucket in parallel.
+        if k <= 128 {
+            let Some(Counts::Wide(counts)) = tables.into_iter().next() else {
+                unreachable!("keys of 33..=128 bases are wide packed")
+            };
+            return match counts {
+                WideCounts::W80(c) => write_sorted_wide(c, k, threads, writer, binary),
+                WideCounts::W96(c) => write_sorted_wide(c, k, threads, writer, binary),
+                WideCounts::W128(c) => write_sorted_wide(c, k, threads, writer, binary),
+                WideCounts::W192(c) => write_sorted_wide(c, k, threads, writer, binary),
+                WideCounts::W256(c) => write_sorted_wide(c, k, threads, writer, binary),
+            };
         }
         let mut entries: Vec<(Vec<u8>, u64)> = Vec::new();
         for table in tables {

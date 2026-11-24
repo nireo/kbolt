@@ -257,9 +257,9 @@ const STEADY_BUCKETS: usize = 1024;
 /// `i * MASK_BITS..(i + 1) * MASK_BITS`, all of them set or all clear. NEON
 /// narrows each comparison to a byte; x86 extracts one bit per slot.
 #[cfg(target_arch = "x86_64")]
-const MASK_BITS: u32 = 1;
+pub(crate) const MASK_BITS: u32 = 1;
 #[cfg(not(target_arch = "x86_64"))]
-const MASK_BITS: u32 = 8;
+pub(crate) const MASK_BITS: u32 = 8;
 
 /// Per-slot masks (see `MASK_BITS`) of slots equal to `key` after clearing
 /// their count bits, and of empty slots.
@@ -271,11 +271,91 @@ const MASK_BITS: u32 = 8;
 /// so that the comparison stays inlined in every update loop.
 #[inline(always)]
 fn bucket_masks(bucket: &Bucket, key: u64, key_mask: u64) -> (u64, u64) {
+    bucket_masks_8(&bucket.0, key, key_mask)
+}
+
+/// Same as `bucket_masks_8`, but safe when `slots_arr` is only 8-byte aligned
+/// (used by compact wide buckets whose size is not a multiple of 64 bytes).
+#[inline(always)]
+pub(crate) fn bucket_masks_8_unaligned(
+    slots_arr: &[u64; 8],
+    key: u64,
+    key_mask: u64,
+) -> (u64, u64) {
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: NEON is mandatory on aarch64, and the bucket holds 8 u64s.
+    {
+        bucket_masks_8(slots_arr, key, key_mask)
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    // SAFETY: AVX-512F is enabled; unaligned load needs no 64-byte alignment.
+    unsafe {
+        use core::arch::x86_64::*;
+        let slots = _mm512_loadu_si512(slots_arr.as_ptr().cast());
+        let matches = _mm512_cmpeq_epi64_mask(
+            _mm512_and_si512(slots, _mm512_set1_epi64(key_mask as i64)),
+            _mm512_set1_epi64(key as i64),
+        );
+        let empty = _mm512_testn_epi64_mask(slots, slots);
+        (u64::from(matches), u64::from(empty))
+    }
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        not(target_feature = "avx512f")
+    ))]
+    // SAFETY: AVX2 is enabled; unaligned loads need no 32-byte alignment.
+    unsafe {
+        use core::arch::x86_64::*;
+        let pointer = slots_arr.as_ptr().cast::<__m256i>();
+        let (low, high) = (
+            _mm256_loadu_si256(pointer),
+            _mm256_loadu_si256(pointer.add(1)),
+        );
+        let key = _mm256_set1_epi64x(key as i64);
+        let key_mask = _mm256_set1_epi64x(key_mask as i64);
+        let zero = _mm256_setzero_si256();
+        let bits = |equal| _mm256_movemask_pd(_mm256_castsi256_pd(equal)) as u32 as u64;
+        let matches = |slots| bits(_mm256_cmpeq_epi64(_mm256_and_si256(slots, key_mask), key));
+        let empty = |slots| bits(_mm256_cmpeq_epi64(slots, zero));
+        (
+            matches(low) | (matches(high) << 4),
+            empty(low) | (empty(high) << 4),
+        )
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+    // SAFETY: SSE2 is baseline on x86-64; unaligned loads need no 16-byte alignment.
+    unsafe {
+        use core::arch::x86_64::*;
+        let pointer = slots_arr.as_ptr().cast::<__m128i>();
+        let key = _mm_set1_epi64x(key as i64);
+        let key_mask = _mm_set1_epi64x(key_mask as i64);
+        let zero = _mm_setzero_si128();
+        let equal = |a, b| {
+            let halves = _mm_cmpeq_epi32(a, b);
+            let both = _mm_and_si128(halves, _mm_shuffle_epi32::<0b1011_0001>(halves));
+            _mm_movemask_pd(_mm_castsi128_pd(both)) as u32 as u64
+        };
+        let (mut matches, mut empty) = (0, 0);
+        for quarter in 0..4 {
+            let slots = _mm_loadu_si128(pointer.add(quarter));
+            matches |= equal(_mm_and_si128(slots, key_mask), key) << (2 * quarter);
+            empty |= equal(slots, zero) << (2 * quarter);
+        }
+        (matches, empty)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        bucket_masks_8(slots_arr, key, key_mask)
+    }
+}
+
+#[inline(always)]
+pub(crate) fn bucket_masks_8(slots_arr: &[u64; 8], key: u64, key_mask: u64) -> (u64, u64) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is mandatory on aarch64, and the slice holds 8 u64s.
     unsafe {
         use core::arch::aarch64::*;
-        let slots = vld1q_u64_x4(bucket.0.as_ptr());
+        let slots = vld1q_u64_x4(slots_arr.as_ptr());
         let key = vdupq_n_u64(key);
         let key_mask = vdupq_n_u64(key_mask);
         let matches = |slots| vceqq_u64(vandq_u64(slots, key_mask), key);
@@ -301,11 +381,10 @@ fn bucket_masks(bucket: &Bucket, key: u64, key_mask: u64) -> (u64, u64) {
         )
     }
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-    // SAFETY: AVX-512F is enabled for this build, and the bucket is 64 bytes
-    // aligned to 64.
+    // SAFETY: AVX-512F is enabled for this build, and callers align to 64 bytes.
     unsafe {
         use core::arch::x86_64::*;
-        let slots = _mm512_load_si512(bucket.0.as_ptr().cast());
+        let slots = _mm512_load_si512(slots_arr.as_ptr().cast());
         let matches = _mm512_cmpeq_epi64_mask(
             _mm512_and_si512(slots, _mm512_set1_epi64(key_mask as i64)),
             _mm512_set1_epi64(key as i64),
@@ -318,11 +397,10 @@ fn bucket_masks(bucket: &Bucket, key: u64, key_mask: u64) -> (u64, u64) {
         target_feature = "avx2",
         not(target_feature = "avx512f")
     ))]
-    // SAFETY: AVX2 is enabled for this build, and the bucket holds two
-    // aligned 256-bit halves.
+    // SAFETY: AVX2 is enabled for this build, and callers align to 64 bytes.
     unsafe {
         use core::arch::x86_64::*;
-        let pointer = bucket.0.as_ptr().cast::<__m256i>();
+        let pointer = slots_arr.as_ptr().cast::<__m256i>();
         let (low, high) = (
             _mm256_load_si256(pointer),
             _mm256_load_si256(pointer.add(1)),
@@ -340,11 +418,10 @@ fn bucket_masks(bucket: &Bucket, key: u64, key_mask: u64) -> (u64, u64) {
         )
     }
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
-    // SAFETY: SSE2 is part of the x86-64 baseline, and the bucket holds four
-    // aligned 128-bit quarters.
+    // SAFETY: SSE2 is part of the x86-64 baseline, and callers align to 64 bytes.
     unsafe {
         use core::arch::x86_64::*;
-        let pointer = bucket.0.as_ptr().cast::<__m128i>();
+        let pointer = slots_arr.as_ptr().cast::<__m128i>();
         let key = _mm_set1_epi64x(key as i64);
         let key_mask = _mm_set1_epi64x(key_mask as i64);
         let zero = _mm_setzero_si128();
@@ -366,7 +443,7 @@ fn bucket_masks(bucket: &Bucket, key: u64, key_mask: u64) -> (u64, u64) {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         let (mut matches, mut empty) = (0, 0);
-        for (index, &slot) in bucket.0.iter().enumerate() {
+        for (index, &slot) in slots_arr.iter().enumerate() {
             matches |= u64::from(slot & key_mask == key) * (0xff << (8 * index));
             empty |= u64::from(slot == 0) * (0xff << (8 * index));
         }

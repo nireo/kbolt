@@ -8,13 +8,12 @@ mod disk;
 mod parallel;
 mod sorted;
 mod table;
+mod table_wide;
 
 pub use disk::{DiskCounter, DiskCounts};
 pub use parallel::{ParallelCounter, ParallelInput, ParallelStats};
 use table::PackedCounts;
-
-// Store the high and low words separately to avoid u128 alignment padding in map entries.
-type PackedCounts128 = HashMap<(u64, u64), u64, foldhash::fast::RandomState>;
+use table_wide::{HighKey, PackedCountsWide};
 
 /// Partition bits for packed (k <= 32) tables. Partitions bound growth pauses
 /// and leave count bits in each compact slot; see `table`.
@@ -75,23 +74,240 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+pub(crate) enum WideCounts {
+    /// k = 33..=40: 10 bytes/slot.
+    W80(PackedCountsWide<u16>),
+    /// k = 41..=48: 12 bytes/slot.
+    W96(PackedCountsWide<u32>),
+    /// k = 49..=64: 16 bytes/slot.
+    W128(PackedCountsWide<u64>),
+    /// k = 65..=96: 24 bytes/slot.
+    W192(PackedCountsWide<[u64; 2]>),
+    /// k = 97..=128: 32 bytes/slot.
+    W256(PackedCountsWide<[u64; 3]>),
+}
+
+impl WideCounts {
+    fn with_capacity(
+        k: usize,
+        partition_bits: u32,
+        capacity: usize,
+        load: table::Load,
+    ) -> Result<Self, Error> {
+        Ok(match k {
+            33..=40 => Self::W80(PackedCountsWide::with_capacity(
+                partition_bits,
+                capacity,
+                load,
+            )?),
+            41..=48 => Self::W96(PackedCountsWide::with_capacity(
+                partition_bits,
+                capacity,
+                load,
+            )?),
+            49..=64 => Self::W128(PackedCountsWide::with_capacity(
+                partition_bits,
+                capacity,
+                load,
+            )?),
+            65..=96 => Self::W192(PackedCountsWide::with_capacity(
+                partition_bits,
+                capacity,
+                load,
+            )?),
+            97..=128 => Self::W256(PackedCountsWide::with_capacity(
+                partition_bits,
+                capacity,
+                load,
+            )?),
+            _ => unreachable!("wide tables handle 33 <= k <= 128"),
+        })
+    }
+
+    pub(crate) fn table_count(&self) -> usize {
+        match self {
+            Self::W80(c) => c.tables().len(),
+            Self::W96(c) => c.tables().len(),
+            Self::W128(c) => c.tables().len(),
+            Self::W192(c) => c.tables().len(),
+            Self::W256(c) => c.tables().len(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::W80(c) => c.len(),
+            Self::W96(c) => c.len(),
+            Self::W128(c) => c.len(),
+            Self::W192(c) => c.len(),
+            Self::W256(c) => c.len(),
+        }
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        match self {
+            Self::W80(c) => c.capacity(),
+            Self::W96(c) => c.capacity(),
+            Self::W128(c) => c.capacity(),
+            Self::W192(c) => c.capacity(),
+            Self::W256(c) => c.capacity(),
+        }
+    }
+
+    fn add_records<'a>(
+        &mut self,
+        records: impl IntoIterator<Item = &'a [u8]>,
+        k: usize,
+        strand: StrandMode,
+    ) -> Result<(), Error> {
+        match self {
+            Self::W80(counts) => {
+                let mut adder = counts.adder();
+                for record in records {
+                    if record.len() >= k {
+                        visit_packed128(record, k, strand, |hi, lo| adder.push(hi as u16, lo))?;
+                    }
+                }
+                adder.finish()
+            }
+            Self::W96(counts) => {
+                let mut adder = counts.adder();
+                for record in records {
+                    if record.len() >= k {
+                        visit_packed128(record, k, strand, |hi, lo| adder.push(hi as u32, lo))?;
+                    }
+                }
+                adder.finish()
+            }
+            Self::W128(counts) => {
+                let mut adder = counts.adder();
+                for record in records {
+                    if record.len() >= k {
+                        visit_packed128(record, k, strand, |hi, lo| adder.push(hi, lo))?;
+                    }
+                }
+                adder.finish()
+            }
+            Self::W192(counts) => {
+                let mut adder = counts.adder();
+                for record in records {
+                    if record.len() >= k {
+                        visit_packed192(record, k, strand, |hi, lo| adder.push(hi, lo))?;
+                    }
+                }
+                adder.finish()
+            }
+            Self::W256(counts) => {
+                let mut adder = counts.adder();
+                for record in records {
+                    if record.len() >= k {
+                        visit_packed256(record, k, strand, |hi, lo| adder.push(hi, lo))?;
+                    }
+                }
+                adder.finish()
+            }
+        }
+    }
+
+    fn merge(&mut self, other: &Self) -> Result<(), Error> {
+        match (self, other) {
+            (Self::W80(t), Self::W80(s)) => s
+                .entries()
+                .try_for_each(|((hi, lo), delta)| t.add_key(hi, lo, delta)),
+            (Self::W96(t), Self::W96(s)) => s
+                .entries()
+                .try_for_each(|((hi, lo), delta)| t.add_key(hi, lo, delta)),
+            (Self::W128(t), Self::W128(s)) => s
+                .entries()
+                .try_for_each(|((hi, lo), delta)| t.add_key(hi, lo, delta)),
+            (Self::W192(t), Self::W192(s)) => s
+                .entries()
+                .try_for_each(|((hi, lo), delta)| t.add_key(hi, lo, delta)),
+            (Self::W256(t), Self::W256(s)) => s
+                .entries()
+                .try_for_each(|((hi, lo), delta)| t.add_key(hi, lo, delta)),
+            _ => unreachable!("matching k selects matching wide representation"),
+        }
+    }
+
+    fn write_tsv_range(
+        &self,
+        first: usize,
+        tables: usize,
+        k: usize,
+        writer: &mut dyn Write,
+    ) -> io::Result<()> {
+        fn encode<H: HighKey>(
+            counts: &PackedCountsWide<H>,
+            first: usize,
+            tables: usize,
+            k: usize,
+            writer: &mut dyn Write,
+        ) -> io::Result<()> {
+            let entries =
+                (first..first + tables).flat_map(|partition| counts.partition_entries(partition));
+            write_packed_tsv::<128, _>(entries, k, writer, |(hi, lo), dna| hi.decode_into(lo, dna))
+        }
+        match self {
+            Self::W80(c) => encode(c, first, tables, k, writer),
+            Self::W96(c) => encode(c, first, tables, k, writer),
+            Self::W128(c) => encode(c, first, tables, k, writer),
+            Self::W192(c) => encode(c, first, tables, k, writer),
+            Self::W256(c) => encode(c, first, tables, k, writer),
+        }
+    }
+
+    fn decoded_entries(&self, k: usize) -> Box<dyn Iterator<Item = (Vec<u8>, u64)> + '_> {
+        fn decode_iter<H: HighKey>(
+            counts: &PackedCountsWide<H>,
+            k: usize,
+        ) -> Box<dyn Iterator<Item = (Vec<u8>, u64)> + '_> {
+            Box::new(counts.entries().map(move |((hi, lo), count)| {
+                let mut dna = vec![0; k];
+                hi.decode_into(lo, &mut dna);
+                (dna, count)
+            }))
+        }
+        match self {
+            Self::W80(c) => decode_iter(c, k),
+            Self::W96(c) => decode_iter(c, k),
+            Self::W128(c) => decode_iter(c, k),
+            Self::W192(c) => decode_iter(c, k),
+            Self::W256(c) => decode_iter(c, k),
+        }
+    }
+
+    #[cfg(test)]
+    fn set_counts(&mut self, count: u64) {
+        match self {
+            Self::W80(c) => c.tables_mut().iter_mut().for_each(|t| t.set_counts(count)),
+            Self::W96(c) => c.tables_mut().iter_mut().for_each(|t| t.set_counts(count)),
+            Self::W128(c) => c.tables_mut().iter_mut().for_each(|t| t.set_counts(count)),
+            Self::W192(c) => c.tables_mut().iter_mut().for_each(|t| t.set_counts(count)),
+            Self::W256(c) => c.tables_mut().iter_mut().for_each(|t| t.set_counts(count)),
+        }
+    }
+}
+
 // Keep the representation private so wider packed keys can be added without
 // changing the public output format.
 enum Counts {
-    /// k <= 32: compact, self-partitioned tables (never in `Counter::partitions`).
+    /// k <= 32: compact, self-partitioned 64-bit tables (never in `Counter::partitions`).
     Packed(PackedCounts),
-    Packed128(PackedCounts128),
-    Bytes(HashMap<Vec<u8>, u64>),
+    /// 33 <= k <= 128: compact, self-partitioned wide tables (never in `Counter::partitions`).
+    Wide(WideCounts),
+    Bytes(HashMap<Vec<u8>, u64, foldhash::fast::RandomState>),
 }
 
 /// An exact, in-memory DNA k-mer counter.
 ///
 /// Output keys are uppercase ASCII DNA sequences; counts accumulate across records.
-/// Rolling 2-bit keys use 64 bits for k <= 32 and 128 bits for k <= 64.
-/// Larger k uses byte-string storage, with no maximum other than practical memory limits.
-/// For k <= 32, keys are stored in compact partitioned tables addressed by a fixed,
-/// invertible mixing function; wider keys use FoldHash. Neither is intended to resist
-/// adaptive collision attacks.
+/// Rolling 2-bit keys use compact partitioned tables for k <= 128 (8 bytes per
+/// slot for k <= 32, and 10, 12, 16, 24, or 32 bytes per slot for k up to 40,
+/// 48, 64, 96, and 128). Larger k uses byte-string storage, with no maximum
+/// other than practical memory limits. Neither table family is intended to
+/// resist adaptive collision attacks.
 pub struct Counter {
     counts: Counts,
     // For wider keys from `ParallelCounter`, partition zero is `counts` and the
@@ -144,9 +360,11 @@ impl ChunkSink<'_> {
 /// One independently encodable piece of a counter's output.
 #[derive(Clone, Copy)]
 enum OutputTable<'a> {
-    /// Consecutive partitions of compact packed tables: the first, and how
+    /// Consecutive partitions of compact 64-bit packed tables: the first, and how
     /// many.
     Packed(&'a PackedCounts, usize, usize),
+    /// Consecutive partitions of compact wide tables: the first, and how many.
+    Wide(&'a WideCounts, usize, usize),
     /// A whole map for wider keys.
     Map(&'a Counts),
 }
@@ -189,14 +407,15 @@ impl Counter {
                     capacity,
                     table::Load::Sparse,
                 )?)
-            } else if k <= 64 {
-                let mut counts = PackedCounts128::default();
-                counts
-                    .try_reserve(capacity)
-                    .map_err(|_| Error::ReserveFailed)?;
-                Counts::Packed128(counts)
+            } else if k <= 128 {
+                Counts::Wide(WideCounts::with_capacity(
+                    k,
+                    PACKED_PARTITION_BITS,
+                    capacity,
+                    table::Load::Sparse,
+                )?)
             } else {
-                let mut counts = HashMap::new();
+                let mut counts = HashMap::default();
                 counts
                     .try_reserve(capacity)
                     .map_err(|_| Error::ReserveFailed)?;
@@ -227,16 +446,15 @@ impl Counter {
             visit_packed(sequence, k, strand, |key| adder.push(key))?;
             return adder.finish();
         }
+        if let Counts::Wide(counts) = &mut self.counts {
+            return counts.add_records(std::iter::once(sequence), self.k, self.strand);
+        }
         if !self.partitions.is_empty() {
             let (k, strand) = (self.k, self.strand);
             return match &self.counts {
-                Counts::Packed(_) => unreachable!("packed counts partition themselves"),
-                Counts::Packed128(_) => visit_packed128(sequence, k, strand, |key| {
-                    let Counts::Packed128(map) = self.partition_mut(&key) else {
-                        unreachable!()
-                    };
-                    add_delta(map, key, 1)
-                }),
+                Counts::Packed(_) | Counts::Wide(_) => {
+                    unreachable!("packed counts partition themselves")
+                }
                 Counts::Bytes(_) => visit_bytes(sequence, k, strand, |key| {
                     let Counts::Bytes(map) = self.partition_mut(key) else {
                         unreachable!()
@@ -246,11 +464,7 @@ impl Counter {
             };
         }
         match &mut self.counts {
-            Counts::Packed(_) => unreachable!("handled above"),
-            Counts::Packed128(counts) => match self.strand {
-                StrandMode::Forward => add_packed128_record::<false>(counts, sequence, self.k),
-                StrandMode::Canonical => add_packed128_record::<true>(counts, sequence, self.k),
-            },
+            Counts::Packed(_) | Counts::Wide(_) => unreachable!("handled above"),
             Counts::Bytes(counts) => add_byte_record(counts, sequence, self.k, self.strand),
         }
     }
@@ -276,13 +490,16 @@ impl Counter {
             }
             return adder.finish();
         }
+        if let Counts::Wide(counts) = &mut self.counts {
+            return counts.add_records(records, k, strand);
+        }
         records
             .into_iter()
             .try_for_each(|record| self.add_record(record))
     }
 
     /// Consume another counter with the same k and strand mode, adding its counts.
-    /// Keys remain packed; no DNA decoding or per-key allocation is needed for k <= 64.
+    /// Keys remain packed; no DNA decoding or per-key allocation is needed for k <= 128.
     /// On overflow, earlier entries may have been merged; the overflowing count is unchanged.
     pub fn merge(&mut self, other: Self) -> Result<(), Error> {
         if self.k != other.k || self.strand != other.strand {
@@ -295,27 +512,19 @@ impl Counter {
                 .entries()
                 .try_for_each(|(key, delta)| target.add_key(key, delta));
         }
+        if let (Counts::Wide(target), Counts::Wide(source)) = (&mut self.counts, &other.counts) {
+            return target.merge(source);
+        }
         for source in std::iter::once(other.counts).chain(other.partitions) {
             if self.partitions.is_empty() {
                 match (&mut self.counts, source) {
-                    (Counts::Packed128(target), Counts::Packed128(source)) => {
-                        merge_counts(target, source)?
-                    }
                     (Counts::Bytes(target), Counts::Bytes(source)) => merge_counts(target, source)?,
                     _ => unreachable!("matching k selects matching representations"),
                 }
             } else {
                 match source {
-                    Counts::Packed(_) => {
+                    Counts::Packed(_) | Counts::Wide(_) => {
                         unreachable!("matching k selects matching representations")
-                    }
-                    Counts::Packed128(source) => {
-                        for (key, delta) in source {
-                            let Counts::Packed128(target) = self.partition_mut(&key) else {
-                                unreachable!()
-                            };
-                            add_delta(target, key, delta)?;
-                        }
                     }
                     Counts::Bytes(source) => {
                         for (key, delta) in source {
@@ -366,6 +575,22 @@ impl Counter {
         }
     }
 
+    pub(crate) fn from_wide(
+        k: usize,
+        strand: StrandMode,
+        counts: WideCounts,
+        output_threads: usize,
+    ) -> Self {
+        Self {
+            counts: Counts::Wide(counts),
+            partitions: Vec::new(),
+            partition_hash: None,
+            output_threads: output_threads.max(1),
+            k,
+            strand,
+        }
+    }
+
     fn tables(&self) -> impl Iterator<Item = &Counts> {
         std::iter::once(&self.counts).chain(&self.partitions)
     }
@@ -383,6 +608,14 @@ impl Counter {
                 .step_by(unit)
                 .map(|first| OutputTable::Packed(counts, first, unit))
                 .collect(),
+            Counts::Wide(counts) => {
+                let len = counts.table_count();
+                let step = (len / (self.output_threads * 8).max(1)).clamp(1, 128);
+                (0..len)
+                    .step_by(step)
+                    .map(|first| OutputTable::Wide(counts, first, (len - first).min(step)))
+                    .collect()
+            }
             _ => self.tables().map(OutputTable::Map).collect(),
         };
         write_ordered(
@@ -416,7 +649,7 @@ impl Counter {
         self.tables()
             .map(|table| match table {
                 Counts::Packed(counts) => counts.len(),
-                Counts::Packed128(map) => map.len(),
+                Counts::Wide(counts) => counts.len(),
                 Counts::Bytes(map) => map.len(),
             })
             .sum()
@@ -446,13 +679,12 @@ impl Counter {
                     write_packed64_tsv(entries, self.k, writer)
                 })
             }
-            OutputTable::Map(Counts::Packed(_)) => unreachable!("packed tables are split"),
-            OutputTable::Map(Counts::Packed128(counts)) => write_packed_tsv::<64, _>(
-                counts.iter().map(|(&key, &count)| (key, count)),
-                self.k,
-                writer,
-                decode_packed128_into,
-            ),
+            OutputTable::Wide(counts, first, tables) => {
+                counts.write_tsv_range(first, tables, self.k, writer)
+            }
+            OutputTable::Map(Counts::Packed(_) | Counts::Wide(_)) => {
+                unreachable!("packed tables are split")
+            }
             OutputTable::Map(Counts::Bytes(counts)) => {
                 // A u64 has at most 20 decimal digits, plus a tab and newline.
                 let mut suffix = [0; 22];
@@ -483,18 +715,14 @@ impl Counter {
         self.tables().flat_map(move |table| {
             let (packed, wide, bytes) = match table {
                 Counts::Packed(counts) => (Some(counts.entries()), None, None),
-                Counts::Packed128(counts) => (None, Some(counts.iter()), None),
+                Counts::Wide(counts) => (None, Some(counts.decoded_entries(self.k)), None),
                 Counts::Bytes(counts) => (None, None, Some(counts.iter())),
             };
             packed
                 .into_iter()
                 .flatten()
                 .map(|(key, count)| (decode_packed(key, self.k), count))
-                .chain(wide.into_iter().flatten().map(|(&key, &count)| {
-                    let mut dna = vec![0; self.k];
-                    decode_packed128_into(key, &mut dna);
-                    (dna, count)
-                }))
+                .chain(wide.into_iter().flatten())
                 .chain(
                     bytes
                         .into_iter()
@@ -763,23 +991,11 @@ fn visit_packed_record<const CANONICAL: bool>(
     Ok(())
 }
 
-fn add_packed128_record<const CANONICAL: bool>(
-    counts: &mut PackedCounts128,
-    sequence: &[u8],
-    k: usize,
-) -> Result<(), Error> {
-    visit_packed128_record::<CANONICAL>(sequence, k, |key| {
-        let count = counts.entry(key).or_insert(0);
-        *count = count.checked_add(1).ok_or(Error::CountOverflow)?;
-        Ok(())
-    })
-}
-
 fn visit_packed128(
     sequence: &[u8],
     k: usize,
     strand: StrandMode,
-    emit: impl FnMut((u64, u64)) -> Result<(), Error>,
+    emit: impl FnMut(u64, u64) -> Result<(), Error>,
 ) -> Result<(), Error> {
     match strand {
         StrandMode::Forward => visit_packed128_record::<false>(sequence, k, emit),
@@ -790,26 +1006,32 @@ fn visit_packed128(
 fn visit_packed128_record<const CANONICAL: bool>(
     sequence: &[u8],
     k: usize,
-    mut emit: impl FnMut((u64, u64)) -> Result<(), Error>,
+    mut emit: impl FnMut(u64, u64) -> Result<(), Error>,
 ) -> Result<(), Error> {
-    // Right-shifting an all-ones mask also handles k = 64 without a shift by 128.
-    let mask = u128::MAX >> (128 - 2 * k);
-    let high_shift = 2 * (k - 1);
-    let (mut forward, mut reverse) = (0_u128, 0_u128);
+    // k is in 33..=64, so `lo` holds all 64 low bits and `hi` holds 2..=64 high bits.
+    // `hi_shift = 2*(k-1) - 64` is always in 0..=62, avoiding variable 128-bit shifts.
+    let hi_mask = u64::MAX >> (128 - 2 * k);
+    let hi_shift = 2 * (k - 1) - 64;
+    let (mut f_hi, mut f_lo) = (0_u64, 0_u64);
+    let (mut r_hi, mut r_lo) = (0_u64, 0_u64);
     let mut valid_run = 0;
 
     for &byte in sequence {
         let base = DNA_BASES[byte as usize];
         if base == u8::MAX {
-            forward = 0;
-            reverse = 0;
+            f_hi = 0;
+            f_lo = 0;
+            r_hi = 0;
+            r_lo = 0;
             valid_run = 0;
             continue;
         }
-        let base = u128::from(base);
-        forward = ((forward << 2) | base) & mask;
+        let base = u64::from(base);
+        f_hi = ((f_hi << 2) | (f_lo >> 62)) & hi_mask;
+        f_lo = (f_lo << 2) | base;
         if CANONICAL {
-            reverse = (reverse >> 2) | ((base ^ 3) << high_shift);
+            r_lo = (r_lo >> 2) | (r_hi << 62);
+            r_hi = (r_hi >> 2) | ((base ^ 3) << hi_shift);
         }
         valid_run = (valid_run + 1).min(k);
         if valid_run < k {
@@ -817,21 +1039,124 @@ fn visit_packed128_record<const CANONICAL: bool>(
         }
 
         // A=0, C=1, G=2, T=3 makes numeric and lexicographic order agree.
-        let key = if CANONICAL {
-            forward.min(reverse)
+        let (hi, lo) = if CANONICAL && (r_hi, r_lo) < (f_hi, f_lo) {
+            (r_hi, r_lo)
         } else {
-            forward
+            (f_hi, f_lo)
         };
-        emit(((key >> 64) as u64, key as u64))?;
+        emit(hi, lo)?;
     }
     Ok(())
 }
 
-fn decode_packed128_into(key: (u64, u64), dna: &mut [u8]) {
-    let split = dna.len() - 32;
-    let (high, low) = dna.split_at_mut(split);
-    decode_packed_into(key.0, high);
-    decode_packed_into(key.1, low);
+fn visit_packed192(
+    sequence: &[u8],
+    k: usize,
+    strand: StrandMode,
+    emit: impl FnMut([u64; 2], u64) -> Result<(), Error>,
+) -> Result<(), Error> {
+    match strand {
+        StrandMode::Forward => visit_packed192_record::<false>(sequence, k, emit),
+        StrandMode::Canonical => visit_packed192_record::<true>(sequence, k, emit),
+    }
+}
+
+fn visit_packed192_record<const CANONICAL: bool>(
+    sequence: &[u8],
+    k: usize,
+    mut emit: impl FnMut([u64; 2], u64) -> Result<(), Error>,
+) -> Result<(), Error> {
+    // k is in 65..=96: w0 (64b), w1 (64b), w2 (2..=64b).
+    let top_mask = u64::MAX >> (192 - 2 * k);
+    let top_shift = 2 * (k - 1) - 128;
+    let (mut f2, mut f1, mut f0) = (0_u64, 0_u64, 0_u64);
+    let (mut r2, mut r1, mut r0) = (0_u64, 0_u64, 0_u64);
+    let mut valid_run = 0;
+
+    for &byte in sequence {
+        let base = DNA_BASES[byte as usize];
+        if base == u8::MAX {
+            (f2, f1, f0) = (0, 0, 0);
+            (r2, r1, r0) = (0, 0, 0);
+            valid_run = 0;
+            continue;
+        }
+        let base = u64::from(base);
+        f2 = ((f2 << 2) | (f1 >> 62)) & top_mask;
+        f1 = (f1 << 2) | (f0 >> 62);
+        f0 = (f0 << 2) | base;
+        if CANONICAL {
+            r0 = (r0 >> 2) | (r1 << 62);
+            r1 = (r1 >> 2) | (r2 << 62);
+            r2 = (r2 >> 2) | ((base ^ 3) << top_shift);
+        }
+        valid_run = (valid_run + 1).min(k);
+        if valid_run < k {
+            continue;
+        }
+        if CANONICAL && (r2, r1, r0) < (f2, f1, f0) {
+            emit([r1, r2], r0)?;
+        } else {
+            emit([f1, f2], f0)?;
+        }
+    }
+    Ok(())
+}
+
+fn visit_packed256(
+    sequence: &[u8],
+    k: usize,
+    strand: StrandMode,
+    emit: impl FnMut([u64; 3], u64) -> Result<(), Error>,
+) -> Result<(), Error> {
+    match strand {
+        StrandMode::Forward => visit_packed256_record::<false>(sequence, k, emit),
+        StrandMode::Canonical => visit_packed256_record::<true>(sequence, k, emit),
+    }
+}
+
+fn visit_packed256_record<const CANONICAL: bool>(
+    sequence: &[u8],
+    k: usize,
+    mut emit: impl FnMut([u64; 3], u64) -> Result<(), Error>,
+) -> Result<(), Error> {
+    // k is in 97..=128: w0..w2 (64b each), w3 (2..=64b).
+    let top_mask = u64::MAX >> (256 - 2 * k);
+    let top_shift = 2 * (k - 1) - 192;
+    let (mut f3, mut f2, mut f1, mut f0) = (0_u64, 0_u64, 0_u64, 0_u64);
+    let (mut r3, mut r2, mut r1, mut r0) = (0_u64, 0_u64, 0_u64, 0_u64);
+    let mut valid_run = 0;
+
+    for &byte in sequence {
+        let base = DNA_BASES[byte as usize];
+        if base == u8::MAX {
+            (f3, f2, f1, f0) = (0, 0, 0, 0);
+            (r3, r2, r1, r0) = (0, 0, 0, 0);
+            valid_run = 0;
+            continue;
+        }
+        let base = u64::from(base);
+        f3 = ((f3 << 2) | (f2 >> 62)) & top_mask;
+        f2 = (f2 << 2) | (f1 >> 62);
+        f1 = (f1 << 2) | (f0 >> 62);
+        f0 = (f0 << 2) | base;
+        if CANONICAL {
+            r0 = (r0 >> 2) | (r1 << 62);
+            r1 = (r1 >> 2) | (r2 << 62);
+            r2 = (r2 >> 2) | (r3 << 62);
+            r3 = (r3 >> 2) | ((base ^ 3) << top_shift);
+        }
+        valid_run = (valid_run + 1).min(k);
+        if valid_run < k {
+            continue;
+        }
+        if CANONICAL && (r3, r2, r1, r0) < (f3, f2, f1, f0) {
+            emit([r1, r2, r3], r0)?;
+        } else {
+            emit([f1, f2, f3], f0)?;
+        }
+    }
+    Ok(())
 }
 
 fn decode_packed(key: u64, k: usize) -> Vec<u8> {
@@ -882,9 +1207,9 @@ fn format_count(mut count: u64, buffer: &mut [u8; 22]) -> &[u8] {
     &buffer[start..]
 }
 
-// Byte-string fallback for k > 64.
+// Byte-string fallback for k > 128.
 fn add_byte_record(
-    counts: &mut HashMap<Vec<u8>, u64>,
+    counts: &mut HashMap<Vec<u8>, u64, foldhash::fast::RandomState>,
     sequence: &[u8],
     k: usize,
     strand: StrandMode,
@@ -898,36 +1223,35 @@ fn visit_bytes(
     strand: StrandMode,
     mut emit: impl FnMut(&[u8]) -> Result<(), Error>,
 ) -> Result<(), Error> {
-    let sequence = sequence.to_ascii_uppercase();
+    if sequence.len() < k {
+        return Ok(());
+    }
+    let mut normalized = Vec::with_capacity(sequence.len());
     let mut reverse_complement = if strand == StrandMode::Canonical {
         vec![0; k]
     } else {
         Vec::new()
     };
 
-    for kmer in sequence.windows(k) {
-        if !kmer
-            .iter()
-            .all(|base| matches!(base, b'A' | b'C' | b'G' | b'T'))
-        {
+    for &byte in sequence {
+        let base = DNA_BASES[byte as usize];
+        if base == u8::MAX {
+            normalized.clear();
             continue;
         }
-
+        normalized.push(b"ACGT"[base as usize]);
+        if normalized.len() < k {
+            continue;
+        }
+        let kmer = &normalized[normalized.len() - k..];
         let key = if strand == StrandMode::Canonical {
-            for (complement, base) in reverse_complement.iter_mut().zip(kmer.iter().rev()) {
-                *complement = match base {
-                    b'A' => b'T',
-                    b'C' => b'G',
-                    b'G' => b'C',
-                    b'T' => b'A',
-                    _ => unreachable!("bases were validated above"),
-                };
+            for (complement, &b) in reverse_complement.iter_mut().zip(kmer.iter().rev()) {
+                *complement = b"TGCA"[DNA_BASES[b as usize] as usize];
             }
             kmer.min(reverse_complement.as_slice())
         } else {
             kmer
         };
-
         emit(key)?;
     }
     Ok(())
@@ -946,7 +1270,11 @@ fn add_delta<K: Eq + Hash, S: BuildHasher>(
     Ok(())
 }
 
-fn add_byte_delta(map: &mut HashMap<Vec<u8>, u64>, key: &[u8], delta: u64) -> Result<(), Error> {
+fn add_byte_delta<S: BuildHasher>(
+    map: &mut HashMap<Vec<u8>, u64, S>,
+    key: &[u8],
+    delta: u64,
+) -> Result<(), Error> {
     if let Some(count) = map.get_mut(key) {
         *count = count.checked_add(delta).ok_or(Error::CountOverflow)?;
         Ok(())
@@ -966,7 +1294,7 @@ impl Counts {
                 .tables_mut()
                 .iter_mut()
                 .for_each(|table| table.set_counts(count)),
-            Counts::Packed128(map) => map.values_mut().for_each(|value| *value = count),
+            Counts::Wide(counts) => counts.set_counts(count),
             Counts::Bytes(map) => map.values_mut().for_each(|value| *value = count),
         }
     }
@@ -1019,26 +1347,28 @@ mod tests {
     }
 
     #[test]
-    fn full_width_128_bit_keys_preserve_high_bits_and_leading_as() {
-        let mut counter = Counter::new(64, StrandMode::Forward).unwrap();
-        counter.add_record(&[b'T'; 65]).unwrap();
-        counter.add_record(&[b'A'; 64]).unwrap();
-        let leading_as = format!("{}C", "A".repeat(63));
-        counter.add_record(leading_as.as_bytes()).unwrap();
-        assert_counts(
-            &counter,
-            &[(&"T".repeat(64), 2), (&"A".repeat(64), 1), (&leading_as, 1)],
-        );
+    fn full_width_wide_keys_preserve_high_bits_and_leading_as() {
+        for k in [40, 48, 64, 96, 128] {
+            let mut counter = Counter::new(k, StrandMode::Forward).unwrap();
+            counter.add_record(&vec![b'T'; k + 1]).unwrap();
+            counter.add_record(&vec![b'A'; k]).unwrap();
+            let leading_as = format!("{}C", "A".repeat(k - 1));
+            counter.add_record(leading_as.as_bytes()).unwrap();
+            assert_counts(
+                &counter,
+                &[(&"T".repeat(k), 2), (&"A".repeat(k), 1), (&leading_as, 1)],
+            );
 
-        let mut canonical = Counter::new(64, StrandMode::Canonical).unwrap();
-        canonical.add_record(&[b'T'; 65]).unwrap();
-        canonical.add_record(&[b'A'; 64]).unwrap();
-        assert_counts(&canonical, &[(&"A".repeat(64), 3)]);
+            let mut canonical = Counter::new(k, StrandMode::Canonical).unwrap();
+            canonical.add_record(&vec![b'T'; k + 1]).unwrap();
+            canonical.add_record(&vec![b'A'; k]).unwrap();
+            assert_counts(&canonical, &[(&"A".repeat(k), 3)]);
+        }
     }
 
     #[test]
     fn every_invalid_byte_breaks_wide_packed_runs() {
-        for k in [33, 64] {
+        for k in [33, 40, 48, 64, 65, 96, 97, 128] {
             for strand in [StrandMode::Forward, StrandMode::Canonical] {
                 for byte in 0..=u8::MAX {
                     if b"ACGTacgt".contains(&byte) {
@@ -1057,18 +1387,18 @@ mod tests {
 
     #[test]
     fn capacity_hint_preserves_counts_and_allows_growth() {
-        for k in [1, 3, 31, 32, 33, 63, 64, 65] {
+        for k in [1, 3, 31, 32, 33, 40, 48, 63, 64, 65, 96, 97, 128, 129] {
             for strand in [StrandMode::Canonical, StrandMode::Forward] {
                 let mut expected = Counter::new(k, strand).unwrap();
                 let mut reserved = Counter::with_capacity(k, strand, 1).unwrap();
                 assert!(reserved.is_empty());
                 let capacity = match &reserved.counts {
                     Counts::Packed(counts) => counts.capacity(),
-                    Counts::Packed128(counts) => counts.capacity(),
+                    Counts::Wide(counts) => counts.capacity(),
                     Counts::Bytes(counts) => counts.capacity(),
                 };
                 assert!(capacity >= 1);
-                for record in [b"ACGTTACGAGTCAGATTCGAC".repeat(8), vec![b'T'; 80]] {
+                for record in [b"ACGTTACGAGTCAGATTCGAC".repeat(12), vec![b'T'; 160]] {
                     expected.add_record(&record).unwrap();
                     reserved.add_record(&record).unwrap();
                 }
@@ -1087,7 +1417,7 @@ mod tests {
             Counter::with_capacity(0, StrandMode::Canonical, usize::MAX),
             Err(Error::InvalidK)
         ));
-        for k in [31, 33, 65] {
+        for k in [31, 33, 41, 49, 65, 97, 129] {
             assert!(matches!(
                 Counter::with_capacity(k, StrandMode::Canonical, usize::MAX),
                 Err(Error::ReserveFailed)

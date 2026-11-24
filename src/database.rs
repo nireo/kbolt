@@ -65,7 +65,8 @@
 use std::io::{self, Read, Write};
 
 use crate::table::{self, Mixer, PackedCounts};
-use crate::{Counter, Counts, OutputTable, StrandMode, format_count};
+use crate::table_wide::{HighKey, PackedCountsWide};
+use crate::{Counter, Counts, OutputTable, StrandMode, WideCounts, format_count};
 
 const MAGIC: &[u8; 8] = b"KBOLTDB\0";
 /// The only version read or written. Version 1, with whole keys and
@@ -164,6 +165,21 @@ impl<'a, W: Write + ?Sized> SectionWriter<'a, W> {
     #[inline(always)]
     pub(crate) fn raw(&mut self, key: &[u8], count: u64) -> io::Result<()> {
         self.section.extend_from_slice(key);
+        put_varint(&mut self.section, count);
+        self.added()
+    }
+
+    /// Add a wide packed record directly into the section buffer without an
+    /// intermediate key copy.
+    #[inline(always)]
+    pub(crate) fn raw_wide<H: HighKey>(
+        &mut self,
+        hi: H,
+        lo: u64,
+        key_bytes: usize,
+        count: u64,
+    ) -> io::Result<()> {
+        hi.push_le(lo, key_bytes, &mut self.section);
         put_varint(&mut self.section, count);
         self.added()
     }
@@ -527,14 +543,32 @@ impl Counter {
             OutputTable::Packed(counts, first, tables) => {
                 write_hash_sections(counts, first, tables, writer)
             }
-            OutputTable::Map(Counts::Packed(_)) => unreachable!("packed tables are split"),
-            OutputTable::Map(Counts::Packed128(counts)) => {
-                let mut sections = SectionWriter::new(writer);
-                for (&(high, low), &count) in counts {
-                    let key = ((high as u128) << 64) | low as u128;
-                    sections.raw(&key.to_le_bytes()[..key_bytes], count)?;
+            OutputTable::Wide(counts, first, tables) => {
+                fn encode_wide<H: HighKey>(
+                    counts: &PackedCountsWide<H>,
+                    first: usize,
+                    tables: usize,
+                    key_bytes: usize,
+                    writer: &mut dyn Write,
+                ) -> io::Result<()> {
+                    let mut sections = SectionWriter::new(writer);
+                    for partition in first..first + tables {
+                        for ((hi, lo), count) in counts.partition_entries(partition) {
+                            sections.raw_wide(hi, lo, key_bytes, count)?;
+                        }
+                    }
+                    sections.finish()
                 }
-                sections.finish()
+                match counts {
+                    WideCounts::W80(c) => encode_wide(c, first, tables, key_bytes, writer),
+                    WideCounts::W96(c) => encode_wide(c, first, tables, key_bytes, writer),
+                    WideCounts::W128(c) => encode_wide(c, first, tables, key_bytes, writer),
+                    WideCounts::W192(c) => encode_wide(c, first, tables, key_bytes, writer),
+                    WideCounts::W256(c) => encode_wide(c, first, tables, key_bytes, writer),
+                }
+            }
+            OutputTable::Map(Counts::Packed(_) | Counts::Wide(_)) => {
+                unreachable!("packed tables are split")
             }
             OutputTable::Map(Counts::Bytes(counts)) => {
                 let mut sections = SectionWriter::new(writer);
@@ -564,15 +598,24 @@ impl Counter {
                         .insert_new(u64::from_le_bytes(packed), count)
                         .map_err(io::Error::other)?
                 }
-                Counts::Packed128(counts) => {
-                    let mut packed = [0; 16];
+                Counts::Wide(counts) => {
+                    fn insert_wide<H: HighKey>(
+                        counts: &mut PackedCountsWide<H>,
+                        bytes: &[u8],
+                        count: u64,
+                    ) -> io::Result<bool> {
+                        let (hi, lo) = H::read_le(bytes);
+                        Ok(!counts.insert_new(hi, lo, count).map_err(io::Error::other)?)
+                    }
                     let size = header.k.div_ceil(4);
-                    packed[..size].copy_from_slice(&reader.record[..size]);
-                    let key = u128::from_le_bytes(packed);
-                    counts.try_reserve(1).map_err(io::Error::other)?;
-                    counts
-                        .insert(((key >> 64) as u64, key as u64), count)
-                        .is_some()
+                    let bytes = &reader.record[..size];
+                    match counts {
+                        WideCounts::W80(c) => insert_wide(c, bytes, count)?,
+                        WideCounts::W96(c) => insert_wide(c, bytes, count)?,
+                        WideCounts::W128(c) => insert_wide(c, bytes, count)?,
+                        WideCounts::W192(c) => insert_wide(c, bytes, count)?,
+                        WideCounts::W256(c) => insert_wide(c, bytes, count)?,
+                    }
                 }
                 Counts::Bytes(counts) => {
                     counts.try_reserve(1).map_err(io::Error::other)?;

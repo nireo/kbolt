@@ -96,7 +96,85 @@ fn main() -> Result<(), kbolt::Error> {
 For many short reads, `add_records` is faster than repeated `add_record`
 calls. `ParallelCounter` counts on several threads and `finish()` returns a
 normal `Counter`. `DiskCounter` takes input the same way but counts on disk
-within a memory limit and writes its result straight to a file.
+within a memory limit and writes its result straight to a file. All three also
+support `add_file`, `add_files`, and `add_reader` for streaming plain or gzipped
+FASTA/FASTQ input, and `Counter` supports `get`, `get_many`, `histogram`,
+`top_k`, and filtered/packed export.
+
+## Python and R bindings
+
+Native bindings live under [`bindings/python`](bindings/python) (PyO3 + maturin,
+single `abi3` wheel for Python 3.11+) and [`bindings/r`](bindings/r) (extendr).
+Both keep the hash tables in Rust memory and stream FASTA/FASTQ/gzip files
+directly through the Rust engine, so you can query, summarize, and filter
+without materializing hundreds of millions of strings in Python or R.
+
+### Python
+
+```sh
+cd bindings/python && maturin develop --release
+```
+
+```python
+import kbolt
+
+# Count plain or gzipped FASTA/FASTQ files in parallel (GIL released)
+counts = kbolt.count_files(["sample_R1.fastq.gz", "sample_R2.fastq.gz"], k=31, threads=8)
+
+len(counts)
+counts["ACGTACGTACGTACGTACGTACGTACGTACG"]
+counts.get_many(["ACGT...", "TGCA..."])
+
+# K-mer spectrum, top-k, and bulk NumPy export (S{k} ASCII or packed uint64)
+spectrum = counts.histogram()
+top20 = counts.top_k(20)
+keys, vals = counts.to_numpy(min_count=2, packed=True)
+
+# Count on disk within a memory budget and stream the .kbolt database
+kbolt.count_files_to_disk(
+    ["sample_R1.fastq.gz", "sample_R2.fastq.gz"],
+    "counts.kbolt",
+    k=31,
+    memory="2G",
+    threads=8,
+)
+with kbolt.open_database("counts.kbolt") as db:
+    for kmer, count in db:
+        ...
+```
+
+### R
+
+```sh
+R CMD INSTALL bindings/r
+```
+
+```r
+library(kbolt)
+
+# Count plain or gzipped FASTA/FASTQ files in parallel
+counts <- kbolt_count_files(c("sample_R1.fastq.gz", "sample_R2.fastq.gz"), k = 31, threads = 8)
+
+length(counts)
+counts[c("ACGTACGTACGTACGTACGTACGTACGTACG", "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT")]
+
+# K-mer spectrum, top-k, and filtered data.frame export
+spectrum <- kbolt_histogram(counts)
+top20 <- kbolt_top_k(counts, 20)
+df <- as.data.frame(counts, min_count = 2)
+
+# Count on disk within a memory budget and read chunks from the .kbolt database
+kbolt_count_files_to_disk(
+  c("sample_R1.fastq.gz", "sample_R2.fastq.gz"),
+  output = "counts.kbolt",
+  k = 31,
+  memory = "2G",
+  threads = 8
+)
+db <- kbolt_open_database("counts.kbolt")
+chunk <- kbolt_database_read(db, n = 100000)
+kbolt_database_close(db)
+```
 
 ## How it works
 

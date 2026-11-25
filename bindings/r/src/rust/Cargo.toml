@@ -1,0 +1,13 @@
+[package]
+name = "kbolt-r"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "kbolt_r"
+crate-type = ["staticlib"]
+
+[dependencies]
+extendr-api = { version = "0.9", features = ["result_list"] }
+kbolt = { path = "../../../.." }

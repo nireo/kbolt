@@ -1,0 +1,14 @@
+Package: kbolt
+Type: Package
+Title: Fast Exact DNA K-mer Counting
+Version: 0.1.0
+Authors@R: person("nireo", email = "eemil.lehtikangas1@gmail.com", role = c("aut", "cre"))
+Description: Fast exact DNA k-mer counting backed by the kbolt Rust library.
+    Supports streaming plain and gzipped FASTA/FASTQ files in parallel,
+    in-memory and disk-backed counting, vectorized k-mer lookups, count
+    histograms, top-k extraction, filtered data.frame export, and streaming
+    binary count databases.
+License: MIT + file LICENSE
+Encoding: UTF-8
+SystemRequirements: Cargo (Rust's package manager), rustc (>= 1.85)
+NeedsCompilation: yes

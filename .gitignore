@@ -1,2 +1,12 @@
 /target
 /data/
+/bindings/python/target
+.DS_Store
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+.pytest_cache/
+.venv/
+dist/
+*.egg-info/

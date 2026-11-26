@@ -9,6 +9,14 @@ the inputs of compare.py, its count table is far larger than the CPU caches.
     python3 benches/reads.py --fetch    # download 5 GB to data/celegans, once
     python3 benches/reads.py
 
+--dataset na12878 counts human reads instead: NA12878 run SRR8848156, two
+gzip-compressed FASTQ files of 95.9 million reads of 150 bases each (28.76
+Gbp, 16 GB compressed), with 8,185,470,424 distinct canonical 31-mers. They
+do not fit in the memory of a laptop, so give every tool a limit:
+
+    python3 benches/reads.py --dataset na12878 --fetch
+    python3 benches/reads.py --dataset na12878 --memory 4 --tools kbolt kmc fastk --warmup 0
+
 Every tool counts canonical 31-mers, keeps k-mers seen once, and writes its
 native table to target/compare/out. kbolt's and KMC's tables hold identical
 counts (compared as complete count histograms). KMC and FastK flags are as in
@@ -42,15 +50,31 @@ import urllib.request
 from compare import INPUTS, OUT, TMP, WORK, digest, run_cases
 from dataset import ROOT, nonnegative, positive, summarize, wait_idle
 
-DATA = ROOT / "data/celegans"
-ENA = "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR065/SRR065390/"
-# name: (bytes, MD5), as published by ENA for run SRR065390.
-FILES = {
-    "SRR065390_1.fastq.gz": (2476071286, "08a64d5483edcc42ef652933ba8c6b47"),
-    "SRR065390_2.fastq.gz": (2509181096, "6a5cf958b5ab4d30910bb5d0494916d4"),
+# Per dataset: directory, ENA directory, and file name: (bytes, MD5) as
+# published by ENA, read length, reads in all files.
+DATASETS = {
+    "celegans": {
+        "data": ROOT / "data/celegans",
+        "ena": "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR065/SRR065390/",
+        "files": {
+            "SRR065390_1.fastq.gz": (2476071286, "08a64d5483edcc42ef652933ba8c6b47"),
+            "SRR065390_2.fastq.gz": (2509181096, "6a5cf958b5ab4d30910bb5d0494916d4"),
+        },
+        "read_bases": 100,
+        "reads": 67617092,
+    },
+    "na12878": {
+        "data": ROOT / "data/na12878",
+        "ena": "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR884/006/SRR8848156/",
+        "files": {
+            "SRR8848156_1.fastq.gz": (7921603800, "b21ab6d5330c2b054a19437ad6996c12"),
+            "SRR8848156_2.fastq.gz": (9149021851, "7e3294454da6b27c43bcf6359e7b989d"),
+        },
+        "read_bases": 150,
+        "reads": 191729882,
+    },
 }
-READ_BASES = 100
-READS = 67617092
+DATA = ENA = FILES = READ_BASES = READS = None
 TOOLS = ["kbolt", "kmc", "fastk"]
 PART = 32 << 20
 
@@ -98,7 +122,7 @@ def fetch_file(name, size, md5):
 
 def subset(reads):
     """The first `reads` reads of the first file as plain FASTQ."""
-    path = INPUTS / f"celegans-{reads}.fq"
+    path = INPUTS / f"{DATA.name}-{reads}.fq"
     if not path.exists():
         with gzip.open(DATA / next(iter(FILES)), "rb") as source, path.open("wb") as out:
             for _ in range(4 * reads):
@@ -129,6 +153,7 @@ def count_command(tool, inputs, name, threads, memory, kbolt, kmc):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--dataset", default="celegans", choices=list(DATASETS))
     parser.add_argument("--fetch", action="store_true", help="download the reads and exit")
     parser.add_argument("--reads", type=positive, help="count only the first N reads of the first file")
     parser.add_argument("--kbolt", type=Path, default=ROOT / "target/release/kbolt")
@@ -143,6 +168,10 @@ def main():
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--output", type=Path, default=WORK / "reads-results.json")
     args = parser.parse_args()
+    global DATA, ENA, FILES, READ_BASES, READS
+    dataset = DATASETS[args.dataset]
+    DATA, ENA, FILES = dataset["data"], dataset["ena"], dataset["files"]
+    READ_BASES, READS = dataset["read_bases"], dataset["reads"]
     if args.fetch:
         DATA.mkdir(parents=True, exist_ok=True)
         for name, (size, md5) in FILES.items():
@@ -154,9 +183,9 @@ def main():
     for directory in (INPUTS, OUT, TMP):
         directory.mkdir(parents=True, exist_ok=True)
     if args.reads:
-        name, inputs, bases = f"celegans-{args.reads}", [subset(args.reads)], args.reads * READ_BASES
+        name, inputs, bases = f"{args.dataset}-{args.reads}", [subset(args.reads)], args.reads * READ_BASES
     else:
-        name, inputs, bases = "celegans", [DATA / file for file in FILES], READS * READ_BASES
+        name, inputs, bases = args.dataset, [DATA / file for file in FILES], READS * READ_BASES
     kbolt, kmc = str(args.kbolt.resolve()), str(args.kmc.resolve())
     cases = [(f"{tool}/t{threads}" + (f"/m{memory}" if memory else ""),
               count_command(tool, inputs, name, threads, memory, kbolt, kmc))

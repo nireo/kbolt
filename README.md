@@ -5,15 +5,33 @@ and it lists every substring of length k along with how many times it shows up.
 The counts are exact, not estimates. It reads FASTA and FASTQ, gzipped or not,
 and you can use it from the command line or as a Rust library.
 
-It's built to be fast on an ordinary machine. Everything stays in memory, so it
-works best when the distinct k-mers fit in RAM. Here's how it compares with KMC
-and FastK, two widely used exact counters, on a real read set (C. elegans
-SRR065390: two gzipped FASTQ files, 6.76 Gbp, 488 million distinct 31-mers):
+It's built to be fast on an ordinary machine. By default it counts in memory,
+and `--memory` switches to disk-backed counting when the distinct k-mers don't
+fit in RAM. Here's how it compares with KMC and FastK, two widely used exact
+counters, on a human read set far larger than the laptop's memory (NA12878
+SRR8848156: two gzipped FASTQ files, 28.76 Gbp, 8.19 billion distinct
+31-mers, which would take over 100 GB to hold in memory):
+
+![Wall time, CPU time and peak memory of kbolt, KMC and FastK counting 31-mers in 28.76 Gbp of human reads within 4 GiB of memory](docs/benchmark-human.png)
+
+Counting canonical 31-mers at 8 threads with every tool limited to 4 GiB
+(kbolt `--memory 4G`, KMC `-m4`, FastK `-M4`), median of 3 runs on an Apple M5
+with 24 GB of memory:
+
+| | Wall time | CPU time | Peak memory |
+|---|---:|---:|---:|
+| kbolt | **76.2 s** | 601 s | 3.2 GiB |
+| KMC | 161.8 s | 811 s | 3.8 GiB |
+| FastK | 317.3 s | 1430 s | 5.9 GiB |
+
+kbolt is 2.1× faster than KMC and 4.2× faster than FastK, and stays furthest
+below the limit. Its first pass, about 27 s, waits on inflating the two gzip
+files, one thread per file.
+
+On a read set whose k-mers fit in memory (C. elegans SRR065390: two gzipped
+FASTQ files, 6.76 Gbp, 488 million distinct 31-mers), the margin is wider:
 
 ![Wall time, CPU time and peak memory of kbolt, KMC and FastK counting 31-mers in 6.76 Gbp of C. elegans reads](docs/benchmark.png)
-
-Counting canonical 31-mers at 8 threads (median of 3 runs, Apple M5 with 24 GB
-of memory):
 
 | | Wall time | CPU time | Peak memory |
 |---|---:|---:|---:|
@@ -24,13 +42,11 @@ of memory):
 kbolt is 3.2× faster than KMC and 4.2× faster than FastK, on less than half
 the CPU time and two thirds of the memory or less. kbolt and KMC report identical counts.
 
-Read sets whose k-mers do not fit in memory can be counted on disk with
-`--memory`, as KMC and FastK do. The same reads with every tool limited to
-2 GiB (kbolt `--memory 2G`, KMC `-m2`, FastK `-M2`), median of 3 runs:
+The same reads with every tool limited to 2 GiB, median of 3 runs:
 
 | | Wall time | CPU time | Peak memory |
 |---|---:|---:|---:|
-| kbolt | **12.1 s** | 88 s | 1.6 GiB |
+| kbolt | **11.7 s** | 84 s | 1.4 GiB |
 | KMC | 34.4 s | 198 s | 1.9 GiB |
 | FastK | 43.9 s | 192 s | 4.2 GiB |
 
@@ -193,11 +209,13 @@ ordinary hash maps.
 
 With `--memory`, counting takes two passes. The first cuts each read into
 super-k-mers, runs of neighbouring k-mers that share a minimizer, and appends
-them to one of 512 bins; every copy of a k-mer lands in the same bin. Bins
+them to one of 2048 bins; every copy of a k-mer lands in the same bin. Bins
 stay in memory while the limit allows and go to a temporary file after that.
 The second pass counts one bin at a time with the same tables and writes its
 k-mers out before the next, so memory follows the bins being counted, not the
-input. Reads overlap, so most super-k-mers of a read set occur many times;
+input. Each bin gets as many tables as its distinct k-mers need to stay in
+cache, and bins still in memory are moved to the file when the tables need
+the room. Reads overlap, so most super-k-mers of a read set occur many times;
 equal ones are merged first and their k-mers counted once, with the number of
 copies.
 
@@ -226,6 +244,11 @@ comparison after `python3 benches/reads.py --fetch` has downloaded the reads
 (5 GB); FastK comes from Homebrew and KMC from its GitHub releases. Add
 `--memory 0 2` to also run every tool with a 2 GiB limit. Redraw the
 chart with `uv run --no-project --with matplotlib python benches/plot_reads.py`.
+`--dataset na12878` does the same for the human reads (16 GB to download);
+`python3 benches/reads.py --dataset na12878 --memory 4 --tools kbolt kmc fastk
+--warmup 0` reruns the comparison above, and `benches/plot_reads.py --results
+target/compare/reads-results.json --output docs/benchmark-human.png` redraws
+its chart.
 `python3 benches/compare.py` reruns the small-input comparison (inputs from
 `benches/generate_inputs.py`), and `benches/plot_compare.py` plots its
 throughput against threads.

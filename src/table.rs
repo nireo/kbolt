@@ -775,25 +775,6 @@ impl CompactTable {
         Ok(true)
     }
 
-    /// Add `entry >> delta_shift` for each entry, whose low bits are a
-    /// remainder of this table, for a table that has left the cache since
-    /// its last burst whatever its size (see `crate::disk`). A burst that
-    /// will touch most of the table reads it into cache first; a sparser one
-    /// relies on each bucket being prefetched ahead of its update.
-    pub(crate) fn add_burst(&mut self, entries: &[u64], delta_shift: u32) -> Result<(), Error> {
-        if entries.len() >= self.buckets.len() / 4 {
-            self.read();
-        }
-        self.add_entries(entries, delta_shift)
-    }
-
-    /// Remove every key, keeping the allocated buckets for reuse.
-    pub(crate) fn clear(&mut self) {
-        self.buckets.fill(Bucket([0; SLOTS]));
-        self.overflow.clear();
-        self.len = 0;
-    }
-
     /// The remainder and count held by an occupied slot.
     #[inline(always)]
     fn entry(&self, slot: u64) -> (u64, u64) {
@@ -1167,21 +1148,9 @@ impl PackedCounts {
         })
     }
 
-    /// Remove every key, keeping the tables' allocations for reuse.
-    pub(crate) fn clear(&mut self) {
-        self.tables.iter_mut().for_each(CompactTable::clear);
-    }
-
+    #[cfg(test)]
     pub(crate) fn tables_mut(&mut self) -> &mut [CompactTable] {
         &mut self.tables
-    }
-
-    /// Bytes of bucket storage currently allocated.
-    pub(crate) fn bytes(&self) -> usize {
-        self.tables
-            .iter()
-            .map(|table| table.buckets() * std::mem::size_of::<Bucket>())
-            .sum()
     }
 
     /// Start counting a sequence of keys in order; see [`OrderedAdder`].

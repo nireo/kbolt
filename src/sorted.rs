@@ -328,14 +328,6 @@ impl Sorter {
         Ok(bucket.large)
     }
 
-    /// Hand every entry of `counts` to the sorter, from the calling thread.
-    pub(crate) fn feed(&self, counts: &PackedCounts, batch: &mut Batch) -> io::Result<()> {
-        for (key, count) in counts.entries() {
-            self.push(batch, key, count)?;
-        }
-        self.flush(batch)
-    }
-
     /// Hand every entry of `counts` to the sorter on `threads` threads,
     /// freeing each table as soon as its entries are in buckets: the
     /// buckets grow no faster than the tables shrink.

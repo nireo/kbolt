@@ -11,21 +11,22 @@
 //! written to one temporary file shared by all bins, their locations kept in
 //! memory.
 //!
-//! In the second phase each bin is counted on its own, by the same compact
-//! tables as in memory, and its k-mers are written out before the tables are
-//! reused for the next bin. Memory then follows the bins being counted at
-//! once, not the input: a bin is admitted only when its estimated tables fit
-//! in the remaining budget, and a bin too large for the whole budget is
-//! counted in several passes, each taking a slice of its k-mers.
+//! In the second phase each bin is counted on its own, by sorting rather
+//! than by hash tables (see [`Updates`]): every k-mer of the bin becomes an
+//! update, the updates are sorted by mixed key, and equal keys are summed as
+//! they are written out, already in the order the output wants. Memory then
+//! follows the bins being counted at once, not the input: a bin has at most
+//! one update per k-mer, it is admitted only when that many fit in the
+//! remaining budget, and a bin too large for the whole budget is counted in
+//! several passes, each taking a slice of its k-mers.
 //!
 //! Large inputs set three choices here. Bins are many, so that each thread's
-//! tables are a small part of the budget and every thread can count at once.
-//! A thread that would still wait for memory writes the blocks kept in memory
-//! of a bin not yet counted to the file instead, which frees their memory for
-//! tables. And a bin's k-mers are spread over as many tables as its estimated
-//! distinct k-mers call for, so that each table stays in cache however large
-//! the bins grow. The file is read back with a hint to the OS to read ahead,
-//! so that the threads rarely wait for the disk.
+//! updates are a small part of the budget and every thread can count at
+//! once; the largest are counted first, so that none is left for the end. A
+//! thread that would still wait for memory writes the blocks kept in memory
+//! of a bin not yet counted to the file instead, which frees their memory
+//! for updates. And the file is read back with a hint to the OS to read
+//! ahead, so that the threads rarely wait for the disk.
 //!
 //! Reads overlap, so at any depth of coverage most super-k-mers occur many
 //! times over. As a bin is read, equal records are merged in a hash table:
@@ -50,7 +51,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use crate::database::{self, KeyOrder};
 use crate::parallel::{ParallelCounter, ParallelInput};
 use crate::sorted::{self, Sorter};
-use crate::table::{Buckets, Layout, Load, Mixer, PackedCounts, key_bits};
+use crate::table::{Buckets, Mixer, key_bits};
 use crate::{ChunkSink, DNA_BASES, EncodedChunk, Error, StrandMode};
 
 /// Bins the input is split into; a power of two. With 512, a human genome
@@ -66,29 +67,12 @@ const MAX_BLOCK: usize = 256 * 1024;
 const MIN_BLOCK: usize = 64;
 /// Bytes a worker collects for a bin before taking the bin's lock.
 const LOCAL: usize = 1024;
-/// Distinct k-mers aimed at per table of a bin. A bin's k-mers are spread
-/// over a power of two of tables, enough that each holds about this many and
-/// is updated in the first-level cache: per k-mer, tables of 6000 keys cost
-/// half as much again as tables of 1500.
-const TABLE_KEYS: u64 = 1024;
-/// Bounds on the partition bits of a bin's tables. The update buffers grow
-/// with the number of tables, `8 * BURST` bytes each.
-const MIN_PARTITION_BITS: u32 = 6;
-const MAX_PARTITION_BITS: u32 = 12;
-/// Partition bits of the first bins, counted before any estimate is known.
-const FIRST_PARTITION_BITS: u32 = 10;
-/// Updates collected per table of a group before the group is applied.
-const BURST: usize = if cfg!(test) { 8 } else { 512 };
 /// Slots of a counting thread's table of repeated records: within an eighth
 /// of the memory limit between the threads.
 const MAX_REPEATS: usize = 1 << 20;
 /// Bins a thread counts without merging after one with few repeats.
 const UNMERGED: usize = if cfg!(test) { 1 } else { 7 };
 const MIN_REPEATS: usize = if cfg!(test) { 16 } else { 1 << 10 };
-/// Table bytes assumed per distinct k-mer when admitting a bin: 64-byte
-/// buckets of eight slots at 7/8 load with 1.5x growth steps (up to ~14 B/key,
-/// plus transient growth and partition-count overhead).
-const KEY_BYTES: u64 = 15;
 
 fn minimizer_length(k: usize) -> usize {
     if k >= 2 * MINIMIZER {
@@ -572,154 +556,234 @@ fn expand(
     })
 }
 
-/// One bin's count tables, with the updates collected for them.
+/// One bin's k-mers, counted by sorting.
 ///
 /// A k-mer is not counted when it is expanded. Its mixed key, with the
-/// number of occurrences to add above it, joins the updates of its group of
-/// tables; a full group is split by table, and each
-/// table then receives its updates in one burst while it sits in cache.
-/// Going through groups keeps every step to a few dozen sequential streams:
-/// scattering straight to a thousand tables would miss the cache on nearly
-/// every k-mer.
-struct Tables {
-    counts: PackedCounts,
+/// number of occurrences to add below it, is appended to one of `GROUPS`
+/// lists by the key's top bits: a few dozen sequential streams. Once the bin
+/// has been read, each list is sorted while it sits in cache, and equal keys
+/// are summed as they are visited in ascending order, the order in which the
+/// output wants them. In a bin whose repeated records are merged, most keys
+/// arrive once or twice, and sorting a few updates per key costs less than
+/// probing a hash table for each and sorting the table again for output.
+struct Updates {
     mixer: Mixer,
-    layout: Layout,
-    /// Tables in a group, and the key bits below a group's index.
-    grouped: usize,
-    group_shift: u32,
-    /// Room for `grouped * BURST` updates per group, and how many are there.
-    pending: Vec<u64>,
+    /// Updates by group: the key bits below the group index, then the
+    /// weight. Group `g` fills `arena[g * room..(g + 1) * room]`, and any
+    /// more go to `overflow[g]`. The arena is mapped, so its memory returns
+    /// to the OS as soon as it is dropped.
+    arena: Buckets<u64>,
+    room: usize,
     filled: Vec<usize>,
-    /// Scratch for splitting a group's updates by table.
-    split: Vec<u64>,
-    ends: Vec<usize>,
+    overflow: Vec<Vec<u64>>,
+    /// Key bits below the group index, and the bits left for the weight.
+    low_bits: u32,
+    weight_bits: u32,
+    /// A group's updates once sorted, and the bucket counts for sorting.
+    sorted: Buckets<u64>,
+    buckets: Vec<u32>,
 }
 
-impl Tables {
-    /// Tables for `k`-mers over about `2^partition_bits` partitions.
-    fn new(k: usize, partition_bits: u32) -> Result<Self, Error> {
-        let counts = PackedCounts::with_capacity(k, partition_bits, 0, Load::Dense)?;
-        let layout = counts.layout();
-        let table_bits = counts.tables().len().trailing_zeros();
-        let grouped = 1_usize << (table_bits - table_bits / 2);
-        let groups = counts.tables().len() / grouped;
-        Ok(Self {
-            mixer: counts.mixer(),
-            layout,
-            counts,
-            grouped,
-            group_shift: layout.remainder_bits + grouped.trailing_zeros(),
-            pending: vec![0; groups * grouped * BURST],
-            filled: vec![0; groups],
-            split: Vec::new(),
-            ends: Vec::new(),
-        })
+/// Groups of updates of one bin; a power of two.
+const GROUPS: usize = 64;
+/// Updates per bucket when a group is sorted, on average.
+const UPDATES_PER_BUCKET: usize = 4;
+
+impl Updates {
+    fn new(k: usize) -> Self {
+        let bits = key_bits(k);
+        // Every key keeps at least one bit below its group, and the weight
+        // at least one bit.
+        let group_bits = GROUPS.trailing_zeros().min(bits - 1);
+        let low_bits = bits - group_bits;
+        Self {
+            mixer: Mixer::new(bits, crate::table::SEED),
+            arena: Buckets::new(),
+            room: 0,
+            filled: vec![0; 1 << group_bits],
+            overflow: (0..1 << group_bits).map(|_| Vec::new()).collect(),
+            low_bits,
+            weight_bits: 64 - low_bits,
+            sorted: Buckets::new(),
+            buckets: Vec::new(),
+        }
+    }
+
+    /// Make room for `updates` updates, spread evenly over the groups.
+    fn reserve(&mut self, updates: u64) -> io::Result<()> {
+        let groups = self.filled.len();
+        let room = usize::try_from(updates / groups as u64 * 9 / 8 + 64).unwrap_or(usize::MAX);
+        if room > self.room {
+            self.arena = Buckets::new();
+            self.arena = Buckets::zeroed(room * groups).map_err(io::Error::other)?;
+            self.room = room;
+        }
+        Ok(())
     }
 
     /// Count `weight` (at least one) occurrences of the k-mer whose mixed
     /// key is `mixed`.
     #[inline(always)]
-    fn push(&mut self, mixed: u64, mut weight: u64) -> Result<(), Error> {
-        let capacity = self.grouped * BURST;
-        // The group index leaves at least two bits above the rest of the key
-        // (a 64-bit key always has group bits), which hold the weight.
-        let group = (mixed >> self.group_shift) as usize;
-        let (low, heaviest) = (
-            mixed ^ ((group as u64) << self.group_shift),
-            u64::MAX >> self.group_shift,
-        );
-        loop {
-            let part = weight.min(heaviest);
-            let filled = self.filled[group];
-            self.pending[group * capacity + filled] = (part << self.group_shift) | low;
+    fn push(&mut self, mixed: u64, mut weight: u64) {
+        let group = (mixed >> self.low_bits) as usize;
+        // The group bits leave at the top.
+        let key = mixed << self.weight_bits;
+        let heaviest = u64::MAX >> self.low_bits;
+        while weight > heaviest {
+            self.push_one(group, key | heaviest);
+            weight -= heaviest;
+        }
+        self.push_one(group, key | weight);
+    }
+
+    #[inline(always)]
+    fn push_one(&mut self, group: usize, update: u64) {
+        let filled = self.filled[group];
+        if filled < self.room {
+            self.arena[group * self.room + filled] = update;
             self.filled[group] = filled + 1;
-            if filled + 1 == capacity {
-                self.apply(group)?;
-            }
-            weight -= part;
-            if weight == 0 {
-                return Ok(());
-            }
+        } else {
+            self.overflow[group].push(update);
         }
     }
 
-    #[inline(never)]
-    fn apply(&mut self, group: usize) -> Result<(), Error> {
-        let capacity = self.grouped * BURST;
-        let filled = std::mem::take(&mut self.filled[group]);
-        let (shift, mask) = (self.layout.remainder_bits, self.grouped - 1);
-        crate::table::add_split(
-            &mut self.counts.tables_mut()[group * self.grouped..(group + 1) * self.grouped],
-            &self.pending[group * capacity..group * capacity + filled],
-            &mut self.split,
-            &mut self.ends,
-            |entry| (entry >> shift) as usize & mask,
-            |table, updates| table.add_burst(updates, self.group_shift),
-        )
-    }
-
-    /// Apply every collected update.
-    fn finish(&mut self) -> Result<(), Error> {
-        (0..self.filled.len()).try_for_each(|group| self.apply(group))
-    }
-
-    /// The partitions `Tables::new(k, partition_bits)` makes.
-    fn partitions(k: usize, partition_bits: u32) -> usize {
-        1 << crate::table::partition_bits(key_bits(k), partition_bits)
-    }
-
-    /// Fixed bytes of the update buffer (`pending`) of such tables.
-    fn pending_bytes(k: usize, partition_bits: u32) -> u64 {
-        (Self::partitions(k, partition_bits) * BURST * std::mem::size_of::<u64>()) as u64
-    }
-
-    /// Partition bits for tables of about `distinct` k-mers: enough for
-    /// `TABLE_KEYS` per table, as long as the update buffer stays within
-    /// `pending` bytes.
-    fn partition_bits(k: usize, distinct: u64, pending: u64) -> u32 {
-        let mut bits = (distinct / TABLE_KEYS)
-            .max(1)
-            .next_power_of_two()
-            .trailing_zeros()
-            .clamp(MIN_PARTITION_BITS, MAX_PARTITION_BITS);
-        while bits > MIN_PARTITION_BITS && Self::pending_bytes(k, bits) > pending {
-            bits -= 1;
+    /// Visit every distinct k-mer with its count, in ascending order of the
+    /// mixed key, and empty the bin. Returns the number visited.
+    fn drain(&mut self, mut visit: impl FnMut(u64, u64) -> io::Result<()>) -> io::Result<u64> {
+        let (low_bits, weight_bits) = (self.low_bits, self.weight_bits);
+        let weight_mask = u64::MAX >> low_bits;
+        let mut distinct = 0;
+        for group in 0..self.filled.len() {
+            let start = group * self.room;
+            let (stored, extra) = (
+                &self.arena[start..start + self.filled[group]],
+                &self.overflow[group],
+            );
+            let length = stored.len() + extra.len();
+            if self.sorted.len() < length {
+                self.sorted = Buckets::new();
+                self.sorted = Buckets::zeroed(length + length / 4).map_err(io::Error::other)?;
+            }
+            let list = &mut self.sorted[..length];
+            sort_updates(stored, extra, list, &mut self.buckets);
+            let base = (group as u64) << low_bits;
+            let mut at = 0;
+            while at < list.len() {
+                let key = list[at] >> weight_bits;
+                let mut count = list[at] & weight_mask;
+                at += 1;
+                while at < list.len() && list[at] >> weight_bits == key {
+                    count += list[at] & weight_mask;
+                    at += 1;
+                }
+                visit(base | key, count)?;
+                distinct += 1;
+            }
         }
-        bits
+        self.clear();
+        Ok(distinct)
     }
 
-    /// Bytes currently allocated by these tables and their update buffers.
+    fn clear(&mut self) {
+        self.filled.fill(0);
+        for overflow in &mut self.overflow {
+            // Overflow is rare; do not keep its memory.
+            *overflow = Vec::new();
+        }
+    }
+
+    /// Bytes allocated for updates and scratch.
     fn bytes(&self) -> u64 {
-        self.counts.bytes() as u64
-            + ((self.pending.capacity() + self.split.capacity()) * std::mem::size_of::<u64>())
-                as u64
+        let overflow: usize = self.overflow.iter().map(Vec::capacity).sum();
+        (8 * (self.arena.len() + self.sorted.len() + overflow) + 4 * self.buckets.capacity())
+            as u64
+    }
+
+    /// Bytes to reserve for a bin of `updates` updates at most.
+    fn needed(updates: u64) -> u64 {
+        // The updates with room to spare, and the largest group sorted.
+        updates.saturating_mul(9) + updates / GROUPS as u64 * 12 + (64 << 10)
+    }
+}
+
+/// Sort the updates of `stored` and `extra` into `sorted`, as long as both:
+/// by their top bits into buckets of a few updates each, then by insertion,
+/// which on nearly sorted updates costs about one comparison each. A bucket
+/// far larger than the rest (many copies of one k-mer with different
+/// weights) is sorted on its own.
+fn sort_updates(stored: &[u64], extra: &[u64], sorted: &mut [u64], counts: &mut Vec<u32>) {
+    let length = sorted.len();
+    if length <= 32 {
+        sorted[..stored.len()].copy_from_slice(stored);
+        sorted[stored.len()..].copy_from_slice(extra);
+        insertion_sort(sorted);
+        return;
+    }
+    let bits = (length / UPDATES_PER_BUCKET).next_power_of_two().trailing_zeros().min(20);
+    let shift = 64 - bits;
+    counts.clear();
+    counts.resize((1 << bits) + 1, 0);
+    for &update in stored.iter().chain(extra) {
+        counts[(update >> shift) as usize + 1] += 1;
+    }
+    let largest = counts.iter().copied().max().unwrap_or(0) as usize;
+    for index in 0..1 << bits {
+        counts[index + 1] += counts[index];
+    }
+    for &update in stored.iter().chain(extra) {
+        let bucket = (update >> shift) as usize;
+        sorted[counts[bucket] as usize] = update;
+        counts[bucket] += 1;
+    }
+    if largest <= 64 {
+        insertion_sort(sorted);
+        return;
+    }
+    // `counts[bucket]` is now where the bucket ends.
+    let mut begin = 0;
+    for &end in &counts[..1 << bits] {
+        sorted[begin..end as usize].sort_unstable();
+        begin = end as usize;
+    }
+}
+
+#[inline(always)]
+fn insertion_sort(values: &mut [u64]) {
+    for index in 1..values.len() {
+        let value = values[index];
+        let mut at = index;
+        while at > 0 && values[at - 1] > value {
+            values[at] = values[at - 1];
+            at -= 1;
+        }
+        values[at] = value;
     }
 }
 
 struct BudgetState {
-    /// Bytes currently available for active and pooled tables. Grows as
+    /// Bytes currently available for active and pooled updates. Grows as
     /// in-memory bin blocks are freed during pass 2.
     limit: u64,
     /// Bytes reserved by currently active workers.
     reserved: u64,
-    /// Cleared tables awaiting reuse by the next worker. Keeping tables in a
+    /// Emptied updates awaiting reuse by the next worker. Keeping them in a
     /// shared pool prevents idle threads waiting for budget from holding onto
-    /// grown bucket allocations.
-    pool: Vec<Tables>,
+    /// grown allocations.
+    pool: Vec<Updates>,
 }
 
-/// Table memory and reusable [`Tables`] shared by the counting workers.
+/// Memory for updates, and reusable [`Updates`], shared by the counting
+/// workers.
 struct Budget {
     max_limit: u64,
     state: Mutex<BudgetState>,
     released: Condvar,
 }
 
-/// An active worker's leased [`Tables`] and its reservation in [`Budget`].
+/// An active worker's leased [`Updates`] and its reservation in [`Budget`].
 struct Lease<'a> {
     budget: &'a Budget,
-    tables: Option<Tables>,
+    updates: Option<Updates>,
     reserved: u64,
 }
 
@@ -738,36 +802,31 @@ impl Budget {
         }
     }
 
-    /// Wait until room for `needed` bytes is free, returning a leased [`Tables`]
-    /// (reused from the pool when one fits, or freshly allocated). Evicts
-    /// pooled tables before blocking so idle memory is returned to the OS.
+    /// Wait until room for `needed` bytes is free, returning leased
+    /// [`Updates`] (reused from the pool when they fit, or new). Evicts
+    /// pooled ones before blocking so idle memory is returned to the OS.
     /// Before blocking, `free` is called without the lock held; it may make
     /// room (returning true, and crediting what it freed) instead of waiting.
     fn acquire(
         &self,
         k: usize,
-        partition_bits: u32,
         needed: u64,
         mut free: impl FnMut() -> io::Result<bool>,
     ) -> io::Result<Lease<'_>> {
-        // Only tables of the same shape are reused; others are evicted.
-        let partitions = Tables::partitions(k, partition_bits);
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let mut can_free = true;
         let (reused, reserved) = loop {
-            let total_pool: u64 = state.pool.iter().map(Tables::bytes).sum();
+            let total_pool: u64 = state.pool.iter().map(Updates::bytes).sum();
             let candidate = state
                 .pool
                 .iter()
                 .enumerate()
                 .filter(|(_, t)| {
                     let bytes = t.bytes();
-                    t.counts.tables().len() == partitions
-                        && bytes <= needed.saturating_mul(2)
-                        && bytes <= state.limit
+                    bytes <= needed.saturating_mul(2) && bytes <= state.limit
                 })
                 .max_by_key(|(_, t)| t.bytes())
                 .map(|(index, _)| index);
@@ -782,28 +841,25 @@ impl Budget {
                 None => (needed.min(state.limit), total_pool),
             };
             if state.reserved + other_pool + want <= state.limit {
-                let tables = candidate.map(|index| state.pool.swap_remove(index));
+                let updates = candidate.map(|index| state.pool.swap_remove(index));
                 state.reserved += want;
-                break (tables, want);
+                break (updates, want);
             }
             if state.reserved == 0 {
                 // Always allow at least one worker to make progress even under
-                // tiny memory limits, reusing an idle empty table if present.
-                let tables = if state.pool.len() == 1
-                    && state.pool[0].counts.bytes() <= 16 * 1024
-                    && state.pool[0].counts.tables().len() == partitions
-                {
+                // tiny memory limits, reusing idle empty updates if present.
+                let updates = if state.pool.len() == 1 && state.pool[0].bytes() <= 16 * 1024 {
                     Some(state.pool.swap_remove(0))
                 } else {
                     None
                 };
-                if tables.is_some() || state.pool.is_empty() {
+                if updates.is_some() || state.pool.is_empty() {
                     state.reserved += want;
-                    break (tables, want);
+                    break (updates, want);
                 }
             }
             if !state.pool.is_empty() {
-                // Evict the largest idle table not selected as our candidate
+                // Evict the largest idle updates not selected as our candidate
                 // (or the candidate itself if nothing else remains).
                 let evict = state
                     .pool
@@ -824,7 +880,7 @@ impl Budget {
             }
             if can_free {
                 // Whether or not this frees anything, look again under the
-                // lock: a worker may have released its tables meanwhile.
+                // lock: a worker may have released its updates meanwhile.
                 drop(state);
                 can_free = free()?;
                 state = self
@@ -839,24 +895,18 @@ impl Budget {
                 .unwrap_or_else(|poison| poison.into_inner());
         };
         drop(state);
-        let tables = match reused {
-            Some(tables) => tables,
-            None => match Tables::new(k, partition_bits) {
-                Ok(tables) => tables,
-                Err(error) => {
-                    self.release_raw(None, reserved, 0);
-                    return Err(io::Error::other(error));
-                }
-            },
+        let updates = match reused {
+            Some(updates) => updates,
+            None => Updates::new(k),
         };
         Ok(Lease {
             budget: self,
-            tables: Some(tables),
+            updates: Some(updates),
             reserved,
         })
     }
 
-    fn release_raw(&self, tables: Option<Tables>, reserved: u64, freed_bin_bytes: u64) {
+    fn release_raw(&self, updates: Option<Updates>, reserved: u64, freed_bin_bytes: u64) {
         let mut evicted = None;
         {
             let mut state = self
@@ -868,13 +918,14 @@ impl Budget {
                 .limit
                 .saturating_add(freed_bin_bytes)
                 .min(self.max_limit);
-            if let Some(tables) = tables {
-                let total_pool: u64 = state.pool.iter().map(Tables::bytes).sum();
-                let tiny_fallback = state.pool.is_empty() && tables.counts.bytes() <= 16 * 1024;
-                if state.reserved + total_pool + tables.bytes() <= state.limit || tiny_fallback {
-                    state.pool.push(tables);
+            if let Some(mut updates) = updates {
+                updates.clear();
+                let total_pool: u64 = state.pool.iter().map(Updates::bytes).sum();
+                let tiny_fallback = state.pool.is_empty() && updates.bytes() <= 16 * 1024;
+                if state.reserved + total_pool + updates.bytes() <= state.limit || tiny_fallback {
+                    state.pool.push(updates);
                 } else {
-                    evicted = Some(tables);
+                    evicted = Some(updates);
                 }
             }
             self.released.notify_all();
@@ -899,28 +950,25 @@ impl Budget {
 }
 
 impl Lease<'_> {
-    fn tables(&mut self) -> &mut Tables {
-        self.tables.as_mut().expect("active lease holds tables")
+    fn updates(&mut self) -> &mut Updates {
+        self.updates.as_mut().expect("active lease holds updates")
     }
 
-    /// Return the cleared tables to the pool (or drop them if over budget)
-    /// and credit any freed in-memory bin bytes to the budget limit.
+    /// Return the updates to the pool (or drop them if over budget) and
+    /// credit any freed in-memory bin bytes to the budget limit.
     fn release(mut self, freed_bin_bytes: u64) {
-        if let Some(tables) = self.tables.as_mut() {
-            tables.counts.clear();
-        }
-        let tables = self.tables.take();
+        let updates = self.updates.take();
         let reserved = std::mem::replace(&mut self.reserved, 0);
-        self.budget.release_raw(tables, reserved, freed_bin_bytes);
+        self.budget.release_raw(updates, reserved, freed_bin_bytes);
     }
 }
 
 impl Drop for Lease<'_> {
     fn drop(&mut self) {
-        if self.reserved > 0 || self.tables.is_some() {
-            let tables = self.tables.take();
+        if self.reserved > 0 || self.updates.is_some() {
+            let updates = self.updates.take();
             let reserved = std::mem::replace(&mut self.reserved, 0);
-            self.budget.release_raw(tables, reserved, 0);
+            self.budget.release_raw(updates, reserved, 0);
         }
     }
 }
@@ -1093,8 +1141,21 @@ impl DiskCounts {
         if self.sorted {
             return self.count_sorted(&mut writer, sorted::tsv_rows(k), |_, _| Ok(()));
         }
-        self.count(&mut writer, 0, |counts, writer| {
-            crate::write_packed64_tsv(counts.entries(), k, writer)
+        self.count(&mut writer, 0, |updates, writer| {
+            let mixer = updates.mixer;
+            let mut batch = [0; 16 * 1024];
+            let mut offset = 0;
+            let distinct = updates.drain(|mixed, count| {
+                if offset + 32 + 22 > batch.len() {
+                    writer.write_all(&batch[..offset])?;
+                    offset = 0;
+                }
+                batch[offset..offset + 32].copy_from_slice(&crate::decode_packed32(mixer.unmix(mixed), k));
+                offset = crate::push_count(&mut batch, offset + k, count);
+                Ok(())
+            })?;
+            writer.write_all(&batch[..offset])?;
+            Ok(distinct)
         })
     }
 
@@ -1116,8 +1177,11 @@ impl DiskCounts {
         let start = writer.stream_position()?;
         let header = |entries| database::header(k, strand, KeyOrder::Hash, false, entries);
         writer.write_all(&header(0))?;
-        let distinct = self.count(&mut writer, 0, |counts, writer| {
-            database::write_hash_sections(counts, 0, counts.tables().len(), writer)
+        let distinct = self.count(&mut writer, 0, |updates, writer| {
+            let mut sections = database::SectionWriter::new(writer);
+            let distinct = updates.drain(|mixed, count| sections.ascending(mixed, count))?;
+            sections.finish()?;
+            Ok(distinct)
         })?;
         let end = writer.stream_position()?;
         writer.seek(SeekFrom::Start(start))?;
@@ -1146,36 +1210,39 @@ impl DiskCounts {
             self.threads,
             &self.directory,
         )?;
-        let distinct = self.count(
-            writer,
-            self.memory / 8,
-            |counts, _| sorter.feed(counts, &mut sorted::Batch::default()),
-        )?;
+        let distinct = self.count(writer, self.memory / 8, |updates, _| {
+            let mixer = updates.mixer;
+            let mut batch = sorted::Batch::default();
+            let distinct =
+                updates.drain(|mixed, count| sorter.push(&mut batch, mixer.unmix(mixed), count))?;
+            sorter.flush(&mut batch)?;
+            Ok(distinct)
+        })?;
         begin(distinct, writer)?;
         sorter.write(self.threads, writer, encode)?;
         Ok(distinct)
     }
 
-    /// Write the blocks still in memory of the last bin not yet taken to the
-    /// temporary file, and give their memory to the count tables. Returns
-    /// false once no bin is left to spill.
+    /// Write the blocks still in memory of the last bin in order not yet
+    /// taken to the temporary file, and give their memory to the updates.
+    /// Returns false once no bin is left to spill.
     ///
-    /// Blocks kept in memory spare the disk only while the tables have room:
-    /// counting a large input needs every byte for tables, and a thread that
+    /// Blocks kept in memory spare the disk only while the updates have room:
+    /// counting a large input needs every byte for updates, and a thread that
     /// would wait for memory does better to write blocks out than to idle.
     fn spill_held(&self, progress: &Progress, budget: &Budget) -> io::Result<bool> {
         while let Ok(spilled) =
             progress
                 .spilled
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |spilled| {
-                    (spilled < self.bins.len()).then_some(spilled + 1)
+                    (spilled < progress.order.len()).then_some(spilled + 1)
                 })
         {
-            let index = self.bins.len() - 1 - spilled;
-            if index < progress.next.load(Ordering::Relaxed) {
+            let position = progress.order.len() - 1 - spilled;
+            if position < progress.next.load(Ordering::Relaxed) {
                 break;
             }
-            let mut bin = self.bins[index]
+            let mut bin = self.bins[progress.order[position]]
                 .lock()
                 .map_err(|_| io::Error::other("poisoned"))?;
             let freed = Self::bin_bytes(&bin);
@@ -1210,11 +1277,12 @@ impl DiskCounts {
 
     /// Count bins on `threads` threads, encoding each with `encode` and
     /// writing the encoded chunks, in no particular order, from this thread.
+    /// `encode` drains a bin's updates and returns its distinct k-mers.
     fn count(
         &self,
         writer: &mut dyn Write,
         extra_reserved: u64,
-        encode: impl Fn(&PackedCounts, &mut dyn Write) -> io::Result<()> + Sync,
+        encode: impl Fn(&mut Updates, &mut dyn Write) -> io::Result<u64> + Sync,
     ) -> io::Result<u64> {
         // An eighth of the memory, between the threads, merges equal records.
         let repeat_slots = usize::try_from(self.memory / 8).unwrap_or(usize::MAX)
@@ -1247,7 +1315,19 @@ impl DiskCounts {
             .min(max_limit)
             .max(1);
         let budget = Budget::new(initial_limit, max_limit);
-        let progress = Progress::default();
+        // The largest bins first, so that no large one is left for the end
+        // while the other threads idle.
+        let mut order: Vec<(u64, usize)> = self
+            .bins
+            .iter()
+            .enumerate()
+            .map(|(index, bin)| (bin.lock().map_or(0, |bin| bin.kmers), index))
+            .collect();
+        order.sort_unstable_by(|a, b| b.cmp(a));
+        let progress = Progress {
+            order: order.into_iter().map(|(_, index)| index).collect(),
+            ..Progress::default()
+        };
         let (sender, receiver) = crossbeam_channel::bounded::<EncodedChunk>(2 * self.threads);
         let (recycle, recycled) = crossbeam_channel::unbounded::<Vec<u8>>();
         std::thread::scope(|scope| {
@@ -1291,17 +1371,16 @@ impl DiskCounts {
         budget: &Budget,
         progress: &Progress,
         repeat_slots: usize,
-        encode: &(impl Fn(&PackedCounts, &mut dyn Write) -> io::Result<()> + Sync),
+        encode: &(impl Fn(&mut Updates, &mut dyn Write) -> io::Result<u64> + Sync),
         sender: &crossbeam_channel::Sender<EncodedChunk>,
         recycled: &crossbeam_channel::Receiver<Vec<u8>>,
     ) -> io::Result<()> {
-        // Update buffers take at most a quarter of the tables' memory.
-        let pending = budget.max_limit / 4 / self.threads as u64;
         let mut repeats = Repeats::new(repeat_slots)?;
         // Bins this thread still counts without merging; see below.
         let mut unmerged = 0;
         let mut block = Vec::new();
-        while let Some(bin) = self.bins.get(progress.next.fetch_add(1, Ordering::Relaxed)) {
+        while let Some(&index) = progress.order.get(progress.next.fetch_add(1, Ordering::Relaxed)) {
+            let bin = &self.bins[index];
             // Taking the bin frees its blocks once it has been counted.
             let bin = std::mem::take(&mut *bin.lock().map_err(|_| io::Error::other("poisoned"))?);
             let freed_bin_bytes = Self::bin_bytes(&bin);
@@ -1311,28 +1390,21 @@ impl DiskCounts {
                 continue;
             }
             let bin_kmers = bin.kmers;
-            let distinct = progress.estimate(bin_kmers);
-            // A bin too large for the whole budget is counted in passes, each
-            // taking the k-mers whose mixed key falls in one residue class.
-            let passes = distinct.saturating_mul(KEY_BYTES).div_ceil(budget.max_limit);
-            let distinct = distinct / passes;
-            // Before any bin is counted the estimate is only a bound.
-            let bits = if progress.kmers.load(Ordering::Relaxed) == 0 {
-                FIRST_PARTITION_BITS
-            } else {
-                Tables::partition_bits(self.k, distinct, pending)
-            };
-            let needed = distinct
-                .saturating_mul(KEY_BYTES)
-                .saturating_add(Tables::pending_bytes(self.k, bits));
+            // A bin has at most one update per k-mer. One too large for the
+            // whole budget is counted in passes, each taking the k-mers whose
+            // mixed key falls in one residue class.
+            let passes = Updates::needed(bin_kmers).div_ceil(budget.max_limit);
+            let updates_per_pass = bin_kmers.div_ceil(passes);
+            let needed = Updates::needed(updates_per_pass);
             let mut lease =
-                budget.acquire(self.k, bits, needed, || self.spill_held(progress, budget))?;
+                budget.acquire(self.k, needed, || self.spill_held(progress, budget))?;
             // Its blocks in the file are read while those in memory are counted.
             for &(offset, len) in &bin.written {
                 self.spill.advise(offset, len);
             }
-            let tables = lease.tables();
-            let mixer = tables.mixer;
+            let updates = lease.updates();
+            updates.reserve(updates_per_pass)?;
+            let mixer = updates.mixer;
             for pass in 0..passes {
                 let mut count = |record: &[u8], copies: u64| {
                     expand(
@@ -1342,7 +1414,7 @@ impl DiskCounts {
                         |key| {
                             let mixed = mixer.mix(key);
                             if passes == 1 || mixed % passes == pass {
-                                tables.push(mixed, copies)?;
+                                updates.push(mixed, copies);
                             }
                             Ok(())
                         },
@@ -1366,18 +1438,14 @@ impl DiskCounts {
                 repeats
                     .drain(self.k, &mut count)
                     .map_err(io::Error::other)?;
-                tables.finish().map_err(io::Error::other)?;
                 let mut sink = ChunkSink {
                     buffer: recycled.try_recv().unwrap_or_default(),
                     sender,
                     recycled,
                 };
-                encode(&tables.counts, &mut sink)?;
+                let distinct = encode(updates, &mut sink)?;
                 sink.finish()?;
-                progress
-                    .distinct
-                    .fetch_add(tables.counts.len() as u64, Ordering::Relaxed);
-                tables.counts.clear();
+                progress.distinct.fetch_add(distinct, Ordering::Relaxed);
             }
             drop(bin);
             lease.release(freed_bin_bytes);
@@ -1533,24 +1601,13 @@ impl Repeats {
 /// Bins handed out and counted so far.
 #[derive(Default)]
 struct Progress {
+    /// Bins in the order they are counted, and how many have been taken.
+    order: Vec<usize>,
     next: AtomicUsize,
-    /// Bins, from the last, whose blocks have been written out.
+    /// Bins, from the last in order, whose blocks have been written out.
     spilled: AtomicUsize,
     kmers: AtomicU64,
     distinct: AtomicU64,
-}
-
-impl Progress {
-    /// Distinct k-mers expected among `kmers`, from the ratio in the bins
-    /// counted so far with a quarter added; all of them before any is known.
-    fn estimate(&self, kmers: u64) -> u64 {
-        let counted = self.kmers.load(Ordering::Relaxed);
-        if counted == 0 {
-            return kmers.max(1);
-        }
-        let distinct = self.distinct.load(Ordering::Relaxed) as f64 * 1.25;
-        ((kmers as f64 * (distinct / counted as f64).min(1.0)) as u64).max(1)
-    }
 }
 
 #[cfg(test)]
@@ -1658,8 +1715,15 @@ mod tests {
         let before = counts.temporary_bytes();
         let mut tsv = Vec::new();
         let distinct = counts
-            .count(&mut tsv, 0, |counts, writer| {
-                crate::write_packed64_tsv(counts.entries(), k, writer)
+            .count(&mut tsv, 0, |updates, writer| {
+                let mixer = updates.mixer;
+                let mut rows = Vec::new();
+                let distinct = updates.drain(|mixed, count| {
+                    rows.push((mixer.unmix(mixed), count));
+                    Ok(())
+                })?;
+                crate::write_packed64_tsv(rows.into_iter(), k, writer)?;
+                Ok(distinct)
             })
             .unwrap();
         assert!(

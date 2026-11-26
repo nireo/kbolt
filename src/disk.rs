@@ -18,6 +18,15 @@
 //! in the remaining budget, and a bin too large for the whole budget is
 //! counted in several passes, each taking a slice of its k-mers.
 //!
+//! Large inputs set three choices here. Bins are many, so that each thread's
+//! tables are a small part of the budget and every thread can count at once.
+//! A thread that would still wait for memory writes the blocks kept in memory
+//! of a bin not yet counted to the file instead, which frees their memory for
+//! tables. And a bin's k-mers are spread over as many tables as its estimated
+//! distinct k-mers call for, so that each table stays in cache however large
+//! the bins grow. The file is read back with a hint to the OS to read ahead,
+//! so that the threads rarely wait for the disk.
+//!
 //! Reads overlap, so at any depth of coverage most super-k-mers occur many
 //! times over. As a bin is read, equal records are merged in a hash table:
 //! each distinct record is expanded once, and its k-mers counted with the
@@ -41,11 +50,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use crate::database::{self, KeyOrder};
 use crate::parallel::{ParallelCounter, ParallelInput};
 use crate::sorted::{self, Sorter};
-use crate::table::{Layout, Load, Mixer, PackedCounts, key_bits};
+use crate::table::{Buckets, Layout, Load, Mixer, PackedCounts, key_bits};
 use crate::{ChunkSink, DNA_BASES, EncodedChunk, Error, StrandMode};
 
-/// Bins the input is split into; a power of two.
-const BINS: usize = 512;
+/// Bins the input is split into; a power of two. With 512, a human genome
+/// at 4 GiB left most threads waiting for memory.
+const BINS: usize = 2048;
 /// Longest minimizer. Shorter k use half their length.
 const MINIMIZER: usize = 11;
 /// Most k-mers in one super-k-mer, so that the count fits its header.
@@ -55,11 +65,18 @@ const MAX_BLOCK: usize = 256 * 1024;
 /// The smallest block: more than the longest record.
 const MIN_BLOCK: usize = 64;
 /// Bytes a worker collects for a bin before taking the bin's lock.
-const LOCAL: usize = 4 * 1024;
-/// Partition bits of a bin's tables. A bin's k-mers are spread over this many
-/// tables so that each is small enough to be updated in cache, as in
-/// `crate::parallel`.
-const PARTITION_BITS: u32 = 10;
+const LOCAL: usize = 1024;
+/// Distinct k-mers aimed at per table of a bin. A bin's k-mers are spread
+/// over a power of two of tables, enough that each holds about this many and
+/// is updated in the first-level cache: per k-mer, tables of 6000 keys cost
+/// half as much again as tables of 1500.
+const TABLE_KEYS: u64 = 1024;
+/// Bounds on the partition bits of a bin's tables. The update buffers grow
+/// with the number of tables, `8 * BURST` bytes each.
+const MIN_PARTITION_BITS: u32 = 6;
+const MAX_PARTITION_BITS: u32 = 12;
+/// Partition bits of the first bins, counted before any estimate is known.
+const FIRST_PARTITION_BITS: u32 = 10;
 /// Updates collected per table of a group before the group is applied.
 const BURST: usize = if cfg!(test) { 8 } else { 512 };
 /// Slots of a counting thread's table of repeated records: within an eighth
@@ -69,8 +86,9 @@ const MAX_REPEATS: usize = 1 << 20;
 const UNMERGED: usize = if cfg!(test) { 1 } else { 7 };
 const MIN_REPEATS: usize = if cfg!(test) { 16 } else { 1 << 10 };
 /// Table bytes assumed per distinct k-mer when admitting a bin: 64-byte
-/// buckets of eight slots at most 7/8 full, plus room left by growth steps.
-const KEY_BYTES: u64 = 12;
+/// buckets of eight slots at 7/8 load with 1.5x growth steps (up to ~14 B/key,
+/// plus transient growth and partition-count overhead).
+const KEY_BYTES: u64 = 15;
 
 fn minimizer_length(k: usize) -> usize {
     if k >= 2 * MINIMIZER {
@@ -150,6 +168,37 @@ impl Spill {
         Ok(offset)
     }
 
+    /// Ask the OS to start reading `len` bytes at `offset` into its cache,
+    /// so that a later [`Spill::read`] of them need not wait for the disk.
+    /// Only a hint: failures are ignored, and some systems ignore it.
+    pub(crate) fn advise(&self, offset: u64, len: u32) {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            let advice = libc::radvisory {
+                ra_offset: offset as libc::off_t,
+                ra_count: len as libc::c_int,
+            };
+            // SAFETY: F_RDADVISE reads the struct and nothing else.
+            unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_RDADVISE, &advice) };
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: a plain advisory call on an open descriptor.
+            unsafe {
+                libc::posix_fadvise(
+                    self.file.as_raw_fd(),
+                    offset as libc::off_t,
+                    libc::off_t::from(len),
+                    libc::POSIX_FADV_WILLNEED,
+                )
+            };
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let _ = (offset, len);
+    }
+
     pub(crate) fn read(&self, bytes: &mut [u8], offset: u64) -> io::Result<()> {
         #[cfg(unix)]
         return std::os::unix::fs::FileExt::read_exact_at(&self.file, bytes, offset);
@@ -172,13 +221,59 @@ impl Drop for Spill {
     }
 }
 
+/// One block of super-k-mer records, backed by [`Buckets`] so large blocks
+/// return their memory directly to the OS when a bin is dropped.
+struct Block {
+    data: Buckets<u8>,
+    len: usize,
+}
+
+impl Default for Block {
+    fn default() -> Self {
+        Self {
+            data: Buckets::new(),
+            len: 0,
+        }
+    }
+}
+
+impl Block {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn capacity(&self) -> usize {
+        self.data.len()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.data[..self.len]
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn ensure_capacity(&mut self, capacity: usize) -> Result<(), Error> {
+        if self.data.is_empty() {
+            self.data = Buckets::zeroed(capacity)?;
+        }
+        Ok(())
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.data[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+    }
+}
+
 /// One bin's records, as blocks of whole records in no particular order.
 #[derive(Default)]
 struct Bin {
     /// The block being filled.
-    open: Vec<u8>,
+    open: Block,
     /// Full blocks kept in memory.
-    held: Vec<Vec<u8>>,
+    held: Vec<Block>,
     /// Full blocks in the file: offset and length.
     written: Vec<(u64, u32)>,
     kmers: u64,
@@ -207,7 +302,7 @@ pub(crate) struct BinBuffers {
     buffers: Vec<Vec<u8>>,
     kmers: Vec<u64>,
     /// An empty block to replace the next one this worker fills.
-    spare: Vec<u8>,
+    spare: Block,
     /// The current run of valid bases, four per byte.
     packed: Vec<u8>,
     /// Hashes of the latest m-mers, by m-mer index modulo its length; a
@@ -220,7 +315,7 @@ impl Bins {
         BinBuffers {
             buffers: (0..BINS).map(|_| Vec::new()).collect(),
             kmers: vec![0; BINS],
-            spare: Vec::new(),
+            spare: Block::default(),
             packed: Vec::new(),
             hashes: [0; 32],
         }
@@ -329,15 +424,17 @@ impl Bins {
                 // The block is full. Keep it while memory allows; otherwise
                 // write it below, outside the lock.
                 let block = std::mem::replace(&mut shared.open, std::mem::take(&mut buffers.spare));
-                if self.held.fetch_add(block.len(), Ordering::Relaxed) + block.len() <= self.limit {
+                if self.held.fetch_add(block.capacity(), Ordering::Relaxed) + block.capacity()
+                    <= self.limit
+                {
                     shared.held.push(block);
                 } else {
-                    self.held.fetch_sub(block.len(), Ordering::Relaxed);
+                    self.held.fetch_sub(block.capacity(), Ordering::Relaxed);
                     full = Some(block);
                 }
             }
             if shared.open.capacity() == 0 {
-                shared.open.reserve_exact(self.block);
+                shared.open.ensure_capacity(self.block)?;
             }
             shared.open.extend_from_slice(records);
         }
@@ -348,7 +445,7 @@ impl Bins {
         let Some(mut block) = full else {
             return Ok(());
         };
-        match self.spill.append(&block) {
+        match self.spill.append(block.as_slice()) {
             Ok(offset) => {
                 let mut shared = self.bins[bin].lock().map_err(|_| Error::WorkerFailed)?;
                 shared.written.push((offset, block.len() as u32));
@@ -439,10 +536,21 @@ fn expand(
     let data = &record[1..];
     // The first k-mer is read whole: its 2k bits start `skip` bases into the
     // record, within the first 9 bytes.
-    let mut head = [0_u8; 16];
-    let whole = data.len().min(16);
-    head[..whole].copy_from_slice(&data[..whole]);
-    let mut forward = (u128::from_be_bytes(head) >> (128 - 2 * (skip + k))) as u64 & mask;
+    let length = data.len();
+    let head = if length >= 16 {
+        u128::from_be_bytes(data[..16].try_into().unwrap())
+    } else if length >= 8 {
+        // Two loads that overlap, the second shifted so that only the bytes
+        // past the first eight remain: no copy of variable length.
+        let high = u64::from_be_bytes(data[..8].try_into().unwrap());
+        let low = u64::from_be_bytes(data[length - 8..].try_into().unwrap());
+        (u128::from(high) << 64) | u128::from(low.checked_shl(8 * (16 - length) as u32).unwrap_or(0))
+    } else {
+        let mut head = [0_u8; 16];
+        head[..length].copy_from_slice(data);
+        u128::from_be_bytes(head)
+    };
+    let mut forward = (head >> (128 - 2 * (skip + k))) as u64 & mask;
     // Its reverse complement: complement every base, then reverse the order
     // of the two-bit bases.
     let flipped = (!forward).reverse_bits();
@@ -489,8 +597,9 @@ struct Tables {
 }
 
 impl Tables {
-    fn new(k: usize) -> Result<Self, Error> {
-        let counts = PackedCounts::with_capacity(k, PARTITION_BITS, 0, Load::Dense)?;
+    /// Tables for `k`-mers over about `2^partition_bits` partitions.
+    fn new(k: usize, partition_bits: u32) -> Result<Self, Error> {
+        let counts = PackedCounts::with_capacity(k, partition_bits, 0, Load::Dense)?;
         let layout = counts.layout();
         let table_bits = counts.tables().len().trailing_zeros();
         let grouped = 1_usize << (table_bits - table_bits / 2);
@@ -554,44 +663,265 @@ impl Tables {
     fn finish(&mut self) -> Result<(), Error> {
         (0..self.filled.len()).try_for_each(|group| self.apply(group))
     }
-}
 
-/// Table memory shared by the bins being counted at once.
-struct Budget {
-    total: u64,
-    free: Mutex<u64>,
-    released: Condvar,
-}
+    /// The partitions `Tables::new(k, partition_bits)` makes.
+    fn partitions(k: usize, partition_bits: u32) -> usize {
+        1 << crate::table::partition_bits(key_bits(k), partition_bits)
+    }
 
-struct Held<'a>(&'a Budget, u64);
+    /// Fixed bytes of the update buffer (`pending`) of such tables.
+    fn pending_bytes(k: usize, partition_bits: u32) -> u64 {
+        (Self::partitions(k, partition_bits) * BURST * std::mem::size_of::<u64>()) as u64
+    }
 
-impl Budget {
-    /// Wait until `bytes` (at most the whole budget) are free, and take them.
-    fn take(&self, bytes: u64) -> Held<'_> {
-        let bytes = bytes.min(self.total);
-        let mut free = self
-            .free
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        while *free < bytes {
-            free = self
-                .released
-                .wait(free)
-                .unwrap_or_else(|poison| poison.into_inner());
+    /// Partition bits for tables of about `distinct` k-mers: enough for
+    /// `TABLE_KEYS` per table, as long as the update buffer stays within
+    /// `pending` bytes.
+    fn partition_bits(k: usize, distinct: u64, pending: u64) -> u32 {
+        let mut bits = (distinct / TABLE_KEYS)
+            .max(1)
+            .next_power_of_two()
+            .trailing_zeros()
+            .clamp(MIN_PARTITION_BITS, MAX_PARTITION_BITS);
+        while bits > MIN_PARTITION_BITS && Self::pending_bytes(k, bits) > pending {
+            bits -= 1;
         }
-        *free -= bytes;
-        Held(self, bytes)
+        bits
+    }
+
+    /// Bytes currently allocated by these tables and their update buffers.
+    fn bytes(&self) -> u64 {
+        self.counts.bytes() as u64
+            + ((self.pending.capacity() + self.split.capacity()) * std::mem::size_of::<u64>())
+                as u64
     }
 }
 
-impl Drop for Held<'_> {
-    fn drop(&mut self) {
-        *self
-            .0
-            .free
+struct BudgetState {
+    /// Bytes currently available for active and pooled tables. Grows as
+    /// in-memory bin blocks are freed during pass 2.
+    limit: u64,
+    /// Bytes reserved by currently active workers.
+    reserved: u64,
+    /// Cleared tables awaiting reuse by the next worker. Keeping tables in a
+    /// shared pool prevents idle threads waiting for budget from holding onto
+    /// grown bucket allocations.
+    pool: Vec<Tables>,
+}
+
+/// Table memory and reusable [`Tables`] shared by the counting workers.
+struct Budget {
+    max_limit: u64,
+    state: Mutex<BudgetState>,
+    released: Condvar,
+}
+
+/// An active worker's leased [`Tables`] and its reservation in [`Budget`].
+struct Lease<'a> {
+    budget: &'a Budget,
+    tables: Option<Tables>,
+    reserved: u64,
+}
+
+impl Budget {
+    fn new(initial_limit: u64, max_limit: u64) -> Self {
+        let max_limit = max_limit.max(1);
+        let initial_limit = initial_limit.clamp(1, max_limit);
+        Self {
+            max_limit,
+            state: Mutex::new(BudgetState {
+                limit: initial_limit,
+                reserved: 0,
+                pool: Vec::new(),
+            }),
+            released: Condvar::new(),
+        }
+    }
+
+    /// Wait until room for `needed` bytes is free, returning a leased [`Tables`]
+    /// (reused from the pool when one fits, or freshly allocated). Evicts
+    /// pooled tables before blocking so idle memory is returned to the OS.
+    /// Before blocking, `free` is called without the lock held; it may make
+    /// room (returning true, and crediting what it freed) instead of waiting.
+    fn acquire(
+        &self,
+        k: usize,
+        partition_bits: u32,
+        needed: u64,
+        mut free: impl FnMut() -> io::Result<bool>,
+    ) -> io::Result<Lease<'_>> {
+        // Only tables of the same shape are reused; others are evicted.
+        let partitions = Tables::partitions(k, partition_bits);
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) += self.1;
-        self.0.released.notify_all();
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut can_free = true;
+        let (reused, reserved) = loop {
+            let total_pool: u64 = state.pool.iter().map(Tables::bytes).sum();
+            let candidate = state
+                .pool
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| {
+                    let bytes = t.bytes();
+                    t.counts.tables().len() == partitions
+                        && bytes <= needed.saturating_mul(2)
+                        && bytes <= state.limit
+                })
+                .max_by_key(|(_, t)| t.bytes())
+                .map(|(index, _)| index);
+            let (want, other_pool) = match candidate {
+                Some(index) => {
+                    let bytes = state.pool[index].bytes();
+                    (
+                        needed.max(bytes).min(state.limit),
+                        total_pool.saturating_sub(bytes),
+                    )
+                }
+                None => (needed.min(state.limit), total_pool),
+            };
+            if state.reserved + other_pool + want <= state.limit {
+                let tables = candidate.map(|index| state.pool.swap_remove(index));
+                state.reserved += want;
+                break (tables, want);
+            }
+            if state.reserved == 0 {
+                // Always allow at least one worker to make progress even under
+                // tiny memory limits, reusing an idle empty table if present.
+                let tables = if state.pool.len() == 1
+                    && state.pool[0].counts.bytes() <= 16 * 1024
+                    && state.pool[0].counts.tables().len() == partitions
+                {
+                    Some(state.pool.swap_remove(0))
+                } else {
+                    None
+                };
+                if tables.is_some() || state.pool.is_empty() {
+                    state.reserved += want;
+                    break (tables, want);
+                }
+            }
+            if !state.pool.is_empty() {
+                // Evict the largest idle table not selected as our candidate
+                // (or the candidate itself if nothing else remains).
+                let evict = state
+                    .pool
+                    .iter()
+                    .enumerate()
+                    .filter(|&(index, _)| Some(index) != candidate)
+                    .max_by_key(|(_, t)| t.bytes())
+                    .map(|(index, _)| index)
+                    .unwrap_or_else(|| candidate.expect("non-empty pool"));
+                let evicted = state.pool.swap_remove(evict);
+                drop(state);
+                drop(evicted);
+                state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                continue;
+            }
+            if can_free {
+                // Whether or not this frees anything, look again under the
+                // lock: a worker may have released its tables meanwhile.
+                drop(state);
+                can_free = free()?;
+                state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                continue;
+            }
+            state = self
+                .released
+                .wait(state)
+                .unwrap_or_else(|poison| poison.into_inner());
+        };
+        drop(state);
+        let tables = match reused {
+            Some(tables) => tables,
+            None => match Tables::new(k, partition_bits) {
+                Ok(tables) => tables,
+                Err(error) => {
+                    self.release_raw(None, reserved, 0);
+                    return Err(io::Error::other(error));
+                }
+            },
+        };
+        Ok(Lease {
+            budget: self,
+            tables: Some(tables),
+            reserved,
+        })
+    }
+
+    fn release_raw(&self, tables: Option<Tables>, reserved: u64, freed_bin_bytes: u64) {
+        let mut evicted = None;
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            state.reserved = state.reserved.saturating_sub(reserved);
+            state.limit = state
+                .limit
+                .saturating_add(freed_bin_bytes)
+                .min(self.max_limit);
+            if let Some(tables) = tables {
+                let total_pool: u64 = state.pool.iter().map(Tables::bytes).sum();
+                let tiny_fallback = state.pool.is_empty() && tables.counts.bytes() <= 16 * 1024;
+                if state.reserved + total_pool + tables.bytes() <= state.limit || tiny_fallback {
+                    state.pool.push(tables);
+                } else {
+                    evicted = Some(tables);
+                }
+            }
+            self.released.notify_all();
+        }
+        drop(evicted);
+    }
+
+    fn credit_bin_bytes(&self, freed_bin_bytes: u64) {
+        if freed_bin_bytes == 0 {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.limit = state
+            .limit
+            .saturating_add(freed_bin_bytes)
+            .min(self.max_limit);
+        self.released.notify_all();
+    }
+}
+
+impl Lease<'_> {
+    fn tables(&mut self) -> &mut Tables {
+        self.tables.as_mut().expect("active lease holds tables")
+    }
+
+    /// Return the cleared tables to the pool (or drop them if over budget)
+    /// and credit any freed in-memory bin bytes to the budget limit.
+    fn release(mut self, freed_bin_bytes: u64) {
+        if let Some(tables) = self.tables.as_mut() {
+            tables.counts.clear();
+        }
+        let tables = self.tables.take();
+        let reserved = std::mem::replace(&mut self.reserved, 0);
+        self.budget.release_raw(tables, reserved, freed_bin_bytes);
+    }
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        if self.reserved > 0 || self.tables.is_some() {
+            let tables = self.tables.take();
+            let reserved = std::mem::replace(&mut self.reserved, 0);
+            self.budget.release_raw(tables, reserved, 0);
+        }
     }
 }
 
@@ -763,7 +1093,7 @@ impl DiskCounts {
         if self.sorted {
             return self.count_sorted(&mut writer, sorted::tsv_rows(k), |_, _| Ok(()));
         }
-        self.count(&mut writer, |counts, writer| {
+        self.count(&mut writer, 0, |counts, writer| {
             crate::write_packed64_tsv(counts.entries(), k, writer)
         })
     }
@@ -786,7 +1116,7 @@ impl DiskCounts {
         let start = writer.stream_position()?;
         let header = |entries| database::header(k, strand, KeyOrder::Hash, false, entries);
         writer.write_all(&header(0))?;
-        let distinct = self.count(&mut writer, |counts, writer| {
+        let distinct = self.count(&mut writer, 0, |counts, writer| {
             database::write_hash_sections(counts, 0, counts.tables().len(), writer)
         })?;
         let end = writer.stream_position()?;
@@ -816,12 +1146,66 @@ impl DiskCounts {
             self.threads,
             &self.directory,
         )?;
-        let distinct = self.count(writer, |counts, _| {
-            sorter.feed(counts, &mut sorted::Batch::default())
-        })?;
+        let distinct = self.count(
+            writer,
+            self.memory / 8,
+            |counts, _| sorter.feed(counts, &mut sorted::Batch::default()),
+        )?;
         begin(distinct, writer)?;
         sorter.write(self.threads, writer, encode)?;
         Ok(distinct)
+    }
+
+    /// Write the blocks still in memory of the last bin not yet taken to the
+    /// temporary file, and give their memory to the count tables. Returns
+    /// false once no bin is left to spill.
+    ///
+    /// Blocks kept in memory spare the disk only while the tables have room:
+    /// counting a large input needs every byte for tables, and a thread that
+    /// would wait for memory does better to write blocks out than to idle.
+    fn spill_held(&self, progress: &Progress, budget: &Budget) -> io::Result<bool> {
+        while let Ok(spilled) =
+            progress
+                .spilled
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |spilled| {
+                    (spilled < self.bins.len()).then_some(spilled + 1)
+                })
+        {
+            let index = self.bins.len() - 1 - spilled;
+            if index < progress.next.load(Ordering::Relaxed) {
+                break;
+            }
+            let mut bin = self.bins[index]
+                .lock()
+                .map_err(|_| io::Error::other("poisoned"))?;
+            let freed = Self::bin_bytes(&bin);
+            if freed == 0 {
+                continue;
+            }
+            let Bin {
+                open,
+                held,
+                written,
+                ..
+            } = &mut *bin;
+            let open = std::mem::take(open);
+            for block in held.drain(..).chain(std::iter::once(open)) {
+                if block.len() > 0 {
+                    let offset = self.spill.append(block.as_slice())?;
+                    written.push((offset, block.len() as u32));
+                }
+            }
+            drop(bin);
+            budget.credit_bin_bytes(freed);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Bytes currently held in RAM by one bin's in-memory blocks.
+    fn bin_bytes(bin: &Bin) -> u64 {
+        let held: usize = bin.held.iter().map(Block::capacity).sum();
+        (bin.open.capacity() + held) as u64
     }
 
     /// Count bins on `threads` threads, encoding each with `encode` and
@@ -829,17 +1213,40 @@ impl DiskCounts {
     fn count(
         &self,
         writer: &mut dyn Write,
+        extra_reserved: u64,
         encode: impl Fn(&PackedCounts, &mut dyn Write) -> io::Result<()> + Sync,
     ) -> io::Result<u64> {
-        // Three eighths for tables, and up to an eighth for merging repeats
-        // (see `count_bins`). Bins held in memory take up to half until they
-        // are counted; update and output buffers come on top.
-        let total = (self.memory / 8 * 3).max(1);
-        let budget = Budget {
-            total,
-            free: Mutex::new(total),
-            released: Condvar::new(),
-        };
+        // An eighth of the memory, between the threads, merges equal records.
+        let repeat_slots = usize::try_from(self.memory / 8).unwrap_or(usize::MAX)
+            / self.threads
+            / std::mem::size_of::<Repeat>();
+        let repeat_slots = (1_usize << repeat_slots.max(1).ilog2()).clamp(MIN_REPEATS, MAX_REPEATS);
+        let repeats_bytes =
+            (repeat_slots * std::mem::size_of::<Repeat>() * self.threads) as u64;
+        // Bounded output channel plus one in-flight buffer per worker.
+        let output_bytes = (3 * self.threads * crate::OUTPUT_CHUNK) as u64;
+        // Reserve headroom for allocator retention (e.g. pass-1 buffers) and
+        // transient resize spikes, clamped so both small and large limits behave well.
+        let headroom = (self.memory / 10).clamp(64 << 20, 256 << 20);
+        let held_bytes: u64 = self
+            .bins
+            .iter()
+            .map(|bin| {
+                bin.lock()
+                    .map_or(0, |bin| Self::bin_bytes(&bin))
+            })
+            .sum();
+        let max_limit = self
+            .memory
+            .saturating_sub(repeats_bytes + output_bytes + headroom + extra_reserved)
+            .max(self.memory * 3 / 8)
+            .max(1);
+        let initial_limit = max_limit
+            .saturating_sub(held_bytes)
+            .max(self.memory / 8)
+            .min(max_limit)
+            .max(1);
+        let budget = Budget::new(initial_limit, max_limit);
         let progress = Progress::default();
         let (sender, receiver) = crossbeam_channel::bounded::<EncodedChunk>(2 * self.threads);
         let (recycle, recycled) = crossbeam_channel::unbounded::<Vec<u8>>();
@@ -850,7 +1257,14 @@ impl DiskCounts {
                 std::thread::Builder::new()
                     .name(format!("bin-{index}"))
                     .spawn_scoped(scope, move || {
-                        let result = self.count_bins(budget, progress, encode, &sender, &recycled);
+                        let result = self.count_bins(
+                            budget,
+                            progress,
+                            repeat_slots,
+                            encode,
+                            &sender,
+                            &recycled,
+                        );
                         if let Err(error) = result {
                             // Fails harmlessly if the writer already stopped.
                             let _ = sender.send(Err(error));
@@ -876,36 +1290,48 @@ impl DiskCounts {
         &self,
         budget: &Budget,
         progress: &Progress,
+        repeat_slots: usize,
         encode: &(impl Fn(&PackedCounts, &mut dyn Write) -> io::Result<()> + Sync),
         sender: &crossbeam_channel::Sender<EncodedChunk>,
         recycled: &crossbeam_channel::Receiver<Vec<u8>>,
     ) -> io::Result<()> {
-        let mut tables = Tables::new(self.k).map_err(io::Error::other)?;
-        // An eighth of the memory, between the threads, merges equal records.
-        let slots = usize::try_from(self.memory / 8).unwrap_or(usize::MAX)
-            / self.threads
-            / std::mem::size_of::<Repeat>();
-        let slots = (1_usize << slots.max(1).ilog2()).clamp(MIN_REPEATS, MAX_REPEATS);
-        let mut repeats = Repeats::new(slots);
+        // Update buffers take at most a quarter of the tables' memory.
+        let pending = budget.max_limit / 4 / self.threads as u64;
+        let mut repeats = Repeats::new(repeat_slots)?;
         // Bins this thread still counts without merging; see below.
         let mut unmerged = 0;
         let mut block = Vec::new();
         while let Some(bin) = self.bins.get(progress.next.fetch_add(1, Ordering::Relaxed)) {
             // Taking the bin frees its blocks once it has been counted.
             let bin = std::mem::take(&mut *bin.lock().map_err(|_| io::Error::other("poisoned"))?);
+            let freed_bin_bytes = Self::bin_bytes(&bin);
             if bin.kmers == 0 {
+                drop(bin);
+                budget.credit_bin_bytes(freed_bin_bytes);
                 continue;
             }
-            let needed = progress.estimate(bin.kmers).saturating_mul(KEY_BYTES);
+            let bin_kmers = bin.kmers;
+            let distinct = progress.estimate(bin_kmers);
             // A bin too large for the whole budget is counted in passes, each
             // taking the k-mers whose mixed key falls in one residue class.
-            let passes = needed.div_ceil(budget.total);
-            let needed = needed / passes;
-            if tables.counts.bytes() as u64 > needed.saturating_mul(2) {
-                // Tables grown for a much larger bin; start again small.
-                tables = Tables::new(self.k).map_err(io::Error::other)?;
+            let passes = distinct.saturating_mul(KEY_BYTES).div_ceil(budget.max_limit);
+            let distinct = distinct / passes;
+            // Before any bin is counted the estimate is only a bound.
+            let bits = if progress.kmers.load(Ordering::Relaxed) == 0 {
+                FIRST_PARTITION_BITS
+            } else {
+                Tables::partition_bits(self.k, distinct, pending)
+            };
+            let needed = distinct
+                .saturating_mul(KEY_BYTES)
+                .saturating_add(Tables::pending_bytes(self.k, bits));
+            let mut lease =
+                budget.acquire(self.k, bits, needed, || self.spill_held(progress, budget))?;
+            // Its blocks in the file are read while those in memory are counted.
+            for &(offset, len) in &bin.written {
+                self.spill.advise(offset, len);
             }
-            let _held = budget.take(needed.max(tables.counts.bytes() as u64));
+            let tables = lease.tables();
             let mixer = tables.mixer;
             for pass in 0..passes {
                 let mut count = |record: &[u8], copies: u64| {
@@ -930,7 +1356,7 @@ impl DiskCounts {
                     }
                 };
                 for block in bin.held.iter().chain(std::iter::once(&bin.open)) {
-                    read(block)?;
+                    read(block.as_slice())?;
                 }
                 for &(offset, len) in &bin.written {
                     block.resize(len as usize, 0);
@@ -953,7 +1379,9 @@ impl DiskCounts {
                     .fetch_add(tables.counts.len() as u64, Ordering::Relaxed);
                 tables.counts.clear();
             }
-            progress.kmers.fetch_add(bin.kmers, Ordering::Relaxed);
+            drop(bin);
+            lease.release(freed_bin_bytes);
+            progress.kmers.fetch_add(bin_kmers, Ordering::Relaxed);
             // Bins are alike: where under a quarter of a bin's records were
             // copies, merging costs more than it saves, so the next bins go
             // without it until one is tried again.
@@ -990,7 +1418,7 @@ const _: () = assert!(2 * (MAX_RUN + 31) <= 3 * 64);
 /// its number of copies, and the table starts again empty; copies on either
 /// side of that are merely counted separately.
 struct Repeats {
-    slots: Vec<Repeat>,
+    slots: Buckets<Repeat>,
     filled: usize,
     hasher: foldhash::fast::FixedState,
     /// Records added, and those that were copies, since last reset.
@@ -1000,20 +1428,14 @@ struct Repeats {
 
 impl Repeats {
     /// A table of `slots` slots, a power of two.
-    fn new(slots: usize) -> Self {
-        Self {
-            slots: vec![
-                Repeat {
-                    copies: 0,
-                    record: [0; RECORD],
-                };
-                slots
-            ],
+    fn new(slots: usize) -> io::Result<Self> {
+        Ok(Self {
+            slots: Buckets::zeroed(slots).map_err(io::Error::other)?,
             filled: 0,
             hasher: foldhash::fast::FixedState::default(),
             added: 0,
             copies: 0,
-        }
+        })
     }
 
     /// Visit every record of `block` as it comes, without merging.
@@ -1096,7 +1518,7 @@ impl Repeats {
         if self.filled == 0 {
             return Ok(());
         }
-        for repeat in &mut self.slots {
+        for repeat in self.slots.iter_mut() {
             if repeat.copies != 0 {
                 let length = 1 + (usize::from(repeat.record[0]) + k).div_ceil(4);
                 visit(&repeat.record[..length], u64::from(repeat.copies))?;
@@ -1112,6 +1534,8 @@ impl Repeats {
 #[derive(Default)]
 struct Progress {
     next: AtomicUsize,
+    /// Bins, from the last, whose blocks have been written out.
+    spilled: AtomicUsize,
     kmers: AtomicU64,
     distinct: AtomicU64,
 }
@@ -1215,6 +1639,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn blocks_kept_in_memory_are_written_out_when_tables_need_the_room() {
+        let records: Vec<_> = (0..8)
+            .map(|seed| sequence(60_000, 100 + seed as u64))
+            .collect();
+        let k = 31;
+        let expected = serial(&records, k, StrandMode::Canonical);
+        let counts = on_disk(&records, k, StrandMode::Canonical, 512 << 10);
+        let held: u64 = counts
+            .bins
+            .iter()
+            .map(|bin| DiskCounts::bin_bytes(&bin.lock().unwrap()))
+            .sum();
+        assert!(held > 0, "the first phase kept no blocks in memory");
+        let before = counts.temporary_bytes();
+        let mut tsv = Vec::new();
+        let distinct = counts
+            .count(&mut tsv, 0, |counts, writer| {
+                crate::write_packed64_tsv(counts.entries(), k, writer)
+            })
+            .unwrap();
+        assert!(
+            counts.temporary_bytes() > before,
+            "no blocks were written out while counting"
+        );
+        assert_eq!(distinct, expected.len() as u64);
+        assert_eq!(rows(&tsv), expected);
     }
 
     #[test]

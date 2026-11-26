@@ -25,7 +25,7 @@ use std::sync::{Condvar, Mutex};
 
 use crate::database::{self, KeyOrder, SectionWriter};
 use crate::disk::Spill;
-use crate::table::{self, PackedCounts};
+use crate::table::{self, Buckets, PackedCounts};
 use crate::table_wide::{self, HighKey, PackedCountsWide};
 use crate::{
     Counter, Counts, dispatch_wide, format_count, write_ordered, write_packed_tsv,
@@ -138,14 +138,22 @@ impl Sorter {
         threads: usize,
         directory: &Path,
     ) -> io::Result<Self> {
-        // Half the memory holds the buckets being sorted; one should fit
-        // an eighth of it per thread even if it is several times the
-        // average. An eighth holds the records not yet written.
-        let sorting = memory / 2;
+        // Up to half the memory holds the buckets being sorted, minus room for
+        // the open bucket buffers, ordered output pipeline, and allocator
+        // headroom. One bucket should fit an eighth of sorting memory per
+        // thread even if it is several times the average.
+        let open_bytes = memory / 8;
+        let output_bytes = (5 * threads.max(1) * crate::OUTPUT_CHUNK) as u64;
+        let headroom = (memory / 10).clamp(64 << 20, 256 << 20);
+        let sorting = memory
+            .saturating_sub(open_bytes + output_bytes + headroom)
+            .min(memory / 2)
+            .max(memory / 4)
+            .max(1);
         let bucket = (sorting / 8 / threads.max(1) as u64 / WORD as u64).max(1);
-        let most = 1_u64 << (memory / 8 / MIN_BLOCK as u64).max(1).ilog2();
+        let most = 1_u64 << (open_bytes / MIN_BLOCK as u64).max(1).ilog2();
         let buckets = records.div_ceil(bucket).min(most);
-        let block = usize::try_from(memory / 8 / buckets.max(1).next_power_of_two())
+        let block = usize::try_from(open_bytes / buckets.max(1).next_power_of_two())
             .unwrap_or(MAX_BLOCK)
             .clamp(MIN_BLOCK, MAX_BLOCK);
         Ok(Self::new(
@@ -153,7 +161,7 @@ impl Sorter {
             buckets,
             block,
             Some(Spill::create(directory)?),
-            Some(Admission::new(sorting.max(1))),
+            Some(Admission::new(sorting)),
         ))
     }
 
@@ -239,22 +247,49 @@ impl Sorter {
             let mut bucket = bucket.lock().map_err(poisoned)?;
             let bucket = &mut *bucket;
             bucket.records += run.len() as u64;
-            bucket.open.extend_from_slice(run);
-            if bucket.open.len() < self.block {
-                continue;
-            }
             match &self.spill {
                 Some(spill) => {
-                    // (A number of records fits 32 bits: split more.)
-                    for part in bucket.open.chunks(1 << 27) {
-                        let offset = spill.append(bytes(part))?;
-                        bucket.written.push((offset, part.len() as u32));
+                    let spill_slice = |bucket: &mut Bucket, slice: &[u64]| -> io::Result<()> {
+                        // (A number of records fits 32 bits: split more.)
+                        for part in slice.chunks(1 << 27) {
+                            let offset = spill.append(bytes(part))?;
+                            bucket.written.push((offset, part.len() as u32));
+                        }
+                        Ok(())
+                    };
+                    if bucket.open.len() + run.len() >= self.block {
+                        if !bucket.open.is_empty() {
+                            if bucket.open.len() + run.len() <= bucket.open.capacity() {
+                                bucket.open.extend_from_slice(run);
+                                let open = std::mem::take(&mut bucket.open);
+                                let result = spill_slice(bucket, &open);
+                                bucket.open = open;
+                                bucket.open.clear();
+                                result?;
+                                continue;
+                            }
+                            let open = std::mem::take(&mut bucket.open);
+                            let result = spill_slice(bucket, &open);
+                            bucket.open = open;
+                            bucket.open.clear();
+                            result?;
+                        }
+                        if run.len() >= self.block {
+                            spill_slice(bucket, run)?;
+                            continue;
+                        }
                     }
-                    bucket.open.clear();
+                    if bucket.open.capacity() == 0 {
+                        bucket.open.reserve_exact(self.block);
+                    }
+                    bucket.open.extend_from_slice(run);
                 }
                 None => {
-                    let block = std::mem::take(&mut bucket.open);
-                    bucket.held.push(block);
+                    bucket.open.extend_from_slice(run);
+                    if bucket.open.len() >= self.block {
+                        let block = std::mem::take(&mut bucket.open);
+                        bucket.held.push(block);
+                    }
                 }
             }
         }
@@ -265,27 +300,28 @@ impl Sorter {
         Ok(())
     }
 
-    /// Empty `bucket` into `words`, sorted, and return its large counts,
-    /// sorted as well. `scratch` is space to sort in.
-    fn take(
+    /// Fill `words` from `bucket`, sort it using `scratch`, and return its
+    /// sorted large counts.
+    fn fill_and_sort(
         &self,
-        bucket: usize,
-        words: &mut Vec<u64>,
-        scratch: &mut Vec<u64>,
+        mut bucket: Bucket,
+        words: &mut [u64],
+        scratch: &mut [u64],
     ) -> io::Result<Vec<[u64; 2]>> {
-        let mut bucket = std::mem::take(&mut *self.buckets[bucket].lock().map_err(poisoned)?);
-        words.clear();
-        words.reserve(bucket.records as usize);
+        let mut pos = 0;
         for block in &bucket.held {
-            words.extend_from_slice(block);
+            words[pos..pos + block.len()].copy_from_slice(block);
+            pos += block.len();
         }
         for &(offset, length) in &bucket.written {
-            let start = words.len();
-            words.resize(start + length as usize, 0);
+            let end = pos + length as usize;
             let spill = self.spill.as_ref().expect("written blocks have a file");
-            spill.read(bytes_mut(&mut words[start..]), offset)?;
+            spill.read(bytes_mut(&mut words[pos..end]), offset)?;
+            pos = end;
         }
-        words.extend_from_slice(&bucket.open);
+        words[pos..pos + bucket.open.len()].copy_from_slice(&bucket.open);
+        pos += bucket.open.len();
+        debug_assert_eq!(pos, words.len());
         // The key's low bits are a word's high ones, and keys are distinct.
         sort_words(words, scratch);
         bucket.large.sort_unstable();
@@ -344,29 +380,56 @@ impl Sorter {
         write_ordered(threads, self.buckets(), writer, |bucket, writer| {
             let result = (|| {
                 // A bucket is sorted from one buffer into another.
-                let bytes =
-                    2 * self.buckets[bucket].lock().map_err(poisoned)?.records * WORD as u64;
+                let records = self.buckets[bucket].lock().map_err(poisoned)?.records;
+                let bytes = 2 * records * WORD as u64;
                 let _admitted = match &self.admission {
                     Some(admission) => Some(admission.enter(bucket, bytes)?),
                     None => None,
                 };
-                let (mut words, mut scratch) = self
-                    .spare
-                    .lock()
-                    .map_err(poisoned)?
-                    .pop()
-                    .unwrap_or_default();
-                let large = self.take(bucket, &mut words, &mut scratch)?;
-                let entries = Sorted {
-                    words: words.iter(),
-                    large: large.iter(),
-                    base: (bucket as u64) << self.low_bits,
-                    count_bits: self.count_bits,
-                    marker: self.marker(),
-                };
-                let result = encode(entries, writer);
-                self.spare.lock().map_err(poisoned)?.push((words, scratch));
-                result
+                let taken = std::mem::take(&mut *self.buckets[bucket].lock().map_err(poisoned)?);
+                let len = taken.records as usize;
+                if self.spill.is_some() {
+                    // Back disk-sort buffers with `Buckets` so large buckets
+                    // are unmapped as soon as they finish, before `_admitted`
+                    // releases their budget.
+                    let mut words = Buckets::<u64>::zeroed(len).map_err(io::Error::other)?;
+                    let mut scratch = if len >= RADIX_VALUES {
+                        Buckets::<u64>::zeroed(len).map_err(io::Error::other)?
+                    } else {
+                        Buckets::new()
+                    };
+                    let large = self.fill_and_sort(taken, &mut words, &mut scratch)?;
+                    let entries = Sorted {
+                        words: words.iter(),
+                        large: large.iter(),
+                        base: (bucket as u64) << self.low_bits,
+                        count_bits: self.count_bits,
+                        marker: self.marker(),
+                    };
+                    encode(entries, writer)
+                } else {
+                    let (mut words, mut scratch) = self
+                        .spare
+                        .lock()
+                        .map_err(poisoned)?
+                        .pop()
+                        .unwrap_or_default();
+                    words.resize(len, 0);
+                    if len >= RADIX_VALUES {
+                        scratch.resize(len, 0);
+                    }
+                    let large = self.fill_and_sort(taken, &mut words, &mut scratch)?;
+                    let entries = Sorted {
+                        words: words.iter(),
+                        large: large.iter(),
+                        base: (bucket as u64) << self.low_bits,
+                        count_bits: self.count_bits,
+                        marker: self.marker(),
+                    };
+                    let result = encode(entries, writer);
+                    self.spare.lock().map_err(poisoned)?.push((words, scratch));
+                    result
+                }
             })();
             // A thread that stops here never takes its later buckets; the
             // threads waiting for their turn after those must stop as well.
@@ -378,15 +441,18 @@ impl Sorter {
     }
 }
 
+const RADIX_DIGIT: u32 = 11;
+const RADIX_VALUES: usize = 1 << RADIX_DIGIT;
+
 /// Sort the distinct words of a bucket, with `scratch` as space to work in.
 ///
 /// Two counting sorts on the words' top bits, eleven at a time, leave them
 /// ordered by their top 22 bits. In a bucket those are the bases that
 /// follow the ones its k-mers share, so few words agree in them, and the
 /// ones that do are sorted among themselves.
-fn sort_words(words: &mut [u64], scratch: &mut Vec<u64>) {
-    const DIGIT: u32 = 11;
-    const VALUES: usize = 1 << DIGIT;
+fn sort_words(words: &mut [u64], scratch: &mut [u64]) {
+    const DIGIT: u32 = RADIX_DIGIT;
+    const VALUES: usize = RADIX_VALUES;
     // Not worth two tables of counts.
     if words.len() < VALUES {
         return words.sort_unstable();
@@ -410,8 +476,7 @@ fn sort_words(words: &mut [u64], scratch: &mut Vec<u64>) {
             start += std::mem::replace(count, start);
         }
     }
-    scratch.clear();
-    scratch.resize(words.len(), 0);
+    let scratch = &mut scratch[..words.len()];
     for &word in words.iter() {
         let next = &mut lower[digits(word).0];
         scratch[*next] = word;
@@ -856,6 +921,7 @@ mod tests {
             let mut words: Vec<u64> = (0..length).map(|_| random.next() & mask).collect();
             let mut expected = words.clone();
             expected.sort_unstable();
+            scratch.resize(length, 0);
             sort_words(&mut words, &mut scratch);
             assert!(words == expected, "length={length} mask={mask:x}");
         }

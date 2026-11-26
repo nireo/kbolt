@@ -735,8 +735,8 @@ pub(crate) fn write_ordered(
         let mut streams = Vec::with_capacity(threads);
         for first in 0..threads {
             // Each encoder may run this many chunks ahead of the writer;
-            // enough to buffer a typical piece while others are written.
-            let (sender, receiver) = crossbeam_channel::bounded(16);
+            // enough to keep the writer fed without buffering excessive output.
+            let (sender, receiver) = crossbeam_channel::bounded(4);
             streams.push(receiver);
             let (encode, recycled) = (&encode, recycled.clone());
             std::thread::Builder::new()
